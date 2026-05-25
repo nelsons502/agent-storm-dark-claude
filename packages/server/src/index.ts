@@ -1,4 +1,4 @@
-import {agentStormService, PaneKind} from '@agent-storm/common';
+import {agentStormService, defaultConfig, PaneKind} from '@agent-storm/common';
 import {HttpMethod, log} from '@augment-vir/common';
 import {HttpStatus, implementService, silentServiceLogger} from '@rest-vir/implement-service';
 import {attachService} from '@rest-vir/run-service';
@@ -7,6 +7,8 @@ import {appendFileSync, writeFileSync} from 'node:fs';
 import {parseUrl} from 'url-vir';
 import {initAuth, verifyAuthToken} from './auth.js';
 import {loadConfig, saveConfig} from './config.js';
+import {addWorktreeToConfig, removeWorktreeFromConfig} from './worktree-reconcile.js';
+import {normalizePath} from './paths.js';
 import {
     attachPane,
     killFolderPanes,
@@ -17,10 +19,41 @@ import {
 } from './daemon/daemon-client.js';
 import {ensureDaemon, waitForDaemonGone} from './daemon/ensure-daemon.js';
 import {serverLogPath} from './file-paths.js';
-import {getCachedFolders, refreshFolderInfoNow, startFolderInfoRefreshLoop} from './folder-info.js';
-import {addWorktree, removeWorktree} from './git.js';
+import {appendClientError, resetClientErrorLog} from './client-errors.js';
+import {
+    getCachedFolders,
+    publishTargets,
+    publishTargetsFromConfig,
+    refreshFolderInfoNow,
+    startFolderInfoRefreshLoop,
+} from './folder-info.js';
+import {pickFolder} from './folder-picker.js';
+import {
+    addWorktree,
+    convertRepoToWorktreeLayout,
+    getGitInfo,
+    inspectRepoPath,
+    removeWorktree,
+} from './git.js';
+import {dirname, join, resolve} from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {spawnSync} from 'node:child_process';
 import {saveUpload} from './uploads.js';
+import {ensureTestServer, installShutdownHooks} from './test-server.js';
 import {attachVscodeProxy} from './vscode-proxy.js';
+
+// Resolve once at module load — `scripts/stage-trivial-hunks.mjs` lives at the agent-storm
+// repo root, three levels up from this file (`packages/server/src/index.ts`).
+const stageTrivialHunksScript = resolve(
+    dirname(fileURLToPath(import.meta.url)),
+    '..',
+    '..',
+    '..',
+    'scripts',
+    'stage-trivial-hunks.mjs',
+);
+
+installShutdownHooks();
 
 /**
  * Mirror stdout/stderr to `serverLogPath` so the assistant can tail the backend output instead of
@@ -106,6 +139,7 @@ type SocketAttachment = {
 const attachmentsByWebSocket = new WeakMap<object, SocketAttachment>();
 
 await ensureDaemon();
+await resetClientErrorLog();
 
 await startFolderInfoRefreshLoop();
 
@@ -195,27 +229,37 @@ const implementation = implementService({
             /**
              * Re-enumerate folder targets now so a freshly-added repo (or removed one) shows up in
              * `/folders` immediately instead of waiting for the next background sweep cycle.
-             * `refreshFolderInfoNow` returns once `refreshState.targets` reflects the new layout,
-             * so by the time the frontend's follow-up `/folders` poll lands the new entry is
-             * already present (git/PR fields fill in over the next sweep).
+             * `publishTargetsFromConfig` reconciles the worktree list against disk and writes the
+             * reconciled config back; return that so the client sees the populated worktrees
+             * without an extra round trip.
              */
-            await refreshFolderInfoNow();
+            const reconciled = await publishTargetsFromConfig(requestData);
             return {
                 statusCode: HttpStatus.Ok,
-                responseData: requestData,
+                responseData: reconciled,
             };
         },
         async '/folders'() {
             return {
                 statusCode: HttpStatus.Ok,
                 responseData: {
-                    folders: await getCachedFolders(),
+                    folders: getCachedFolders(),
                 },
             };
         },
         async '/worktrees/create'({requestData}) {
             const {worktreePath} = await addWorktree(requestData);
-            await refreshFolderInfoNow();
+            // Fast path: we know exactly which worktree was added and where it lives, so skip
+            // the full reconcile (which would re-run getGitInfo for every existing worktree
+            // — that's the slow part on big repos). The next background sweep still catches
+            // anything created out-of-band by the CLI.
+            const newPath = normalizePath(join(requestData.repoPath, requestData.name));
+            const config = await loadConfig();
+            const updated = addWorktreeToConfig(config, requestData.repoPath, newPath);
+            if (updated !== config) {
+                await saveConfig(updated);
+            }
+            publishTargets(updated);
             await runPostWorktreeCmd({
                 repoPath: requestData.repoPath,
                 worktreePath,
@@ -228,6 +272,30 @@ const implementation = implementService({
             };
         },
         async '/worktrees/delete'({requestData}) {
+            const config = await loadConfig().catch(() => defaultConfig);
+            const parentRepoPath = dirname(requestData.worktreePath);
+            const parentRepo = config.repos.find((repo) => repo.path === parentRepoPath);
+            // Prefer the config's cached `isBase` flag — it's authoritative and avoids a git
+            // subprocess. Fall back to a live branch check if config hasn't seen this worktree
+            // yet (e.g. created outside agent-storm and not yet reconciled).
+            const knownWorktree = parentRepo?.worktrees.find(
+                (worktree) => worktree.path === requestData.worktreePath,
+            );
+            if (knownWorktree?.isBase && parentRepo?.baseBranch) {
+                return {
+                    statusCode: HttpStatus.BadRequest,
+                    responseErrorMessage: `Refusing to remove ${requestData.worktreePath}: it tracks the "${parentRepo.baseBranch}" base branch for ${parentRepoPath}.`,
+                };
+            }
+            if (!knownWorktree && parentRepo?.baseBranch) {
+                const info = await getGitInfo(requestData.worktreePath);
+                if (info.branch === parentRepo.baseBranch) {
+                    return {
+                        statusCode: HttpStatus.BadRequest,
+                        responseErrorMessage: `Refusing to remove ${requestData.worktreePath}: it tracks the "${parentRepo.baseBranch}" base branch for ${parentRepoPath}.`,
+                    };
+                }
+            }
             await killFolderPanes({
                 folder: requestData.worktreePath,
             });
@@ -237,12 +305,107 @@ const implementation = implementService({
                 /* if no vscode was running for this folder, killVscode is a no-op */
             });
             await removeWorktree(requestData);
-            await refreshFolderInfoNow();
+            // Fast path: we know which worktree was removed; skip the full reconcile.
+            const postDeleteConfig = removeWorktreeFromConfig(config, requestData.worktreePath);
+            if (postDeleteConfig !== config) {
+                await saveConfig(postDeleteConfig);
+            }
+            publishTargets(postDeleteConfig);
             return {
                 statusCode: HttpStatus.Ok,
                 responseData: {
                     ok: true,
                 },
+            };
+        },
+        async '/worktrees/mark-reviewed'({requestData}) {
+            const config = await loadConfig();
+            const repos = config.repos.map((repo) => {
+                if (!repo.worktrees.some((worktree) => worktree.path === requestData.worktreePath)) {
+                    return repo;
+                }
+                return {
+                    ...repo,
+                    worktrees: repo.worktrees.map((worktree) =>
+                        worktree.path === requestData.worktreePath
+                            ? {...worktree, lastReviewedSha: requestData.sha}
+                            : worktree,
+                    ),
+                };
+            });
+            const updated = {...config, repos};
+            await saveConfig(updated);
+            // Republish targets right away so `/folders` reflects the new SHA on the next poll
+            // (no waiting for the ~25s sweep). The sweep's reconcile preserves `lastReviewedSha`
+            // per worktree path, so this write survives the next disk-scan.
+            publishTargets(updated);
+            return {
+                statusCode: HttpStatus.Ok,
+                responseData: {
+                    ok: true,
+                },
+            };
+        },
+        async '/worktrees/set-merge-step'({requestData}) {
+            const config = await loadConfig();
+            const repos = config.repos.map((repo) => {
+                if (!repo.worktrees.some((worktree) => worktree.path === requestData.worktreePath)) {
+                    return repo;
+                }
+                return {
+                    ...repo,
+                    worktrees: repo.worktrees.map((worktree) => {
+                        if (worktree.path !== requestData.worktreePath) {
+                            return worktree;
+                        }
+                        const nextValues = {...(worktree.mergeStepValues ?? {})};
+                        if (requestData.value == null) {
+                            // Null clears the step — same shape as the un-toggled / never-set
+                            // state, which keeps the config file from accumulating dead keys.
+                            delete nextValues[requestData.name];
+                        } else {
+                            nextValues[requestData.name] = requestData.value;
+                        }
+                        return {...worktree, mergeStepValues: nextValues};
+                    }),
+                };
+            });
+            const updated = {...config, repos};
+            await saveConfig(updated);
+            publishTargets(updated);
+            return {
+                statusCode: HttpStatus.Ok,
+                responseData: {
+                    ok: true,
+                },
+            };
+        },
+        async '/worktrees/test-server/start'({requestData}) {
+            const {port: detectedPort, reused} = await ensureTestServer(requestData.worktreePath);
+            return {
+                statusCode: HttpStatus.Ok,
+                responseData: {
+                    port: detectedPort,
+                    reused,
+                },
+            };
+        },
+        async '/worktrees/stage-trivial-hunks'({requestData}) {
+            const result = spawnSync(process.execPath, [stageTrivialHunksScript], {
+                cwd: requestData.worktreePath,
+                encoding: 'utf8',
+                maxBuffer: 64 * 1024 * 1024,
+            });
+            const output = [result.stdout, result.stderr].filter(Boolean).join('');
+            if (result.status !== 0) {
+                return {
+                    statusCode: HttpStatus.InternalServerError,
+                    responseErrorMessage: output || 'stage-trivial-hunks failed',
+                };
+            }
+            return {
+                statusCode: HttpStatus.Ok,
+                responseData: {output},
             };
         },
         async '/panes/restart'({requestData}) {
@@ -290,6 +453,79 @@ const implementation = implementService({
                 statusCode: HttpStatus.Ok,
                 responseData: {
                     path,
+                },
+            };
+        },
+        async '/repos/inspect'({requestData}) {
+            const inspection = await inspectRepoPath(requestData.path);
+            return {
+                statusCode: HttpStatus.Ok,
+                responseData: inspection,
+            };
+        },
+        async '/repos/convert-to-worktree'({requestData}) {
+            await convertRepoToWorktreeLayout(requestData.repoPath);
+            // After conversion the repo path now hosts a worktree layout; reconcile so the
+            // config reflects the new on-disk shape before the frontend reads it back.
+            await publishTargetsFromConfig(await loadConfig());
+            return {
+                statusCode: HttpStatus.Ok,
+                responseData: {
+                    ok: true,
+                },
+            };
+        },
+        async '/repos/delete'({requestData}) {
+            const config = await loadConfig().catch(() => defaultConfig);
+            if (!config.repos.some((repo) => repo.path === requestData.repoPath)) {
+                return {
+                    statusCode: HttpStatus.NotFound,
+                    responseErrorMessage: `Repo ${requestData.repoPath} is not registered.`,
+                };
+            }
+            const nextConfig = {
+                ...config,
+                repos: config.repos.filter((repo) => repo.path !== requestData.repoPath),
+            };
+            await saveConfig(nextConfig);
+            await publishTargetsFromConfig(nextConfig);
+            return {
+                statusCode: HttpStatus.Ok,
+                responseData: {
+                    ok: true,
+                },
+            };
+        },
+        async '/folder-picker'() {
+            try {
+                const path = await pickFolder();
+                return {
+                    statusCode: HttpStatus.Ok,
+                    responseData: {
+                        path,
+                    },
+                };
+            } catch (error: unknown) {
+                const message = error instanceof Error ? error.message : String(error);
+                log.error(`folder-picker failed: ${message}`);
+                return {
+                    statusCode: HttpStatus.InternalServerError,
+                    responseErrorMessage: message,
+                };
+            }
+        },
+        async '/client-errors'({requestData}) {
+            await appendClientError({
+                message: requestData.message,
+                stack: requestData.stack ?? null,
+                source: requestData.source,
+                url: requestData.url ?? null,
+                userAgent: requestData.userAgent ?? null,
+            });
+            return {
+                statusCode: HttpStatus.Ok,
+                responseData: {
+                    ok: true,
                 },
             };
         },
@@ -342,6 +578,7 @@ const implementation = implementService({
 const server = fastify({
     bodyLimit: 25 * 1024 * 1024,
 });
+
 await attachService(server, implementation, {
     throwErrorsForExternalHandling: false,
 });
@@ -352,13 +589,16 @@ await attachService(server, implementation, {
  */
 attachVscodeProxy(server);
 /**
- * Bind to `0.0.0.0` so the dev server is reachable over LAN (testing the UI from a phone or another
- * laptop after running the vite frontend with `--host`). The auth-secret check in `createContext`
- * is what actually keeps a LAN attacker out — the bind alone is just a reachability concern.
+ * Default to `127.0.0.1` so the dev server isn't reachable over LAN. The auth-secret on the
+ * wire would otherwise be a passive-sniffer hazard (no TLS in dev). LAN testing — the UI from
+ * a phone or another laptop — is still possible via `AGENT_STORM_BIND_HOST=0.0.0.0`, at which
+ * point the bearer-secret check becomes the only thing gating access (which is fine because
+ * the secret is 256 bits of unguessable randomness; see `packages/server/src/auth.ts`).
  */
+const bindHost = process.env.AGENT_STORM_BIND_HOST || '127.0.0.1';
 const listenAddress = await server.listen({
     port,
-    host: '0.0.0.0',
+    host: bindHost,
 });
 
 log.success(`agent-storm server listening on ${listenAddress}`);

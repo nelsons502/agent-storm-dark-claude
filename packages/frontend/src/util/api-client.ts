@@ -1,8 +1,15 @@
-import {agentStormService, type Config, type FolderInfo, type PaneKind} from '@agent-storm/common';
+import {
+    agentStormService,
+    type Config,
+    type FolderInfo,
+    type PaneKind,
+    type RepoInspection,
+} from '@agent-storm/common';
 import {HttpMethod} from '@augment-vir/common';
 import {fetchEndpoint} from '@rest-vir/define-service';
 import {clearStoredSecret, ensureSecret} from './auth.js';
 import {notifyBackendFailure, notifyBackendSuccess} from './backend-watchdog.js';
+import {reportClientError} from './error-reporter.js';
 
 async function authOptions(): Promise<{options: {headers: Record<string, string>}}> {
     return {
@@ -47,7 +54,15 @@ async function callApi<Data>(
         } else {
             notifyBackendSuccess();
         }
-        throw new Error(`${label} failed: ${String(result.data)}`);
+        const error = new Error(`${label} failed: ${String(result.data)}`);
+        /**
+         * Report at the API boundary so backend failures land in
+         * `.logs/frontend-errors.log` even when callers catch the thrown error
+         * and surface it as inline UI (which would otherwise hide it from the
+         * global error reporter).
+         */
+        reportClientError(error, 'api-client');
+        throw error;
     }
     notifyBackendSuccess();
     return result.data;
@@ -107,6 +122,58 @@ export async function deleteWorktree(params: Readonly<{worktreePath: string}>): 
             ...options,
             requestData: params,
         }),
+    );
+}
+
+export async function markWorktreeReviewed(
+    params: Readonly<{worktreePath: string; sha: string | null}>,
+): Promise<void> {
+    const options = await authOptions();
+    await callApi(
+        'POST /worktrees/mark-reviewed',
+        fetchEndpoint(agentStormService.endpoints['/worktrees/mark-reviewed'], {
+            ...options,
+            requestData: params,
+        }),
+    );
+}
+
+export async function setWorktreeMergeStep(
+    params: Readonly<{worktreePath: string; name: string; value: boolean | null}>,
+): Promise<void> {
+    const options = await authOptions();
+    await callApi(
+        'POST /worktrees/set-merge-step',
+        fetchEndpoint(agentStormService.endpoints['/worktrees/set-merge-step'], {
+            ...options,
+            requestData: params,
+        }),
+    );
+}
+
+export async function startWorktreeTestServer(
+    params: Readonly<{worktreePath: string}>,
+): Promise<{port: number; reused: boolean}> {
+    const options = await authOptions();
+    return await ensureOk(
+        await fetchEndpoint(agentStormService.endpoints['/worktrees/test-server/start'], {
+            ...options,
+            requestData: params,
+        }),
+        'POST /worktrees/test-server/start',
+    );
+}
+
+export async function stageTrivialHunks(
+    params: Readonly<{worktreePath: string}>,
+): Promise<{output: string}> {
+    const options = await authOptions();
+    return await ensureOk(
+        await fetchEndpoint(agentStormService.endpoints['/worktrees/stage-trivial-hunks'], {
+            ...options,
+            requestData: params,
+        }),
+        'POST /worktrees/stage-trivial-hunks',
     );
 }
 
@@ -187,6 +254,48 @@ export async function killVscode(params: Readonly<{folder: string}>): Promise<vo
         const message = await response.text().catch(() => '');
         throw new Error(`POST /vscode/kill failed: ${response.status} ${message}`);
     }
+}
+
+export async function inspectRepo(path: string): Promise<RepoInspection> {
+    const options = await authOptions();
+    return await callApi(
+        'POST /repos/inspect',
+        fetchEndpoint(agentStormService.endpoints['/repos/inspect'], {
+            ...options,
+            requestData: {path},
+        }),
+    );
+}
+
+export async function convertRepoToWorktree(repoPath: string): Promise<void> {
+    const options = await authOptions();
+    await callApi(
+        'POST /repos/convert-to-worktree',
+        fetchEndpoint(agentStormService.endpoints['/repos/convert-to-worktree'], {
+            ...options,
+            requestData: {repoPath},
+        }),
+    );
+}
+
+export async function deleteRepo(repoPath: string): Promise<void> {
+    const options = await authOptions();
+    await callApi(
+        'POST /repos/delete',
+        fetchEndpoint(agentStormService.endpoints['/repos/delete'], {
+            ...options,
+            requestData: {repoPath},
+        }),
+    );
+}
+
+export async function pickFolder(): Promise<string | null> {
+    const options = await authOptions();
+    const data = await callApi(
+        'POST /folder-picker',
+        fetchEndpoint(agentStormService.endpoints['/folder-picker'], options),
+    );
+    return data.path ?? null;
 }
 
 export async function uploadFile(

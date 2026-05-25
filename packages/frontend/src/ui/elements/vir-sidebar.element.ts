@@ -1,27 +1,18 @@
-import {type FolderInfo, PaneKind, PaneStatus} from '@agent-storm/common';
-import {check} from '@augment-vir/assert';
-import {log} from '@augment-vir/common';
-import {colorCss} from '@electrovir/color';
-import {css, defineElement, defineElementEvent, html, listen} from 'element-vir';
+import {type FolderInfo, PaneKind} from '@agent-storm/common';
+import {css, defineElement, html, listen} from 'element-vir';
 import {parseUrl} from 'url-vir';
 import {
-    createSizedIcon,
     HorizontalAnchor,
-    LoaderAnimated24Icon,
     lucideIcons,
     renderMenuItemEntries,
     ViraButton,
     ViraColorVariant,
-    ViraEmphasis,
-    ViraIcon,
-    ViraLink,
-    type ViraMenuItemEntry,
     ViraMenuTrigger,
+    type ViraMenuItemEntry,
+    ViraModal,
     ViraSize,
-    viraThemeByKeys,
 } from 'vira';
 import {
-    createWorktree,
     deleteWorktree,
     getConfig,
     getFolders,
@@ -29,68 +20,109 @@ import {
     putConfig,
     restartPane,
 } from '../../util/api-client.js';
-import {AgentStormMarkIcon} from '../icons/agent-storm-mark.icon.js';
+import {
+    addRepoFlow,
+    type ConvertRepoConfirmRequest,
+    type PickBaseBranchRequest,
+} from '../../util/add-repo.js';
+import {reportClientError} from '../../util/error-reporter.js';
+import {localStorageClient} from '../../util/local-storage-client.js';
+import {router} from '../../util/router.js';
+import {viraButtonOverrides} from '../button-overrides.styles.js';
+import {VirConvertRepoModal} from './vir-convert-repo-modal.element.js';
+import {VirPickBaseBranchModal} from './vir-pick-base-branch-modal.element.js';
+import {isAnyMergeStepLoading} from './vir-progress-tracker.element.js';
 
-const allowedLinkHostnames = ['github.com'];
+/**
+ * Only `https://github.com/...` URLs are allowed through `window.open`. `prUrl` ultimately comes
+ * from `gh pr view --json url` which we trust, but `window.open` will happily navigate to
+ * `javascript:...` (executes in opener context) and `file://...` URLs, and a hypothetical
+ * compromised `gh` output could redirect to an attacker domain. Parsing with `url-vir`'s `parseUrl`
+ * (instead of regex) gives us a structured scheme + hostname split that can't be tricked by
+ * `https://github.com.evil.com` (different hostname) or `https://github.com@evil.com` (different
+ * host) — both of which a simple `startsWith` check would let through.
+ */
+function openPrUrl(prUrl: string | null | undefined): void {
+    if (!prUrl) {
+        return;
+    }
+    const parsed = parseUrl(prUrl);
+    const isHttp = parsed.protocol === 'https' || parsed.protocol === 'http';
+    if (!isHttp || parsed.hostname !== 'github.com') {
+        return;
+    }
+    window.open(prUrl, '_blank', 'noopener');
+}
 
-const pollIntervalMs = 2000;
+/**
+ * Sidebar status (Working / Needs attention grouping, pane dots) is the only signal a user has
+ * that their typed input registered, so this needs to feel near-instant. 500ms is fast enough
+ * that flipping a pane between Idle and Busy looks responsive, slow enough to keep `/folders`
+ * load modest.
+ */
+const pollIntervalMs = 500;
 
-const loaderIcon = createSizedIcon(LoaderAnimated24Icon, 12);
-const dashIcon = createSizedIcon(lucideIcons.Minus, 12);
-const exitedIcon = createSizedIcon(lucideIcons.X, 12);
-const mergedCheckIcon = createSizedIcon(lucideIcons.Check, 14);
+function isWorking(folder: FolderInfo): boolean {
+    // Working = at least one progress-tracker step is currently rendering as loading. The
+    // merge-steps config is the single source of truth for what "passively waiting" means,
+    // so the sidebar grouping never drifts from what the user sees on the step nodes
+    // (AI-generating spinning, CI in flight, get-approval spinning while waiting on a
+    // reviewer, etc.). Failures and done states inherently fall through to Needs-attention
+    // via the done > failed > loading precedence inside `evaluateMergeStep`.
+    return isAnyMergeStepLoading(folder);
+}
 
-const buttonIconSize = 16;
-const plusIcon = createSizedIcon(lucideIcons.Plus, buttonIconSize);
-const settingsIcon = createSizedIcon(lucideIcons.Settings, buttonIconSize);
-const ellipsisIcon = createSizedIcon(lucideIcons.Ellipsis, buttonIconSize);
-const brandMarkIcon = createSizedIcon(AgentStormMarkIcon, 16);
-
-const paneStatusColor: Record<PaneStatus, string> = {
-    [PaneStatus.None]: String(viraThemeByKeys.grey.foreground.decoration.foreground.value),
-    [PaneStatus.Busy]: String(viraThemeByKeys.pink.foreground.header.foreground.value),
-    [PaneStatus.Idle]: String(viraThemeByKeys.grey.foreground.header.foreground.value),
-    [PaneStatus.Exited]: String(viraThemeByKeys.red.foreground.header.foreground.value),
-};
+function buildMetaLabel(folder: FolderInfo): string {
+    if (folder.git.unpushed && folder.git.dirty) {
+        return '↑·*';
+    } else if (folder.git.unpushed) {
+        return '↑';
+    } else if (folder.git.dirty) {
+        return '*';
+    }
+    return '';
+}
 
 type SidebarState = {
     folders: ReadonlyArray<FolderInfo>;
     pollHandle: ReturnType<typeof setInterval> | undefined;
     loadError: string | undefined;
-    openMenuKey: string | undefined;
+    actionError: {title: string; message: string} | undefined;
+    openMenuFolderPath: string | undefined;
+    repoFilter: string | undefined;
+    convertRequest: ConvertRepoConfirmRequest | undefined;
+    convertResolve: ((confirmed: boolean) => void) | undefined;
+    pickBranchRequest: PickBaseBranchRequest | undefined;
+    pickBranchResolve: ((branch: string | undefined) => void) | undefined;
+    /**
+     * Whether the "Working" group is currently collapsed. Hydrated from
+     * `localStorageClient.workingGroupCollapsed` so the choice survives reloads and persists
+     * across browser sessions per workspace.
+     */
+    workingCollapsed: boolean;
 };
 
 type SidebarUpdate = (newState: Partial<SidebarState>) => void;
 
 export const VirSidebar = defineElement<{
     activeFolder: string | undefined;
+    onActivate: (folder: string) => void;
+    onOpenSettings: () => void;
 }>()({
     tagName: 'vir-sidebar',
-    events: {
-        /**
-         * Emitted when the user clicks a folder row or when an internal action (e.g. creating a
-         * worktree) wants to make the new folder the active one. Detail is the absolute folder
-         * path. Parent owns the `activeFolder` / `openedFolders` state, so it listens for this and
-         * updates accordingly.
-         */
-        folderActivated: defineElementEvent<string>(),
-        /**
-         * Emitted just after the user confirms a worktree-delete or repo-remove, before the API
-         * trip starts. The detail carries every folder path that is now gone (the removed item
-         * plus, for repo removal, all of its worktree children). The parent listens to clear
-         * `activeFolder` if it pointed at one of them and drop them from `openedFolders` so the
-         * right-hand pane unmounts immediately instead of waiting for the next folder-info poll.
-         */
-        foldersRemoved: defineElementEvent<ReadonlyArray<string>>(),
-        /** Emitted when the user clicks the gear button. Parent owns the modal open state. */
-        openSettingsRequested: defineElementEvent<void>(),
-    },
     state(): SidebarState {
         return {
             folders: [],
             pollHandle: undefined,
             loadError: undefined,
-            openMenuKey: undefined,
+            actionError: undefined,
+            openMenuFolderPath: undefined,
+            repoFilter: undefined,
+            convertRequest: undefined,
+            convertResolve: undefined,
+            pickBranchRequest: undefined,
+            pickBranchResolve: undefined,
+            workingCollapsed: localStorageClient.workingGroupCollapsed.read(),
         };
     },
     styles: css`
@@ -98,632 +130,936 @@ export const VirSidebar = defineElement<{
             display: flex;
             flex-direction: column;
             height: 100%;
-            font-family: ui-sans-serif, system-ui, sans-serif;
-            font-size: 12px;
-            border-right: 1px solid ${viraThemeByKeys.grey['behind-bg'].decoration.background.value};
+            font-family: var(--font-body);
+            font-size: 12.5px;
+            line-height: 1.5;
+            background: var(--sidebar-bg);
+            color: var(--sidebar-fg);
+            border-right: 1px solid var(--sidebar-border);
             overflow: hidden;
+            -webkit-font-smoothing: antialiased;
         }
 
-        .header {
+        .brand {
             display: flex;
             align-items: center;
-            justify-content: space-between;
-            padding: 8px 10px;
-            border-bottom: 1px solid
-                ${viraThemeByKeys.grey['behind-bg'].decoration.background.value};
-            gap: 6px;
+            gap: 12px;
+            padding: 22px 22px 18px;
+            border-bottom: 1px solid var(--sidebar-border);
         }
 
-        .title {
+        .topbar {
+            padding: 14px 16px 4px;
+        }
+
+        vira-button.new-worktree {
+            width: 100%;
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            font-size: 11px;
+            --vira-button-background-color: color-mix(in srgb, var(--copper) 6%, transparent);
+            --vira-button-text-color: var(--copper);
+            --vira-button-border-color: var(--copper);
+            --vira-button-hover-background-color: color-mix(
+                in srgb,
+                var(--copper) 14%,
+                transparent
+            );
+            --vira-button-hover-text-color: var(--copper);
+            --vira-button-hover-border-color: var(--copper);
+            --vira-button-active-background-color: color-mix(
+                in srgb,
+                var(--copper) 14%,
+                transparent
+            );
+            --vira-button-active-text-color: var(--copper);
+            --vira-button-active-border-color: var(--copper);
+        }
+
+        .brand-mark {
+            width: 32px;
+            height: 32px;
+            flex-shrink: 0;
+            display: block;
+        }
+
+        .brand-text {
+            display: flex;
+            flex-direction: column;
+            min-width: 0;
+        }
+
+        .brand-name {
+            font-family: var(--font-body);
+            font-weight: 600;
+            font-size: 17px;
+            letter-spacing: -0.02em;
+            color: var(--sidebar-fg);
+            line-height: 1.1;
+        }
+
+        .brand-name em {
+            font-style: normal;
+            color: var(--copper);
+            font-weight: 600;
+            margin: 0 1px;
+        }
+
+        .brand-version {
+            font-size: 9px;
+            color: var(--sidebar-fg-subtle);
+            letter-spacing: 0.18em;
+            text-transform: uppercase;
+            margin-top: 4px;
+        }
+
+        .section-label {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 18px 22px 10px;
+            font-size: 9px;
+            letter-spacing: 0.22em;
+            text-transform: uppercase;
+            color: var(--sidebar-fg-subtle);
+        }
+
+        .section-label .count {
+            color: var(--sidebar-fg-faint);
+            font-weight: 400;
+            font-feature-settings: 'tnum';
+        }
+
+        .section-actions {
             display: inline-flex;
             align-items: center;
             gap: 6px;
-            font-weight: 600;
-            letter-spacing: 0.02em;
-            color: ${viraThemeByKeys.grey.foreground.header.foreground.value};
-            font-size: 13px;
         }
 
-        .header-actions {
+        vira-button.filter-button {
+            --vira-button-padding: 2px;
+        }
+
+        vira-button.filter-button[data-active] {
+            --vira-button-text-color: var(--copper);
+            --vira-button-hover-text-color: var(--copper);
+            --vira-button-active-text-color: var(--copper);
+        }
+
+        .filter-status {
+            padding: 0 22px 8px;
             display: flex;
-            gap: 6px;
             align-items: center;
+            gap: 6px;
+            font-size: 10.5px;
+            color: var(--sidebar-fg-subtle);
+        }
+
+        .filter-status .filter-clear {
+            color: var(--copper);
+            cursor: pointer;
+            text-decoration: underline;
+            text-underline-offset: 2px;
         }
 
         .list {
             flex-grow: 1;
             overflow-y: auto;
-            padding: 4px 0 32px;
-            /* Atkinson Hyperlegible Next — proportional sans designed for legibility (especially
-               for low-vision readers). The rest of the sidebar (logo title, error banner, etc.)
-               keeps the system sans-serif inherited from :host. */
-            font-family: 'Atkinson Hyperlegible Next', ui-sans-serif, system-ui, sans-serif;
-            font-size: 13px;
-            font-weight: 300;
-            letter-spacing: 0.01em;
+            padding: 0 16px 12px;
+            display: flex;
+            flex-direction: column;
+            gap: 1px;
         }
 
-        .repo-header {
-            padding: 6px 10px 2px;
-            font-weight: 600;
+        .group-label {
             display: flex;
             justify-content: space-between;
             align-items: center;
+            padding: 14px 6px 6px;
+            font-size: 9px;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: var(--sidebar-fg-subtle);
+        }
+
+        .group-label:first-child {
+            padding-top: 6px;
+        }
+
+        .group-label .group-count {
+            color: var(--sidebar-fg-faint);
+            font-weight: 400;
+            font-feature-settings: 'tnum';
+        }
+
+        .group-label[data-variant='attention'] {
+            color: var(--amber);
+        }
+
+        /*
+         * The "Working" header (when both groups are present) gets a top border + a bit more
+         * breathing room to visually separate from "Needs attention" above it. The
+         * :first-child guard suppresses the border when Working is the only group — no
+         * stray line needed at the very top.
+         */
+        .group-label[data-variant='working']:not(:first-child) {
+            border-top: 1px solid var(--sidebar-border);
+            margin-top: 6px;
+            padding-top: 14px;
+        }
+
+        .group-label.collapsible {
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .group-label.collapsible:hover {
+            color: var(--sidebar-fg);
+        }
+
+        .group-label .group-left {
+            display: inline-flex;
+            align-items: center;
             gap: 6px;
+        }
+
+        .group-chevron {
+            display: inline-flex;
+            font-size: 10px;
+            line-height: 1;
+            transition: transform 120ms ease;
+        }
+
+        .group-label[data-collapsed] .group-chevron {
+            transform: rotate(-90deg);
+        }
+
+        /*
+         * Rows in the "Working" group are passive — the user isn't expected to act on them
+         * until something completes — so dim the name and the meta text. The active row stays
+         * full strength via the [data-active] rule below so it's still obvious which one is
+         * selected.
+         */
+        .row[data-working]:not([data-active]) .name,
+        .row[data-working]:not([data-active]) .meta {
+            color: var(--sidebar-fg-subtle);
+        }
+
+        .list::-webkit-scrollbar {
+            width: 8px;
+        }
+        .list::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        .list::-webkit-scrollbar-thumb {
+            background: var(--sidebar-border-2);
+            border-radius: var(--radius-full);
+        }
+        .list::-webkit-scrollbar-thumb:hover {
+            background: var(--sidebar-fg-faint);
         }
 
         .row {
             display: flex;
             align-items: center;
-            gap: 4px;
-            padding: 0 10px;
+            gap: 10px;
+            padding: 9px 10px;
+            margin: 1px 0;
+            border-radius: 4px;
             cursor: pointer;
             user-select: none;
-        }
-
-        .row .chips + .name {
-            margin-left: -2px;
+            color: var(--sidebar-fg-muted);
+            font-size: 12.5px;
+            position: relative;
+            transition:
+                background-color 120ms ease,
+                color 120ms ease;
         }
 
         .row:hover {
-            background-color: ${viraThemeByKeys.grey['behind-fg']['small-body'].background.value};
+            background: var(--sidebar-accent-bg-hover);
+            color: var(--sidebar-accent-fg);
         }
 
         .row[data-active] {
-            background-color: ${viraThemeByKeys.blue['behind-fg']['small-body'].background.value};
+            background: var(--sidebar-accent-bg);
+            color: var(--sidebar-accent-fg);
         }
 
-        .row[data-indented] {
-            padding-left: 22px;
-        }
-
-        .chips {
-            display: inline-flex;
-            gap: 0;
-        }
-
-        .chip {
-            width: 12px;
-            height: 12px;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
+        .row[data-active]::before {
+            content: '';
+            position: absolute;
+            left: -16px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 2px;
+            height: 18px;
+            background: var(--sidebar-accent-rail);
+            border-radius: 0 2px 2px 0;
         }
 
         .name {
             flex-grow: 1;
             min-width: 0;
-            overflow-wrap: anywhere;
-            padding: 2px 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            font-weight: 500;
         }
 
         .name[data-pr-open] {
             text-decoration: underline;
-            text-decoration-color: ${viraThemeByKeys.blue.foreground.body.foreground.value};
+            text-decoration-color: var(--blue-400);
+            text-underline-offset: 2px;
         }
 
         .name[data-pr-merged] {
             text-decoration: underline;
-            text-decoration-color: ${viraThemeByKeys.purple.foreground.body.foreground.value};
+            text-decoration-color: var(--purple-500);
+            text-underline-offset: 2px;
         }
 
-        .pr-merged-check {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            width: 14px;
-            height: 14px;
-            color: ${viraThemeByKeys.green.foreground.header.foreground.value};
+        .meta {
+            font-size: 10px;
+            color: var(--sidebar-fg-subtle);
+            font-feature-settings: 'tnum';
             flex-shrink: 0;
+            max-width: 60px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .row[data-active] .meta {
+            color: var(--copper);
         }
 
         .actions {
             display: inline-flex;
             gap: 2px;
+            margin-left: 2px;
         }
 
-        .row .actions {
-            opacity: 0.35;
+        vira-button.add-repo {
+            margin: 8px 16px 0;
         }
 
-        .repo-header .actions {
-            opacity: 0;
+        .foot {
+            margin-top: auto;
+            padding: 14px 22px;
+            border-top: 1px solid var(--sidebar-border);
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            font-size: 10.5px;
+            color: var(--sidebar-fg-subtle);
         }
 
-        .row:hover .actions,
-        .row[data-menu-open] .actions,
-        .repo-header:hover .actions,
-        .repo-header[data-menu-open] .actions {
-            opacity: 1;
+        .foot-meta {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .foot-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: var(--moss);
+            box-shadow: 0 0 6px rgba(122, 145, 89, 0.7);
+            flex-shrink: 0;
+        }
+
+        vira-button.ghost-icon {
+            --vira-button-background-color: transparent;
+            --vira-button-text-color: var(--sidebar-fg-subtle);
+            --vira-button-border-color: transparent;
+            --vira-button-hover-background-color: var(--sidebar-accent-bg-hover);
+            --vira-button-hover-text-color: var(--sidebar-fg);
+            --vira-button-hover-border-color: transparent;
+            --vira-button-active-background-color: var(--sidebar-accent-bg-hover);
+            --vira-button-active-text-color: var(--sidebar-fg);
+            --vira-button-active-border-color: transparent;
         }
 
         .error {
-            padding: 8px 10px;
-            ${colorCss(viraThemeByKeys.red['behind-bg'].body)};
-            border-bottom: 1px solid ${viraThemeByKeys.red['behind-bg'].decoration.background.value};
+            margin: 8px 16px 0;
+            padding: 10px 12px;
+            border-radius: var(--radius-md);
+            background: var(--bg-error);
+            color: var(--fg-error);
+            border: 1px solid var(--border-error);
+            font-size: var(--font-size-xs);
+            line-height: var(--line-height-xs);
             white-space: pre-wrap;
         }
 
-        .empty {
-            padding: 16px 10px;
-            color: ${viraThemeByKeys.grey.foreground.placeholder.foreground.value};
-            text-align: center;
+        .error-modal-body {
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            min-width: 420px;
+            max-width: 720px;
+            color: var(--fg);
+            font-family: var(--font-body);
         }
+
+        .error-modal-message {
+            font-family: var(--font-mono);
+            font-size: var(--font-size-sm);
+            line-height: var(--line-height-sm);
+            color: var(--fg);
+            background: var(--bg-error);
+            border: 1px solid var(--border-error);
+            border-radius: var(--radius-md);
+            padding: 12px 14px;
+            white-space: pre-wrap;
+            word-break: break-word;
+            max-height: 60vh;
+            overflow: auto;
+        }
+
+        .error-modal-footer {
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+        }
+
+        .empty {
+            padding: 16px 12px;
+            color: var(--sidebar-fg-subtle);
+            text-align: center;
+            font-size: 11px;
+        }
+
+        ${viraButtonOverrides}
     `,
-    init({state, updateState}) {
-        void refresh(state, updateState);
+    init({updateState}) {
+        void refresh(updateState);
         const pollHandle = setInterval(() => {
-            void refresh(state, updateState);
+            void refresh(updateState);
         }, pollIntervalMs);
         updateState({
-            pollHandle,
-        });
+pollHandle
+});
     },
     cleanup({state}) {
         if (state.pollHandle) {
             clearInterval(state.pollHandle);
         }
     },
-    render({inputs, state, updateState, dispatch, events}) {
-        const standaloneFolders = state.folders
-            .filter((folder) => !folder.isWorktreeRoot && !folder.parentRepoPath)
-            .toSorted((a, b) =>
-                a.name.localeCompare(b.name, undefined, {
-                    sensitivity: 'base',
-                }),
-            );
+    render({inputs, state, updateState}) {
         const worktreeRoots = state.folders.filter((folder) => folder.isWorktreeRoot);
         /**
-         * Closes over `state.folders` from the latest render so the optimistic-delete handler can
-         * filter against the freshest snapshot without having to ask for a re-read.
+         * Base-branch worktrees are the canonical home for shared local-only files
+         * (`.not-committed/`, secrets) seeded into new worktrees, so they're hidden from the
+         * sidebar and can't be removed. The backend enforces the same rule in `/worktrees/delete`;
+         * filtering here just prevents the user from being offered an action that will be refused.
          */
-        const removeFolderLocally = (path: string) => {
-            updateState({
-                folders: state.folders.filter((folder) => folder.path !== path),
-            });
-        };
-        /**
-         * Fire the `foldersRemoved` event so the parent can drop `activeFolder` / `openedFolders`
-         * entries pointing at the gone folders. Used by the delete-worktree and remove-repo flows
-         * after the user confirms but before the API trip.
-         */
-        const emitFoldersRemoved = (paths: ReadonlyArray<string>) => {
-            dispatch(new events.foldersRemoved(paths));
-        };
-        const emitFolderActivated = (path: string) => {
-            dispatch(new events.folderActivated(path));
-        };
+        const allWorktrees = worktreeRoots.flatMap((root) =>
+            state.folders.filter(
+                (folder) => folder.parentRepoPath === root.path && !folder.isBaseBranch,
+            ),
+        );
+        const repoOptions: ReadonlyArray<{path: string; name: string}> = worktreeRoots.map(
+            (folder) => ({
+                path: folder.path,
+                name: folder.name,
+            }),
+        );
+        const knownRepoPaths = new Set(repoOptions.map((repo) => repo.path));
+        const activeRepoFilter =
+            state.repoFilter && knownRepoPaths.has(state.repoFilter)
+                ? state.repoFilter
+                : undefined;
+        const visibleWorktrees = activeRepoFilter
+            ? allWorktrees.filter((folder) => folder.parentRepoPath === activeRepoFilter)
+            : allWorktrees;
+        const workingWorktrees = visibleWorktrees.filter(isWorking);
+        const needsAttentionWorktrees = visibleWorktrees.filter((folder) => !isWorking(folder));
+        const worktreeCount = visibleWorktrees.length.toString().padStart(2, '0');
+        const activeRepoName = activeRepoFilter
+            ? repoOptions.find((repo) => repo.path === activeRepoFilter)?.name
+            : undefined;
+        const newWorktreeEntries = worktreeRoots.length
+            ? worktreeRoots.map((folder) => ({
+                  content: folder.name,
+                  onClick: () => {
+                      router.setRoute({
+                          paths: ['add-worktree', encodeURIComponent(folder.path)],
+                      });
+                  },
+              }))
+            : [
+                  {
+                      content: 'No repositories yet',
+                      disabled: true,
+                      onClick: () => {},
+                  },
+              ];
+
+        const filterEntries: ViraMenuItemEntry[] = [
+            {
+                content: 'All repositories',
+                selected: !activeRepoFilter,
+                onClick: () => updateState({
+repoFilter: undefined
+}),
+            },
+            ...(repoOptions.length
+                ? repoOptions.map((repo) => ({
+                      content: repo.name,
+                      selected: activeRepoFilter === repo.path,
+                      onClick: () => updateState({
+repoFilter: repo.path
+}),
+                  }))
+                : [
+                      {
+                          content: 'No repositories yet',
+                          disabled: true,
+                          onClick: () => {},
+                      },
+                  ]),
+        ];
 
         return html`
-            <div class="header">
-                <span class="title">
-                    <${ViraIcon.assign({
-                        icon: brandMarkIcon,
-                    })}></${ViraIcon}>
-                    agent-storm
-                </span>
-                <span class="header-actions">
+            <div class="brand">
+                <img
+                    class="brand-mark"
+                    src="/agent-storm-mark.svg"
+                    width="32"
+                    height="32"
+                    alt=""
+                    aria-hidden="true"
+                />
+                <div class="brand-text">
+                    <div class="brand-name">agent<em>·</em>storm</div>
+                    <div class="brand-version">workspace</div>
+                </div>
+            </div>
+
+            <div class="topbar">
+                <${ViraMenuTrigger.assign({
+                    horizontalAnchor: HorizontalAnchor.Left,
+                })}>
                     <${ViraButton.assign({
-                        text: 'Add',
-                        icon: plusIcon,
-                        buttonSize: ViraSize.Small,
-                        color: ViraColorVariant.Brand,
+                        text: 'New worktree',
+                        icon: lucideIcons.GitBranchPlus,
+                        buttonSize: ViraSize.Medium,
+                        color: ViraColorVariant.Custom,
                     })}
-                        ${listen(
-                            'click',
-                            () => void promptAddRepo(updateState, emitFolderActivated),
-                        )}
+                        slot=${ViraMenuTrigger.slotNames.trigger}
+                        class="new-worktree"
+                        title="Create a new worktree in one of your repositories"
                     ></${ViraButton}>
-                    <${ViraButton.assign({
-                        icon: settingsIcon,
-                        buttonSize: ViraSize.Small,
-                        buttonEmphasis: ViraEmphasis.Subtle,
-                        color: ViraColorVariant.Neutral,
-                    })}
-                        ${listen('click', () => dispatch(new events.openSettingsRequested()))}
-                    ></${ViraButton}>
+                    ${renderMenuItemEntries(newWorktreeEntries)}
+                </${ViraMenuTrigger}>
+            </div>
+
+            <div class="section-label">
+                <span>Worktrees</span>
+                <span class="section-actions">
+                    <span class="count">${worktreeCount}</span>
+                    <${ViraMenuTrigger.assign({
+                        horizontalAnchor: HorizontalAnchor.Right,
+                    })}>
+                        <${ViraButton.assign({
+                            icon: lucideIcons.EllipsisVertical,
+                            buttonSize: ViraSize.Small,
+                            color: ViraColorVariant.Custom,
+                        })}
+                            slot=${ViraMenuTrigger.slotNames.trigger}
+                            class="ghost-icon filter-button"
+                            ?data-active=${!!activeRepoFilter}
+                            aria-label="Filter worktrees"
+                            title="Filter by repository"
+                        ></${ViraButton}>
+                        ${renderMenuItemEntries(filterEntries)}
+                    </${ViraMenuTrigger}>
                 </span>
             </div>
+
+            ${activeRepoName
+                ? html`
+                      <div class="filter-status">
+                          <span>Filtered: ${activeRepoName}</span>
+                          <span
+                              class="filter-clear"
+                              role="button"
+                              tabindex="0"
+                              ${listen('click', () => updateState({
+repoFilter: undefined
+}))}
+                          >
+                              clear
+                          </span>
+                      </div>
+                  `
+                : ''}
+
             ${state.loadError
                 ? html`
                       <div class="error">${state.loadError}</div>
                   `
                 : ''}
+
             <div class="list">
                 ${state.folders.length === 0 && !state.loadError
                     ? html`
-                          <div class="empty">No repos configured. Click + to add one.</div>
+                          <div class="empty">No repos yet. Add one below.</div>
                       `
                     : ''}
-                ${standaloneFolders.map((folder) =>
-                    renderRow({
-                        folder,
-                        indented: false,
-                        activeFolder: inputs.activeFolder,
-                        openMenuKey: state.openMenuKey,
-                        onActivate: emitFolderActivated,
-                        removeFolderLocally,
-                        emitFoldersRemoved,
-                        updateState,
-                    }),
-                )}
-                ${worktreeRoots.map((root) => {
-                    const children = state.folders
-                        .filter((folder) => folder.parentRepoPath === root.path)
-                        .toSorted((a, b) =>
-                            a.name.localeCompare(b.name, undefined, {
-                                sensitivity: 'base',
-                            }),
-                        );
-                    const repoMenuKey = `repo:${root.path}`;
-                    return html`
-                        <div
-                            class="repo-header"
-                            ?data-menu-open=${state.openMenuKey === repoMenuKey}
-                        >
-                            <span>${root.name}</span>
-                            <span class="actions">
-                                <${ViraMenuTrigger.assign({
-                                    horizontalAnchor: HorizontalAnchor.Right,
-                                })}
-                                    ${listen(ViraMenuTrigger.events.openChange, (event) => {
-                                        updateState({
-                                            openMenuKey: event.detail ? repoMenuKey : undefined,
-                                        });
-                                    })}
-                                >
-                                    <${ViraButton.assign({
-                                        icon: ellipsisIcon,
-                                        buttonSize: ViraSize.Small,
-                                        buttonEmphasis: ViraEmphasis.Subtle,
-                                        color: ViraColorVariant.Neutral,
-                                    })}
-                                        slot=${ViraMenuTrigger.slotNames.trigger}
-                                        title="Repo actions"
-                                    ></${ViraButton}>
-                                    ${renderMenuItemEntries([
-                                        {
-                                            content: 'Add worktree',
-                                            iconOverride: lucideIcons.GitBranchPlus,
-                                            onClick: () => {
-                                                void promptAddWorktree(
-                                                    root.path,
-                                                    updateState,
-                                                    emitFolderActivated,
-                                                );
-                                            },
-                                        },
-                                        {
-                                            content: 'Remove repo',
-                                            iconOverride: lucideIcons.X,
-                                            onClick: () => {
-                                                void confirmRemoveRepo(root.path, updateState, () =>
-                                                    emitFoldersRemoved([
-                                                        root.path,
-                                                        ...children.map((child) => child.path),
-                                                    ]),
-                                                );
-                                            },
-                                        },
-                                    ])}
-                                </${ViraMenuTrigger}>
-                            </span>
-                        </div>
-                        ${children.map((child) =>
-                            renderRow({
-                                folder: child,
-                                indented: true,
-                                activeFolder: inputs.activeFolder,
-                                openMenuKey: state.openMenuKey,
-                                onActivate: emitFolderActivated,
-                                removeFolderLocally,
-                                emitFoldersRemoved,
-                                updateState,
-                            }),
-                        )}
-                    `;
-                })}
+                ${state.folders.length > 0 &&
+                visibleWorktrees.length === 0 &&
+                !state.loadError
+                    ? html`
+                          <div class="empty">No worktrees match this filter.</div>
+                      `
+                    : ''}
+                ${needsAttentionWorktrees.length
+                    ? html`
+                          <div class="group-label" data-variant="attention">
+                              <span>Needs attention</span>
+                              <span class="group-count">
+                                  ${needsAttentionWorktrees.length.toString().padStart(2, '0')}
+                              </span>
+                          </div>
+                          ${needsAttentionWorktrees.map((folder) =>
+                              renderRow({
+                                  folder,
+                                  folders: state.folders,
+                                  activeFolder: inputs.activeFolder,
+                                  openMenuFolderPath: state.openMenuFolderPath,
+                                  onActivate: inputs.onActivate,
+                                  updateState,
+                              }),
+                          )}
+                      `
+                    : ''}
+                ${workingWorktrees.length
+                    ? html`
+                          <div
+                              class="group-label collapsible"
+                              data-variant="working"
+                              ?data-collapsed=${state.workingCollapsed}
+                              role="button"
+                              tabindex="0"
+                              aria-expanded=${state.workingCollapsed ? 'false' : 'true'}
+                              ${listen('click', () => {
+                                  const next = !state.workingCollapsed;
+                                  updateState({workingCollapsed: next});
+                                  localStorageClient.workingGroupCollapsed.write(next);
+                              })}
+                              ${listen('keydown', (event: KeyboardEvent) => {
+                                  if (event.key !== 'Enter' && event.key !== ' ') {
+                                      return;
+                                  }
+                                  event.preventDefault();
+                                  const next = !state.workingCollapsed;
+                                  updateState({workingCollapsed: next});
+                                  localStorageClient.workingGroupCollapsed.write(next);
+                              })}
+                          >
+                              <span class="group-left">
+                                  <span class="group-chevron" aria-hidden="true">▼</span>
+                                  <span>Working</span>
+                              </span>
+                              <span class="group-count">
+                                  ${workingWorktrees.length.toString().padStart(2, '0')}
+                              </span>
+                          </div>
+                          ${state.workingCollapsed
+                              ? ''
+                              : workingWorktrees.map((folder) =>
+                                    renderRow({
+                                        folder,
+                                        folders: state.folders,
+                                        activeFolder: inputs.activeFolder,
+                                        openMenuFolderPath: state.openMenuFolderPath,
+                                        onActivate: inputs.onActivate,
+                                        updateState,
+                                        working: true,
+                                    }),
+                                )}
+                      `
+                    : ''}
             </div>
+
+            <${ViraButton.assign({
+                text: 'add repository',
+                icon: lucideIcons.Plus,
+                buttonSize: ViraSize.Medium,
+                color: ViraColorVariant.Custom,
+            })}
+                class="tertiary add-repo"
+                ${listen('click', () => void promptAddRepo(updateState))}
+            ></${ViraButton}>
+
+            <div class="foot">
+                <span class="foot-meta">
+                    <span class="foot-dot" aria-hidden="true"></span>
+                    <span>agent-storm</span>
+                </span>
+                <${ViraButton.assign({
+                    icon: lucideIcons.Settings,
+                    buttonSize: ViraSize.Medium,
+                    color: ViraColorVariant.Custom,
+                })}
+                    class="ghost-icon"
+                    aria-label="Settings"
+                    title="Settings"
+                    ${listen('click', () => inputs.onOpenSettings())}
+                ></${ViraButton}>
+            </div>
+
+            <${ViraModal.assign({
+                open: !!state.actionError,
+                modalTitle: state.actionError?.title ?? '',
+            })}
+                ${listen(ViraModal.events.modalClose, () =>
+                    updateState({
+actionError: undefined
+}),
+                )}
+            >
+                ${state.actionError
+                    ? html`
+                          <div class="error-modal-body">
+                              <div class="error-modal-message">
+                                  ${state.actionError.message}
+                              </div>
+                              <div class="error-modal-footer">
+                                  <${ViraButton.assign({
+                                      text: 'Close',
+                                      color: ViraColorVariant.Neutral,
+                                      buttonSize: ViraSize.Medium,
+                                  })}
+                                      ${listen('click', () =>
+                                          updateState({
+actionError: undefined
+}),
+                                      )}
+                                  ></${ViraButton}>
+                              </div>
+                          </div>
+                      `
+                    : ''}
+            </${ViraModal}>
+
+            <${VirConvertRepoModal.assign({request: state.convertRequest})}
+                ${listen(VirConvertRepoModal.events.confirmed, () => {
+                    state.convertResolve?.(true);
+                    updateState({convertRequest: undefined, convertResolve: undefined});
+                })}
+                ${listen(VirConvertRepoModal.events.cancelled, () => {
+                    state.convertResolve?.(false);
+                    updateState({convertRequest: undefined, convertResolve: undefined});
+                })}
+            ></${VirConvertRepoModal}>
+
+            <${VirPickBaseBranchModal.assign({request: state.pickBranchRequest})}
+                ${listen(VirPickBaseBranchModal.events.confirmed, (event) => {
+                    state.pickBranchResolve?.(event.detail);
+                    updateState({pickBranchRequest: undefined, pickBranchResolve: undefined});
+                })}
+                ${listen(VirPickBaseBranchModal.events.cancelled, () => {
+                    state.pickBranchResolve?.(undefined);
+                    updateState({pickBranchRequest: undefined, pickBranchResolve: undefined});
+                })}
+            ></${VirPickBaseBranchModal}>
         `;
     },
 });
 
-function renderPaneChip(label: string, status: PaneStatus) {
-    if (status === PaneStatus.None) {
-        return html`
-            <span class="chip" title="${label} pane: ${status}"></span>
-        `;
-    }
-    const icon =
-        status === PaneStatus.Busy
-            ? loaderIcon
-            : status === PaneStatus.Exited
-              ? exitedIcon
-              : dashIcon;
-    return html`
-        <span
-            class="chip"
-            style="color: ${paneStatusColor[status]};"
-            title="${label} pane: ${status}"
-        >
-            <${ViraIcon.assign({
-                icon,
-            })}></${ViraIcon}>
-        </span>
-    `;
-}
-
 function renderRow({
     folder,
-    indented,
+    folders,
     activeFolder,
-    openMenuKey,
+    openMenuFolderPath,
     onActivate,
-    removeFolderLocally,
-    emitFoldersRemoved,
     updateState,
+    working = false,
 }: Readonly<{
     folder: FolderInfo;
-    indented: boolean;
+    folders: ReadonlyArray<FolderInfo>;
     activeFolder: string | undefined;
-    openMenuKey: string | undefined;
+    openMenuFolderPath: string | undefined;
     onActivate: (folder: string) => void;
-    removeFolderLocally: (path: string) => void;
-    emitFoldersRemoved: (paths: ReadonlyArray<string>) => void;
     updateState: SidebarUpdate;
+    /** True when the row is in the "Working" group — drops the name color a step. */
+    working?: boolean;
 }>) {
-    const nameWithMarkers = [
-        folder.name,
-        folder.git.dirty ? '*' : '',
-        folder.git.notPushed ? '+' : '',
-    ].join('');
-    const rowMenuKey = `row:${folder.path}`;
+    const metaLabel = buildMetaLabel(folder);
+    const isMenuOpen = openMenuFolderPath === folder.path;
     return html`
         <div
             class="row"
             ?data-active=${activeFolder === folder.path}
-            ?data-indented=${indented}
-            ?data-menu-open=${openMenuKey === rowMenuKey}
+            ?data-menu-open=${isMenuOpen}
+            ?data-working=${working}
             ${listen('click', () => onActivate(folder.path))}
         >
-            <span class="chips">
-                ${renderPaneChip('AI', folder.panes.ai)}
-                ${renderPaneChip('Shell', folder.panes.shell)}
-            </span>
             <span
                 class="name"
                 ?data-pr-open=${!!folder.prUrl && !folder.prMerged}
                 ?data-pr-merged=${!!folder.prUrl && folder.prMerged}
             >
-                ${nameWithMarkers}
+                ${folder.name}
             </span>
-            ${folder.prMerged
-                ? html`
-                      <span class="pr-merged-check" title="PR merged">
-                          <${ViraIcon.assign({
-                              icon: mergedCheckIcon,
-                          })}></${ViraIcon}>
-                      </span>
-                  `
-                : ''}
+            ${metaLabel ? html`<span class="meta">${metaLabel}</span>` : ''}
             <span class="actions" ${listen('click', (event) => event.stopPropagation())}>
                 <${ViraMenuTrigger.assign({
                     horizontalAnchor: HorizontalAnchor.Right,
                 })}
                     ${listen(ViraMenuTrigger.events.openChange, (event) => {
                         updateState({
-                            openMenuKey: event.detail ? rowMenuKey : undefined,
+                            openMenuFolderPath: event.detail ? folder.path : undefined,
                         });
                     })}
                 >
                     <${ViraButton.assign({
-                        icon: ellipsisIcon,
-                        buttonSize: ViraSize.Small,
-                        buttonEmphasis: ViraEmphasis.Subtle,
-                        color: ViraColorVariant.Neutral,
+                        icon: lucideIcons.EllipsisVertical,
+                        buttonSize: ViraSize.Medium,
+                        color: ViraColorVariant.Custom,
                     })}
                         slot=${ViraMenuTrigger.slotNames.trigger}
-                        title="Folder actions"
+                        class="ghost-icon"
+                        aria-label="Folder actions"
+                        title="Actions"
                     ></${ViraButton}>
-                    ${renderMenuItemEntries(
-                        buildRowMenuEntries(
-                            folder,
-                            updateState,
-                            removeFolderLocally,
-                            emitFoldersRemoved,
-                        ),
-                    )}
+                    ${renderMenuItemEntries([
+                        {
+                            content: 'Open PR',
+                            hidden: !folder.prUrl,
+                            onClick: () => {
+                                openPrUrl(folder.prUrl);
+                            },
+                        },
+                        {
+                            content: folder.aiHidden ? 'Show AI pane' : 'Hide AI pane',
+                            onClick: () => {
+                                void toggleAiHidden(folder.path, updateState);
+                            },
+                        },
+                        {
+                            content: 'Restart AI',
+                            onClick: () => {
+                                void restartPane({
+folder: folder.path, kind: PaneKind.Ai
+}).catch(
+                                    (error: unknown) =>
+                                        showError(updateState, 'Restart AI failed', error),
+                                );
+                            },
+                        },
+                        {
+                            content: 'Kill folder panes',
+                            onClick: () => {
+                                void killFolderPanes({
+folder: folder.path
+}).catch(
+                                    (error: unknown) =>
+                                        showError(updateState, 'Kill panes failed', error),
+                                );
+                            },
+                        },
+                        {
+                            content: 'Delete worktree',
+                            hidden: folder.isBaseBranch,
+                            onClick: () => {
+                                void confirmDeleteWorktree(
+                                    folder.path,
+                                    folders,
+                                    updateState,
+                                );
+                            },
+                        },
+                        {
+                            content: 'Remove parent repo',
+                            hidden: !folder.parentRepoPath,
+                            onClick: () => {
+                                if (folder.parentRepoPath) {
+                                    void confirmRemoveRepo(
+                                        folder.parentRepoPath,
+                                        folders,
+                                        updateState,
+                                    );
+                                }
+                            },
+                        },
+                    ])}
                 </${ViraMenuTrigger}>
             </span>
         </div>
     `;
 }
 
-function isValidPrUrl(url: string | null | undefined): boolean {
-    if (!url) {
-        return false;
-    }
-
-    const parsed = parseUrl(url);
-    const isHttp = parsed.protocol === 'https' || parsed.protocol === 'http';
-
-    if (!isHttp) {
-        log.error(`Cannot open non http URL: '${url}'`);
-        return false;
-    } else if (allowedLinkHostnames.includes(parsed.hostname)) {
-        return true;
-    } else {
-        log.error(`Cannot open non approved host name: '${url}'`);
-        return false;
-    }
-}
-
-function buildRowMenuEntries(
-    folder: FolderInfo,
-    updateState: SidebarUpdate,
-    removeFolderLocally: (path: string) => void,
-    emitFoldersRemoved: (paths: ReadonlyArray<string>) => void,
-): ReadonlyArray<ViraMenuItemEntry> {
-    return [
-        folder.prUrl &&
-            isValidPrUrl(folder.prUrl) && {
-                content: html`
-                    <${ViraLink.assign({
-                        link: {
-                            url: folder.prUrl,
-                            newTab: true,
-                        },
-                        disableLinkStyles: true,
-                    })}>
-                        Open PR
-                    </${ViraLink}>
-                `,
-                iconOverride: lucideIcons.ExternalLink,
-            },
-        {
-            content: folder.aiHidden ? 'Show AI pane' : 'Hide AI pane',
-            iconOverride: folder.aiHidden ? lucideIcons.Eye : lucideIcons.EyeOff,
-            onClick: () => {
-                void toggleAiHidden(folder.path, updateState);
-            },
-        },
-        {
-            content: 'Restart AI',
-            iconOverride: lucideIcons.RotateCw,
-            onClick: () => {
-                void restartPane({
-                    folder: folder.path,
-                    kind: PaneKind.Ai,
-                }).catch((error: unknown) => showError(updateState, error));
-            },
-        },
-        {
-            content: 'Kill folder panes',
-            iconOverride: lucideIcons.PowerOff,
-            onClick: () => {
-                void killFolderPanes({
-                    folder: folder.path,
-                }).catch((error: unknown) => showError(updateState, error));
-            },
-        },
-        folder.parentRepoPath
-            ? {
-                  content: 'Delete worktree',
-                  iconOverride: lucideIcons.Trash2,
-                  onClick: () => {
-                      void confirmDeleteWorktree(
-                          folder.path,
-                          updateState,
-                          removeFolderLocally,
-                          () => emitFoldersRemoved([folder.path]),
-                      );
-                  },
-              }
-            : {
-                  content: 'Remove repo',
-                  iconOverride: lucideIcons.X,
-                  onClick: () => {
-                      void confirmRemoveRepo(folder.path, updateState, () =>
-                          emitFoldersRemoved([folder.path]),
-                      );
-                  },
-              },
-    ].filter(check.isTruthy);
-}
-
-/**
- * Worktrees the user has asked to delete that the backend is still processing. The 2s sidebar poll
- * fetches `/folders` while `git worktree remove --force` + `refreshFolderInfoNow` are still in
- * flight, so without this filter the deleted row would pop back in until the backend's response
- * lands. Entries clear in `confirmDeleteWorktree`'s `finally` once the delete settles (success or
- * failure).
- */
-const pendingWorktreeDeletions = new Set<string>();
-
-async function refresh(state: SidebarState, updateState: SidebarUpdate): Promise<void> {
+async function refresh(updateState: SidebarUpdate): Promise<void> {
     try {
         const folders = await getFolders();
         updateState({
-            folders: pendingWorktreeDeletions.size
-                ? folders.filter((folder) => !pendingWorktreeDeletions.has(folder.path))
-                : folders,
-            loadError: undefined,
-        });
+folders, loadError: undefined
+});
     } catch (error: unknown) {
+        console.error('sidebar refresh failed', error);
+        reportClientError(error, 'sidebar-refresh');
         updateState({
-            loadError: error instanceof Error ? error.message : String(error),
-        });
+loadError: error instanceof Error ? error.message : String(error)
+});
     }
 }
 
-function showError(updateState: SidebarUpdate, error: unknown): void {
+function showError(updateState: SidebarUpdate, title: string, error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error);
     updateState({
-        loadError: error instanceof Error ? error.message : String(error),
+        actionError: {
+            title,
+            message,
+        },
     });
 }
 
-async function promptAddRepo(
-    updateState: SidebarUpdate,
-    notifyActivated: (path: string) => void,
-): Promise<void> {
-    const input = window.prompt('Absolute path of the repo to add:');
-    if (!input) {
-        return;
-    }
+async function promptAddRepo(updateState: SidebarUpdate): Promise<void> {
     try {
-        const config = await getConfig();
-        const path = input.trim();
-        if (config.repos.some((repo) => repo.path === path)) {
-            /** Repo already configured — activate the existing entry instead of no-oping. */
-            notifyActivated(path);
-            return;
-        }
-        await putConfig({
-            ...config,
-            repos: [
-                ...config.repos,
-                {
-                    path,
-                    postWorktreeCmd: null,
-                },
-            ],
-        });
-        /**
-         * Fetch the new folder list directly so we can find the repo's resolved path (may include a
-         * worktree-root vs. standalone-repo entry) and activate it. The backend's `PUT /config`
-         * already triggered `refreshFolderInfoNow`, so the targets are present by the time this GET
-         * returns.
-         */
-        const folders = await getFolders();
-        updateState({
-            folders: pendingWorktreeDeletions.size
-                ? folders.filter((folder) => !pendingWorktreeDeletions.has(folder.path))
-                : folders,
-            loadError: undefined,
-        });
-        const newFolder = folders.find((folder) => folder.path === path);
-        if (newFolder) {
-            notifyActivated(newFolder.path);
-        }
+        await addRepoFlow(
+            (request) =>
+                new Promise<boolean>((resolve) => {
+                    updateState({convertRequest: request, convertResolve: resolve});
+                }),
+            (request) =>
+                new Promise<string | undefined>((resolve) => {
+                    updateState({pickBranchRequest: request, pickBranchResolve: resolve});
+                }),
+        );
+        await refresh(updateState);
     } catch (error: unknown) {
-        showError(updateState, error);
+        showError(updateState, 'Add repo failed', error);
     }
 }
 
 async function confirmRemoveRepo(
     repoPath: string,
+    currentFolders: ReadonlyArray<FolderInfo>,
     updateState: SidebarUpdate,
-    notifyRemoved: () => void,
 ): Promise<void> {
     if (!window.confirm(`Remove repo ${repoPath}?`)) {
         return;
     }
-    /**
-     * Clear app-level selection / opened panes for this repo (and its worktrees) before the API
-     * trip so the right pane unmounts immediately instead of waiting for the next folder-info
-     * poll.
-     */
-    notifyRemoved();
+    // Optimistically drop the repo root and every worktree underneath it. The server still
+    // reconciles + persists below, but pulling the rows out immediately means the user sees
+    // them disappear on click instead of waiting for the PUT + reconcile round trip (which
+    // does ~4 git subprocesses per remaining worktree before the response returns).
+    updateState({
+        folders: currentFolders.filter(
+            (folder) => folder.path !== repoPath && folder.parentRepoPath !== repoPath,
+        ),
+    });
     try {
         const config = await getConfig();
         await putConfig({
@@ -731,89 +1067,39 @@ async function confirmRemoveRepo(
             repos: config.repos.filter((repo) => repo.path !== repoPath),
             hiddenAiPane: config.hiddenAiPane.filter((path) => path !== repoPath),
         });
-        await refresh(
-            {
-                folders: [],
-                pollHandle: undefined,
-                loadError: undefined,
-                openMenuKey: undefined,
-            },
-            updateState,
-        );
+        await refresh(updateState);
     } catch (error: unknown) {
-        showError(updateState, error);
-    }
-}
-
-async function promptAddWorktree(
-    repoPath: string,
-    updateState: SidebarUpdate,
-    onActivate: (folder: string) => void,
-): Promise<void> {
-    const name = window.prompt(`Name for new worktree under ${repoPath}:`);
-    if (!name) {
-        return;
-    }
-    const trimmedName = name.trim();
-    try {
-        await createWorktree({
-            repoPath,
-            name: trimmedName,
-        });
-        const folders = await getFolders();
-        updateState({
-            folders,
-            loadError: undefined,
-        });
-        const newWorktree = folders.find(
-            (folder) => folder.parentRepoPath === repoPath && folder.name === trimmedName,
-        );
-        if (newWorktree) {
-            onActivate(newWorktree.path);
-        }
-    } catch (error: unknown) {
-        showError(updateState, error);
+        showError(updateState, 'Remove repo failed', error);
+        // Reconciling failed — pull the real list back so the optimistic removal can't leave
+        // the sidebar pointing at a stale view.
+        await refresh(updateState);
     }
 }
 
 async function confirmDeleteWorktree(
     worktreePath: string,
+    currentFolders: ReadonlyArray<FolderInfo>,
     updateState: SidebarUpdate,
-    removeFolderLocally: (path: string) => void,
-    notifyRemoved: () => void,
 ): Promise<void> {
     if (!window.confirm(`Delete worktree ${worktreePath}?`)) {
         return;
     }
-    /**
-     * Optimistically drop the row from the sidebar before the API trip. `git worktree remove
-     * --force` plus the subsequent `refreshFolderInfoNow` can take a couple of seconds; without
-     * this the row sits stale until the response lands. Adding to `pendingWorktreeDeletions` keeps
-     * the 2s background poll from un-removing it while the backend is still chewing through the
-     * delete. `notifyRemoved` lets the parent clear `activeFolder` / `openedFolders` entries for
-     * this worktree so the right-hand pane unmounts immediately. If the backend rejects the delete
-     * the `catch` below re-fetches and the row reappears.
-     */
-    removeFolderLocally(worktreePath);
-    notifyRemoved();
-    pendingWorktreeDeletions.add(worktreePath);
+    // Pull the row out of the sidebar before the API call so the UI reflects the user's
+    // intent immediately. The await below blocks on `git worktree remove` + a full
+    // reconcile sweep, which can take a noticeable beat on repos with many worktrees.
+    updateState({
+        folders: currentFolders.filter((folder) => folder.path !== worktreePath),
+    });
     try {
         await deleteWorktree({
-            worktreePath,
-        });
+worktreePath
+});
+        await refresh(updateState);
     } catch (error: unknown) {
-        showError(updateState, error);
-    } finally {
-        pendingWorktreeDeletions.delete(worktreePath);
-        await refresh(
-            {
-                folders: [],
-                pollHandle: undefined,
-                loadError: undefined,
-                openMenuKey: undefined,
-            },
-            updateState,
-        );
+        showError(updateState, 'Delete worktree failed', error);
+        // Reconciling failed — restore the real list so the optimistic removal doesn't
+        // hide a worktree that's actually still on disk.
+        await refresh(updateState);
     }
 }
 
@@ -830,16 +1116,8 @@ async function toggleAiHidden(folderPath: string, updateState: SidebarUpdate): P
                       folderPath,
                   ],
         });
-        await refresh(
-            {
-                folders: [],
-                pollHandle: undefined,
-                loadError: undefined,
-                openMenuKey: undefined,
-            },
-            updateState,
-        );
+        await refresh(updateState);
     } catch (error: unknown) {
-        showError(updateState, error);
+        showError(updateState, 'Toggle AI pane failed', error);
     }
 }

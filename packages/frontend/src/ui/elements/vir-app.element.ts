@@ -1,15 +1,22 @@
 import {type FolderInfo} from '@agent-storm/common';
 import {css, defineElement, html, listen} from 'element-vir';
-import {viraThemeByKeys} from 'vira';
 import {getFolders} from '../../util/api-client.js';
+import {installErrorReporter, reportClientError} from '../../util/error-reporter.js';
 import {localStorageClient, sidebarWidth} from '../../util/local-storage-client.js';
 import {router, type AppRoute, type FrontendPaths} from '../../util/router.js';
 import '../../util/service-origin.js';
+import '../../util/theme.js';
+import {VirAddRepo} from './vir-add-repo.element.js';
+import {VirAddWorktree} from './vir-add-worktree.element.js';
 import {VirAuthModal} from './vir-auth-modal.element.js';
 import {VirBook} from './vir-book.element.js';
 import {VirPaneGroup} from './vir-pane-group.element.js';
+import {VirPrEmbed} from './vir-pr-embed.element.js';
+import {VirProgressTracker} from './vir-progress-tracker.element.js';
 import {VirSettingsModal} from './vir-settings-modal.element.js';
 import {VirSidebar} from './vir-sidebar.element.js';
+
+installErrorReporter();
 
 /**
  * Result of resolving the current URL against the live folder list.
@@ -127,6 +134,12 @@ type AppState = {
     folderInfo: Map<string, FolderInfo>;
     pollHandle: ReturnType<typeof setInterval> | undefined;
     settingsOpen: boolean;
+    /**
+     * PR URL currently being shown by the fullscreen vir-pr-embed overlay, or null when the
+     * overlay is closed. Set when the progress tracker fires `prEmbedRequested`; cleared by
+     * the embed's `closed` event (X-button click).
+     */
+    embeddedPrUrl: string | null;
     route: AppRoute;
     removeRouteListener: (() => void) | undefined;
     sidebarWidth: number;
@@ -143,6 +156,7 @@ export const VirApp = defineElement()({
             folderInfo: new Map(),
             pollHandle: undefined,
             settingsOpen: false,
+            embeddedPrUrl: null,
             route: router.readCurrentRoute(),
             removeRouteListener: undefined,
             sidebarWidth: localStorageClient.sidebarWidth.read(),
@@ -158,8 +172,12 @@ export const VirApp = defineElement()({
                viewport meta's interactive-widget=resizes-content option in index.html) this
                shrinks when the on-screen keyboard appears so the terminals aren't hidden behind
                it. The 100% above it is the fallback for browsers without dvh support. */
+            height: 100%;
             height: 100dvh;
-            font-family: sans-serif;
+            font-family: var(--font-body);
+            font-size: var(--font-size-md);
+            background: var(--bg);
+            color: var(--fg);
         }
 
         vir-sidebar {
@@ -171,7 +189,7 @@ export const VirApp = defineElement()({
             flex: 0 0 4px;
             position: relative;
             cursor: col-resize;
-            background: ${viraThemeByKeys.grey['behind-bg'].decoration.background.value};
+            background: var(--border);
             transition: background 120ms ease;
             /* Sit above the sidebar so the hit-area extension below catches the pointer
                instead of being eaten by sidebar event handlers. */
@@ -191,13 +209,21 @@ export const VirApp = defineElement()({
 
         .sidebar-divider:hover,
         .sidebar-divider.dragging {
-            background: ${viraThemeByKeys.grey.foreground.body.foreground.value};
+            background: var(--border-emphasized);
         }
 
         .stage {
-            position: relative;
+            display: flex;
+            flex-direction: column;
             flex-grow: 1;
             min-width: 0;
+            min-height: 0;
+            background: var(--bg);
+        }
+
+        .stage-content {
+            position: relative;
+            flex: 1 1 auto;
             min-height: 0;
         }
 
@@ -205,8 +231,9 @@ export const VirApp = defineElement()({
             display: flex;
             align-items: center;
             justify-content: center;
-            color: ${viraThemeByKeys.grey.foreground.placeholder.foreground.value};
-            font-size: 13px;
+            color: var(--fg-muted);
+            font-size: var(--font-size-sm);
+            line-height: var(--line-height-sm);
             height: 100%;
         }
 
@@ -247,6 +274,17 @@ export const VirApp = defineElement()({
                 <${VirBook.assign({
                     subPaths: state.route.paths.slice(1),
                 })}></${VirBook}>
+            `;
+        } else if (state.route.paths[0] === 'add-repo') {
+            return html`
+                <${VirAddRepo}></${VirAddRepo}>
+                <${VirAuthModal}></${VirAuthModal}>
+            `;
+        } else if (state.route.paths[0] === 'add-worktree') {
+            const repoPath = decodeURIComponent(state.route.paths[1]);
+            return html`
+                <${VirAddWorktree.assign({repoPath})}></${VirAddWorktree}>
+                <${VirAuthModal}></${VirAuthModal}>
             `;
         }
 
@@ -359,23 +397,16 @@ export const VirApp = defineElement()({
         return html`
             <${VirSidebar.assign({
                 activeFolder,
-            })}
-                ${listen(VirSidebar.events.folderActivated, (event) => {
-                    const folderPath = event.detail;
+                onActivate: (folderPath: string) => {
                     const folder = state.folderInfo.get(folderPath);
                     /**
                      * Drive the URL from the click; render will re-derive `activeFolder` from the
                      * new route. If `folderInfo` doesn't yet know the folder (race with first poll)
                      * we still add it to `openedFolders` so the pane mounts — the URL update
-                     * happens on a subsequent render once the data lands.
+                     * happens on a subsequent render once the data lands. Wipe `search` so the new
+                     * repo starts on the CLI tab rather than inheriting the prior repo's `?code`.
                      */
                     if (folder) {
-                        /**
-                         * Wipe `search` on a sidebar click so the new repo starts on the CLI tab.
-                         * Without this, the `?code` flag from the previous repo carries over and
-                         * the user lands on the Code tab of the freshly-selected one, which is
-                         * usually surprising.
-                         */
                         router.setRoute({
                             paths: pathsForFolder(folder, state.folderInfo),
                             search: undefined,
@@ -389,29 +420,12 @@ export const VirApp = defineElement()({
                             ],
                         });
                     }
-                })}
-                ${listen(VirSidebar.events.foldersRemoved, (event) => {
-                    const removed = new Set(event.detail);
-                    /**
-                     * If the URL pointed at one of the gone folders, bounce to root so we don't sit
-                     * on a broken route. The render-time `redirectToRoot` would catch it on the
-                     * next sweep, but doing it eagerly avoids a flicker.
-                     */
-                    if (activeFolder && removed.has(activeFolder)) {
-                        router.setRoute({
-                            paths: [],
-                        });
-                    }
-                    updateState({
-                        openedFolders: state.openedFolders.filter((folder) => !removed.has(folder)),
-                    });
-                })}
-                ${listen(VirSidebar.events.openSettingsRequested, () => {
+                },
+                onOpenSettings: () =>
                     updateState({
                         settingsOpen: true,
-                    });
-                })}
-            ></${VirSidebar}>
+                    }),
+            })}></${VirSidebar}>
             <div
                 class="sidebar-divider ${state.sidebarDragging ? 'dragging' : ''}"
                 role="separator"
@@ -421,51 +435,67 @@ export const VirApp = defineElement()({
                 ${listen('dblclick', onDividerDoubleClick)}
             ></div>
             <div class="stage">
-                ${state.openedFolders.length === 0
+                <div class="stage-content">
+                    ${state.openedFolders.length === 0
+                        ? html`
+                              <div class="stage-empty">Select a repo to open its panes.</div>
+                          `
+                        : ''}
+                    ${state.openedFolders.map((folder) => {
+                        const info = state.folderInfo.get(folder);
+                        const active = folder === activeFolder;
+                        return html`
+                            <div class="pane-slot" ?data-active=${active}>
+                                <${VirPaneGroup.assign({
+                                    folder,
+                                    aiHidden: !!info?.aiHidden,
+                                    active,
+                                    codeTabActive: !!state.route.search?.code,
+                                })}
+                                    ${listen(VirPaneGroup.events.cliTabRequested, () => {
+                                        router.setRoute({
+                                            paths: state.route.paths,
+                                            search: undefined,
+                                        });
+                                    })}
+                                    ${listen(VirPaneGroup.events.codeTabRequested, () => {
+                                        router.setRoute({
+                                            paths: state.route.paths,
+                                            search: {
+                                                code: [],
+                                            },
+                                        });
+                                    })}
+                                ></${VirPaneGroup}>
+                            </div>
+                        `;
+                    })}
+                </div>
+                ${activeFolder && state.folderInfo.get(activeFolder)
                     ? html`
-                          <div class="stage-empty">Select a repo to open its panes.</div>
+                          <${VirProgressTracker.assign({
+                              folder: state.folderInfo.get(activeFolder)!,
+                          })}
+                              ${listen(VirProgressTracker.events.prEmbedRequested, (event) => {
+                                  updateState({embeddedPrUrl: event.detail});
+                              })}
+                          ></${VirProgressTracker}>
                       `
                     : ''}
-                ${state.openedFolders.map((folder) => {
-                    const info = state.folderInfo.get(folder);
-                    const active = folder === activeFolder;
-                    return html`
-                        <div class="pane-slot" ?data-active=${active}>
-                            <${VirPaneGroup.assign({
-                                folder,
-                                aiHidden: !!info?.aiHidden,
-                                active,
-                                codeTabActive: !!state.route.search?.code,
-                            })}
-                                ${listen(VirPaneGroup.events.cliTabRequested, () => {
-                                    router.setRoute({
-                                        paths: state.route.paths,
-                                        search: undefined,
-                                    });
-                                })}
-                                ${listen(VirPaneGroup.events.codeTabRequested, () => {
-                                    router.setRoute({
-                                        paths: state.route.paths,
-                                        search: {
-                                            code: [],
-                                        },
-                                    });
-                                })}
-                            ></${VirPaneGroup}>
-                        </div>
-                    `;
-                })}
             </div>
             <${VirSettingsModal.assign({
                 open: state.settingsOpen,
-            })}
-                ${listen(VirSettingsModal.events.closeRequested, () => {
+                onClose: () => {
                     updateState({
                         settingsOpen: false,
                     });
-                })}
-            ></${VirSettingsModal}>
+                    void syncTheme();
+                },
+            })}></${VirSettingsModal}>
             <${VirAuthModal}></${VirAuthModal}>
+            <${VirPrEmbed.assign({url: state.embeddedPrUrl})}
+                ${listen(VirPrEmbed.events.closed, () => updateState({embeddedPrUrl: null}))}
+            ></${VirPrEmbed}>
         `;
     },
 });
@@ -480,7 +510,28 @@ async function refreshFolderInfo(updateState: AppUpdate): Promise<void> {
         updateState({
             folderInfo,
         });
-    } catch {
-        /* sidebar surfaces the load error */
+        const currentRoute = router.readCurrentRoute();
+        if (currentRoute.paths[0] === 'home' && folders.length === 0) {
+            router.setRoute(
+                {
+                    paths: ['add-repo'],
+                },
+                {
+                    replace: true,
+                },
+            );
+        } else if (currentRoute.paths[0] === 'add-repo' && folders.length > 0) {
+            router.setRoute(
+                {
+                    paths: ['home'],
+                },
+                {
+                    replace: true,
+                },
+            );
+        }
+    } catch (error) {
+        console.error('refreshFolderInfo failed', error);
+        reportClientError(error, 'refreshFolderInfo');
     }
 }

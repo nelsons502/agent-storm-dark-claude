@@ -1,6 +1,8 @@
+import {RepoInspectionState, type RepoInspection} from '@agent-storm/common';
 import {log} from '@augment-vir/common';
+import {runShellCommand} from '@augment-vir/node';
 import {execFile} from 'node:child_process';
-import {lstat, readdir, stat} from 'node:fs/promises';
+import {lstat, readdir, rename, stat, writeFile} from 'node:fs/promises';
 import {dirname, join} from 'node:path';
 import {promisify} from 'node:util';
 
@@ -10,12 +12,15 @@ type GitInfo = {
     branch: string | null;
     dirty: boolean;
     notPushed: boolean;
+    /** Short HEAD SHA (`rev-parse HEAD`); null for detached / not-a-repo. */
+    localCommitHash: string | null;
 };
 
 const cleanGitInfo: GitInfo = {
     branch: null,
     dirty: false,
     notPushed: false,
+    localCommitHash: null,
 };
 
 export async function getGitInfo(folder: string): Promise<GitInfo> {
@@ -34,6 +39,11 @@ export async function getGitInfo(folder: string): Promise<GitInfo> {
         '--porcelain',
     ]);
     const dirty = !!status && status.length > 0;
+
+    const localCommitHash = await runGit(folder, [
+        'rev-parse',
+        'HEAD',
+    ]).then((output) => output?.trim() || null);
 
     const hasUpstream = await runGit(folder, [
         'rev-parse',
@@ -54,7 +64,16 @@ export async function getGitInfo(folder: string): Promise<GitInfo> {
         branch,
         dirty,
         notPushed,
+        localCommitHash,
     };
+}
+
+export async function hasUncommittedChanges(folder: string): Promise<boolean> {
+    const status = await runGit(folder, [
+        'status',
+        '--porcelain',
+    ]);
+    return !!status && status.length > 0;
 }
 
 async function runGit(cwd: string, args: ReadonlyArray<string>): Promise<string | undefined> {
@@ -194,12 +213,34 @@ async function isGhAvailable(): Promise<boolean> {
 
 export type PrInfo = {
     url: string;
+    /** True when the PR is merged. */
+    merged: boolean;
+    /** True when the PR is in draft state. */
+    isDraft: boolean;
+    /** Remote head SHA. Empty string when unavailable. */
+    headRefOid: string;
     /**
-     * True when the PR is merged or closed (and within the 7-day display window — older
-     * terminal-state PRs are dropped from the response entirely, so this is never true for stale
-     * data). False for still-open PRs, including drafts.
+     * Aggregated CI result: true if every check finished successfully, false if any failed,
+     * null while checks are still pending or no checks have been registered yet.
      */
-    closed: boolean;
+    ciPassing: boolean | null;
+    /** True when at least one CI check is currently running. */
+    ciInProgress: boolean;
+    /** True when GitHub's `reviewDecision` is APPROVED. */
+    approved: boolean;
+    /** True when GitHub's `reviewDecision` is CHANGES_REQUESTED. */
+    reviewChangesRequested: boolean;
+    /** True when reviewers have been requested but haven't yet weighed in. */
+    reviewPending: boolean;
+    /** True when at least one inline review thread is still unresolved. */
+    hasUnresolvedReviewComments: boolean;
+    /**
+     * Aggregated result of review-flavoured status checks. Null when none exist or all are still
+     * running.
+     */
+    reviewCheckPassing: boolean | null;
+    /** True while at least one review-flavoured check is still running. */
+    reviewCheckInProgress: boolean;
 };
 
 export type RepoSlug = {
@@ -326,7 +367,7 @@ export async function getRepoSlug(folder: string): Promise<RepoSlug | null> {
  * the sidebar's use case (we only need to find any open / recently-terminal PR for the branches the
  * user has worktrees against).
  */
-const fetchRepoPrsBatchSize = 20;
+const fetchRepoPrsBatchSize = 40;
 
 const repoPrsGraphqlQuery = [
     'query($owner: String!, $name: String!) {',
@@ -342,20 +383,126 @@ const repoPrsGraphqlQuery = [
     '      nodes {',
     '        url',
     '        headRefName',
+    '        headRefOid',
     '        state',
     '        closedAt',
+    '        mergedAt',
+    '        isDraft',
+    '        reviewDecision',
+    '        reviewRequests(first: 1) { totalCount }',
+    '        reviewThreads(first: 25) { nodes { isResolved isOutdated } }',
+    '        commits(last: 1) { nodes { commit { statusCheckRollup {',
+    '          contexts(first: 30) { nodes {',
+    '            __typename',
+    '            ... on CheckRun { name status conclusion }',
+    '            ... on StatusContext { context state }',
+    '          } }',
+    '        } } } }',
     '      }',
     '    }',
     '  }',
     '}',
 ].join('\n');
 
+type RawCheckRollupContext = {
+    __typename?: string;
+    name?: string;
+    status?: string;
+    conclusion?: string;
+    context?: string;
+    state?: string;
+};
+
 type RawPrNode = {
     url?: string;
     headRefName?: string;
+    headRefOid?: string;
     state?: string;
     closedAt?: string | null;
+    mergedAt?: string | null;
+    isDraft?: boolean;
+    reviewDecision?: string | null;
+    reviewRequests?: {
+        totalCount?: number;
+    };
+    reviewThreads?: {
+        nodes?: ReadonlyArray<{
+            isResolved?: boolean;
+            isOutdated?: boolean;
+        }>;
+    };
+    commits?: {
+        nodes?: ReadonlyArray<{
+            commit?: {
+                statusCheckRollup?: {
+                    contexts?: {
+                        nodes?: ReadonlyArray<RawCheckRollupContext>;
+                    };
+                } | null;
+            };
+        }>;
+    };
 };
+
+/**
+ * Identifies checks that represent code review (Claude review, reviewdog, etc.) rather than
+ * build/lint/format/test CI. The "Pass CI" progress step ignores these — code review has its
+ * own dedicated step ("Get approval") and a pending or failed review shouldn't make the CI
+ * step look red.
+ */
+const reviewCheckPattern = /review/i;
+
+function isReviewCheck(check: Readonly<RawCheckRollupContext>): boolean {
+    const label = check.name || check.context || '';
+    return reviewCheckPattern.test(label);
+}
+
+const failureConclusions = new Set([
+    'FAILURE',
+    'CANCELLED',
+    'TIMED_OUT',
+    'ACTION_REQUIRED',
+    'STALE',
+]);
+const successConclusions = new Set([
+    'SUCCESS',
+    'NEUTRAL',
+    'SKIPPED',
+]);
+
+function summarizeStatusCheckRollup(
+    checks: ReadonlyArray<RawCheckRollupContext> | undefined,
+): {passing: boolean | null; inProgress: boolean} {
+    if (!checks || checks.length === 0) {
+        return {passing: null, inProgress: false};
+    }
+    let pending = false;
+    for (const check of checks) {
+        const conclusion = check.conclusion?.toUpperCase() || '';
+        const status = check.status?.toUpperCase() || '';
+        const commitState = check.state?.toUpperCase() || '';
+        if (
+            failureConclusions.has(conclusion) ||
+            commitState === 'FAILURE' ||
+            commitState === 'ERROR'
+        ) {
+            return {passing: false, inProgress: false};
+        }
+        if (status && status !== 'COMPLETED') {
+            pending = true;
+        } else if (commitState === 'PENDING' || commitState === 'EXPECTED') {
+            pending = true;
+        } else if (conclusion && !successConclusions.has(conclusion)) {
+            pending = true;
+        } else if (!conclusion && !commitState) {
+            pending = true;
+        }
+    }
+    return {
+        passing: pending ? null : true,
+        inProgress: pending,
+    };
+}
 
 type GhExecResult = {
     exitCode: number;
@@ -469,11 +616,300 @@ export async function fetchRepoPrs(slug: Readonly<RepoSlug>): Promise<Map<string
          * branch).
          */
         if (!map.has(node.headRefName)) {
+            const allChecks =
+                node.commits?.nodes?.[0]?.commit?.statusCheckRollup?.contexts?.nodes ?? [];
+            const buildChecks = allChecks.filter((check) => !isReviewCheck(check));
+            const reviewChecks = allChecks.filter((check) => isReviewCheck(check));
+            const ciStatus = summarizeStatusCheckRollup(buildChecks);
+            const reviewCheckStatus = summarizeStatusCheckRollup(reviewChecks);
+            const reviewDecision = node.reviewDecision ?? '';
+            const reviewRequestsCount = node.reviewRequests?.totalCount ?? 0;
+            const reviewThreadNodes = node.reviewThreads?.nodes ?? [];
+            // Outdated threads point at code that no longer exists in the diff — the reviewer's
+            // concern is moot regardless of whether anyone clicked "Resolve conversation".
+            const hasUnresolvedReviewComments = reviewThreadNodes.some(
+                (thread) => thread.isResolved === false && thread.isOutdated !== true,
+            );
             map.set(node.headRefName, {
                 url: node.url,
-                closed: isTerminal,
+                merged: node.state === 'MERGED',
+                isDraft: !!node.isDraft,
+                headRefOid: node.headRefOid || '',
+                ciPassing: ciStatus.passing,
+                ciInProgress: ciStatus.inProgress,
+                approved: reviewDecision === 'APPROVED',
+                // CHANGES_REQUESTED is GitHub's authoritative "actively blocking" signal —
+                // re-requesting review flips the decision back to REVIEW_REQUIRED.
+                reviewChangesRequested: reviewDecision === 'CHANGES_REQUESTED',
+                // Only flag pending when there's an outstanding human action. PRs without
+                // required reviewers report `reviewDecision: ''` and shouldn't light up the
+                // approval step as loading forever.
+                reviewPending:
+                    reviewDecision === 'REVIEW_REQUIRED' && reviewRequestsCount > 0,
+                hasUnresolvedReviewComments,
+                reviewCheckPassing: reviewCheckStatus.passing,
+                reviewCheckInProgress: reviewCheckStatus.inProgress,
             });
         }
     });
     return map;
+}
+
+/**
+ * Per-branch PR lookup for branches the batch `fetchRepoPrs` missed (e.g. the branch's PR
+ * predates the 100 most-recently-updated PRs in the repo). Uses `gh pr view` against a single
+ * branch — cheaper than expanding the batch query, and only triggered for cache misses, so a
+ * repo where every active worktree matches a recent PR pays nothing extra.
+ *
+ * Returns null when there is no PR for the branch, or when the lookup hits a benign failure
+ * (network blip, repo not on GitHub, etc.). Rate-limit / auth failures bubble up so the outer
+ * cache layer can flip the kill-switch.
+ */
+export async function fetchPrInfoForBranch(
+    folder: string,
+    branch: string,
+): Promise<PrInfo | null> {
+    if (!(await isGhAvailable())) {
+        return null;
+    }
+    const safeBranch = `'${branch.replace(/'/g, String.raw`'\''`)}'`;
+    /**
+     * `gh pr view --json` exposes `statusCheckRollup`, `reviewDecision`, `reviewRequests`, etc. but
+     * NOT `reviewThreads` — that's only reachable via raw GraphQL. The fallback path is rare
+     * (worktree against a PR older than the batch window) so we accept the small accuracy loss on
+     * `hasUnresolvedReviewComments` here rather than running a second per-branch GraphQL call.
+     */
+    const result = await runShellCommand(
+        `gh pr view ${safeBranch} --json url,state,mergedAt,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviewRequests`,
+        {cwd: folder},
+    );
+    if (result.exitCode !== 0) {
+        if (looksRateLimited(result.stderr)) {
+            throw new GitHubPollingError(
+                'rate-limited',
+                `GitHub API rate limit hit (pr view): ${result.stderr.trim()}`,
+            );
+        } else if (looksUnauthenticated(result.stderr)) {
+            throw new GitHubPollingError(
+                'unauthenticated',
+                `GitHub authentication failed (pr view): ${result.stderr.trim()}`,
+            );
+        }
+        return null;
+    }
+    let parsed: {
+        url?: string;
+        state?: string;
+        mergedAt?: string | null;
+        isDraft?: boolean;
+        headRefOid?: string;
+        statusCheckRollup?: ReadonlyArray<RawCheckRollupContext>;
+        reviewDecision?: string | null;
+        reviewRequests?: ReadonlyArray<unknown>;
+    };
+    try {
+        parsed = JSON.parse(result.stdout);
+    } catch {
+        return null;
+    }
+    if (!parsed.url || parsed.state === 'CLOSED') {
+        return null;
+    }
+    const allChecks = parsed.statusCheckRollup ?? [];
+    const buildChecks = allChecks.filter((check) => !isReviewCheck(check));
+    const reviewChecks = allChecks.filter((check) => isReviewCheck(check));
+    const ciStatus = summarizeStatusCheckRollup(buildChecks);
+    const reviewCheckStatus = summarizeStatusCheckRollup(reviewChecks);
+    const reviewDecision = parsed.reviewDecision ?? '';
+    const reviewRequestsCount = parsed.reviewRequests?.length ?? 0;
+    return {
+        url: parsed.url,
+        merged: parsed.state === 'MERGED',
+        isDraft: !!parsed.isDraft,
+        headRefOid: parsed.headRefOid || '',
+        ciPassing: ciStatus.passing,
+        ciInProgress: ciStatus.inProgress,
+        approved: reviewDecision === 'APPROVED',
+        reviewChangesRequested: reviewDecision === 'CHANGES_REQUESTED',
+        reviewPending: reviewDecision === 'REVIEW_REQUIRED' && reviewRequestsCount > 0,
+        // `gh pr view --json` doesn't expose reviewThreads, so this stays false on the fallback
+        // path. Live data for branches in the batch window comes through the full GraphQL query
+        // in `fetchRepoPrs`.
+        hasUnresolvedReviewComments: false,
+        reviewCheckPassing: reviewCheckStatus.passing,
+        reviewCheckInProgress: reviewCheckStatus.inProgress,
+    };
+}
+
+export async function inspectRepoPath(folder: string): Promise<RepoInspection> {
+    const folderStat = await stat(folder).catch(() => undefined);
+    if (!folderStat?.isDirectory()) {
+        return {
+            state: RepoInspectionState.Empty,
+            currentBranch: null,
+            workingTreeClean: true,
+            branches: [],
+            worktreeRoot: null,
+        };
+    }
+
+    const entries = await readdir(folder).catch(() => []);
+    if (entries.length === 0) {
+        return {
+            state: RepoInspectionState.Empty,
+            currentBranch: null,
+            workingTreeClean: true,
+            branches: [],
+            worktreeRoot: null,
+        };
+    } else if (await isWorktreeRoot(folder)) {
+        const children = await listWorktreeChildren(folder);
+        const branches = (
+            await Promise.all(children.map((child) => getGitInfo(child).then((info) => info.branch)))
+        ).filter((branch): branch is string => !!branch);
+        return {
+            state: RepoInspectionState.Worktree,
+            currentBranch: null,
+            workingTreeClean: true,
+            branches,
+            worktreeRoot: null,
+        };
+    }
+
+    const dotGit = join(folder, '.git');
+    const dotGitStat = await lstat(dotGit).catch(() => undefined);
+
+    // If the picked folder is itself a worktree (.git is a pointer file, not a directory) and
+    // its parent is a worktree-style repo root, treat the parent as the registerable repo and
+    // the picked folder's branch as the chosen base branch — no picker needed.
+    if (dotGitStat?.isFile()) {
+        const parent = dirname(folder);
+        if (parent !== folder && (await isWorktreeRoot(parent))) {
+            const info = await getGitInfo(folder);
+            const children = await listWorktreeChildren(parent);
+            const branches = (
+                await Promise.all(
+                    children.map((child) => getGitInfo(child).then((childInfo) => childInfo.branch)),
+                )
+            ).filter((branch): branch is string => !!branch);
+            return {
+                state: RepoInspectionState.WorktreeChild,
+                currentBranch: info.branch,
+                workingTreeClean: !info.dirty,
+                branches,
+                worktreeRoot: parent,
+            };
+        }
+    }
+
+    if (!dotGitStat?.isDirectory()) {
+        return {
+            state: RepoInspectionState.NotARepo,
+            currentBranch: null,
+            workingTreeClean: false,
+            branches: [],
+            worktreeRoot: null,
+        };
+    }
+
+    const info = await getGitInfo(folder);
+    return {
+        state: RepoInspectionState.Regular,
+        currentBranch: info.branch,
+        workingTreeClean: !info.dirty,
+        branches: info.branch ? [info.branch] : [],
+        worktreeRoot: null,
+    };
+}
+
+export async function convertRepoToWorktreeLayout(folder: string): Promise<void> {
+    const inspection = await inspectRepoPath(folder);
+    if (inspection.state !== RepoInspectionState.Regular) {
+        throw new Error(
+            `Cannot convert ${folder}: expected a regular git repository (got "${inspection.state}").`,
+        );
+    } else if (!inspection.currentBranch) {
+        throw new Error(
+            `Cannot convert ${folder}: repository is in a detached HEAD state. Check out a branch first.`,
+        );
+    } else if (!inspection.workingTreeClean) {
+        throw new Error(
+            `Cannot convert ${folder}: working tree has uncommitted changes or untracked files. Commit or remove them first.`,
+        );
+    }
+
+    const branch = inspection.currentBranch;
+    const branchFolderName = branch.replace(/[/\\]/g, '-');
+    const bareDir = join(folder, '.bare');
+    const dotGitFile = join(folder, '.git');
+    const newWorktreeDir = join(folder, branchFolderName);
+
+    const bareExists = await lstat(bareDir).catch(() => undefined);
+    if (bareExists) {
+        throw new Error(`Cannot convert ${folder}: ".bare" already exists.`);
+    }
+    const branchFolderExists = await lstat(newWorktreeDir).catch(() => undefined);
+    if (branchFolderExists) {
+        throw new Error(
+            `Cannot convert ${folder}: "${branchFolderName}" already exists at the repo root.`,
+        );
+    }
+
+    await rename(join(folder, '.git'), bareDir);
+    await exec('git', [
+        '--git-dir',
+        bareDir,
+        'config',
+        'core.bare',
+        'true',
+    ]);
+    await exec('git', [
+        '--git-dir',
+        bareDir,
+        'config',
+        '--unset',
+        'core.worktree',
+    ]).catch(() => undefined);
+    await writeFile(dotGitFile, 'gitdir: ./.bare\n');
+
+    // `git worktree add` refuses to attach to a pre-existing directory, so register the worktree
+    // first (this creates `newWorktreeDir` with only a `.git` pointer file inside) and then move
+    // the original working tree contents into it.
+    await exec(
+        'git',
+        [
+            '--git-dir',
+            bareDir,
+            'worktree',
+            'add',
+            '--no-checkout',
+            newWorktreeDir,
+            branch,
+        ],
+        {
+            cwd: folder,
+        },
+    );
+
+    const remainingEntries = (await readdir(folder)).filter(
+        (name) => name !== '.git' && name !== '.bare' && name !== branchFolderName,
+    );
+    for (const name of remainingEntries) {
+        await rename(join(folder, name), join(newWorktreeDir, name));
+    }
+
+    // `--no-checkout` leaves the new worktree's index empty, which would make every file in the
+    // working tree look both "deleted" and "untracked". Populate the index from HEAD so the
+    // existing (clean) working tree matches it.
+    await exec(
+        'git',
+        [
+            'reset',
+            '--mixed',
+            'HEAD',
+        ],
+        {
+            cwd: newWorktreeDir,
+        },
+    );
 }
