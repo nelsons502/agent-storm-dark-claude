@@ -103,6 +103,21 @@ const configShape = defineShape({
     repos: [repoConfigShape],
     hiddenAiPane: [''],
     /**
+     * Worktree paths the user has marked as hidden from the sidebar. Mirrors the shape of
+     * `hiddenAiPane` rather than living per-worktree under `repos[].worktrees[]` so the toggle
+     * surfaces with a single `putConfig` call and doesn't need a dedicated endpoint. Filtered
+     * out of the sidebar's tab list unless `showHiddenWorktrees` is on; cleaned up alongside
+     * the worktree's row on delete and alongside the repo's rows on remove.
+     */
+    hiddenWorktrees: [''],
+    /**
+     * Whether the sidebar should show worktrees marked as hidden. Optional + falsy by default so
+     * the "Hidden" mark actually hides things on first use; toggled from the worktree-section
+     * three-dot menu. Persisted in config (not localStorage) so the choice syncs across the
+     * desktop + browser builds.
+     */
+    showHiddenWorktrees: optionalShape(false),
+    /**
      * Opt-out flag for the background `gh pr view` calls the refresh loop makes on each non-root
      * folder. Optional and falsy by default so GitHub polling is on out of the box; set to true to
      * skip the `gh` shell-outs entirely when GitHub starts rate-limiting the account (the API
@@ -136,6 +151,12 @@ export const folderInfoShape = defineShape({
     isWorktreeRoot: false,
     isBaseBranch: false,
     aiHidden: false,
+    /**
+     * Whether the user marked this worktree as hidden from the sidebar. Mirrored from
+     * `config.hiddenWorktrees`; the sidebar filters these rows out unless the "Show hidden"
+     * toggle is on.
+     */
+    isHidden: false,
     branch: nullableShape(''),
     git: {
         dirty: false,

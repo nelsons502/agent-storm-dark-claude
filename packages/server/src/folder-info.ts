@@ -307,6 +307,12 @@ type RefreshTarget = {
     baseBranch: string | null;
     aiHidden: boolean;
     /**
+     * Whether the user marked this worktree as hidden via the row's three-dot menu. Mirrored
+     * from `config.hiddenWorktrees` so the sidebar's "Show hidden" filter can decide whether
+     * to render this row.
+     */
+    isHidden: boolean;
+    /**
      * SHA captured the last time the user checked Self-review (code) on this worktree, mirrored
      * from `worktreeConfigShape.lastReviewedSha`. Lifted into the target up-front so the progress
      * tracker can show the right state on the very first render — before any sweep has built a
@@ -334,6 +340,7 @@ function enumerateTargets(config: Readonly<Config>): RefreshTarget[] {
                     isBase: false,
                     baseBranch: null,
                     aiHidden: config.hiddenAiPane.includes(repo.path),
+                    isHidden: false,
                     lastReviewedSha: null,
                     mergeStepValues: {},
                 },
@@ -347,6 +354,7 @@ function enumerateTargets(config: Readonly<Config>): RefreshTarget[] {
                 isBase: false,
                 baseBranch: null,
                 aiHidden: false,
+                isHidden: false,
                 lastReviewedSha: null,
                 mergeStepValues: {},
             },
@@ -358,6 +366,7 @@ function enumerateTargets(config: Readonly<Config>): RefreshTarget[] {
                     isBase: worktree.isBase,
                     baseBranch: repo.baseBranch ?? null,
                     aiHidden: config.hiddenAiPane.includes(worktree.path),
+                    isHidden: config.hiddenWorktrees.includes(worktree.path),
                     lastReviewedSha: worktree.lastReviewedSha ?? null,
                     mergeStepValues: worktree.mergeStepValues ?? {},
                 }),
@@ -389,6 +398,7 @@ async function buildFolderInfo({
         isWorktreeRoot: target.isWorktreeRoot,
         isBaseBranch: target.isBase,
         aiHidden: target.aiHidden,
+        isHidden: target.isHidden,
         branch: git.branch,
         git: {
             dirty: git.dirty,
@@ -491,6 +501,7 @@ function placeholderFolderInfo(target: RefreshTarget): FolderInfo {
         isWorktreeRoot: target.isWorktreeRoot,
         isBaseBranch: target.isBase,
         aiHidden: target.aiHidden,
+        isHidden: target.isHidden,
         branch: null,
         git: {
             dirty: false,
@@ -548,6 +559,7 @@ export function getCachedFolders(): FolderInfo[] {
             isWorktreeRoot: target.isWorktreeRoot,
             isBaseBranch: target.isBase,
             aiHidden: target.aiHidden,
+            isHidden: target.isHidden,
             hasUncommittedChanges: liveUncommitted,
             // `lastReviewedSha` and `mergeStepValues` are authored at the config layer (the
             // `/worktrees/mark-reviewed` and `/worktrees/set-merge-step` endpoints write
@@ -716,6 +728,7 @@ function normalizeCachedFolderInfo(info: FolderInfo): FolderInfo {
             info.mergeStepValues && typeof info.mergeStepValues === 'object'
                 ? info.mergeStepValues
                 : {},
+        isHidden: typeof info.isHidden === 'boolean' ? info.isHidden : false,
     };
 }
 
@@ -750,6 +763,7 @@ async function loadPersistedCache(): Promise<void> {
                     target.mergeStepValues && typeof target.mergeStepValues === 'object'
                         ? target.mergeStepValues
                         : {},
+                isHidden: typeof target.isHidden === 'boolean' ? target.isHidden : false,
             }));
             parsed.entries.forEach((pair) => {
                 if (!Array.isArray(pair) || pair.length !== 2) {

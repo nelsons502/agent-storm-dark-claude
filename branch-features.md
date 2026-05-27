@@ -32,3 +32,4 @@ At-a-glance list of features on this branch. Append one 10–15 word bullet per 
 - Self-review (code) popover gains "Stage trivial hunks" entry; staging now skips any import-only hunk.
 - "Get approval" stops flagging red for outdated review threads — only live unresolved comments count.
 - Merge steps support `dependsOn`; gated steps stay visible but render as plain unchecked until their deps land.
+- Worktrees can be marked hidden; sidebar three-dot menu toggles show-hidden visibility.

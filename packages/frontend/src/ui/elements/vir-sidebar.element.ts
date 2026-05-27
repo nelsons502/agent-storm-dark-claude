@@ -1,4 +1,4 @@
-import {type FolderInfo, PaneKind} from '@agent-storm/common';
+import {type Config, type FolderInfo, PaneKind} from '@agent-storm/common';
 import {css, defineElement, html, listen} from 'element-vir';
 import {parseUrl} from 'url-vir';
 import {
@@ -85,6 +85,13 @@ function buildMetaLabel(folder: FolderInfo): string {
 
 type SidebarState = {
     folders: ReadonlyArray<FolderInfo>;
+    /**
+     * Latest config snapshot from the backend. The sidebar's "Show hidden worktrees" toggle
+     * lives in config (not localStorage) so it syncs across the desktop + browser builds; the
+     * refresh loop pulls a fresh copy each poll so a toggle from another client surfaces here
+     * within the standard poll interval.
+     */
+    config: Config | undefined;
     pollHandle: ReturnType<typeof setInterval> | undefined;
     loadError: string | undefined;
     actionError: {title: string; message: string} | undefined;
@@ -113,6 +120,7 @@ export const VirSidebar = defineElement<{
     state(): SidebarState {
         return {
             folders: [],
+            config: undefined,
             pollHandle: undefined,
             loadError: undefined,
             actionError: undefined,
@@ -561,10 +569,25 @@ pollHandle
          * sidebar and can't be removed. The backend enforces the same rule in `/worktrees/delete`;
          * filtering here just prevents the user from being offered an action that will be refused.
          */
+        const showHidden = !!state.config?.showHiddenWorktrees;
         const allWorktrees = worktreeRoots.flatMap((root) =>
             state.folders.filter(
-                (folder) => folder.parentRepoPath === root.path && !folder.isBaseBranch,
+                (folder) =>
+                    folder.parentRepoPath === root.path &&
+                    !folder.isBaseBranch &&
+                    (showHidden || !folder.isHidden),
             ),
+        );
+        const hiddenCount = worktreeRoots.reduce(
+            (count, root) =>
+                count +
+                state.folders.filter(
+                    (folder) =>
+                        folder.parentRepoPath === root.path &&
+                        !folder.isBaseBranch &&
+                        folder.isHidden,
+                ).length,
+            0,
         );
         const repoOptions: ReadonlyArray<{path: string; name: string}> = worktreeRoots.map(
             (folder) => ({
@@ -626,6 +649,14 @@ repoFilter: repo.path
                           onClick: () => {},
                       },
                   ]),
+            {
+                content: showHidden
+                    ? `Hide hidden worktrees${hiddenCount ? ` (${hiddenCount})` : ''}`
+                    : `Show hidden worktrees${hiddenCount ? ` (${hiddenCount})` : ''}`,
+                onClick: () => {
+                    void toggleShowHidden(updateState);
+                },
+            },
         ];
 
         return html`
@@ -970,6 +1001,13 @@ folder: folder.path
                             },
                         },
                         {
+                            content: folder.isHidden ? 'Mark visible' : 'Mark hidden',
+                            hidden: folder.isBaseBranch,
+                            onClick: () => {
+                                void toggleWorktreeHidden(folder.path, updateState);
+                            },
+                        },
+                        {
                             content: 'Delete worktree',
                             hidden: folder.isBaseBranch,
                             onClick: () => {
@@ -1002,9 +1040,19 @@ folder: folder.path
 
 async function refresh(updateState: SidebarUpdate): Promise<void> {
     try {
-        const folders = await getFolders();
+        // Fetch folders + config together so the "Show hidden" toggle (which lives in config)
+        // and the per-row `isHidden` flag (which flows through FolderInfo) stay in lockstep —
+        // otherwise toggling Show-hidden from another client would lag the visible row set by
+        // up to one full poll cycle.
+        const [
+            folders,
+            config,
+        ] = await Promise.all([
+            getFolders(),
+            getConfig(),
+        ]);
         updateState({
-folders, loadError: undefined
+folders, config, loadError: undefined
 });
     } catch (error: unknown) {
         console.error('sidebar refresh failed', error);
@@ -1062,10 +1110,18 @@ async function confirmRemoveRepo(
     });
     try {
         const config = await getConfig();
+        // Collect the worktree paths that lived under this repo so we can prune them out of
+        // `hiddenWorktrees` in the same write — otherwise stale entries pile up after each
+        // repo remove + re-add.
+        const repoConfig = config.repos.find((repo) => repo.path === repoPath);
+        const worktreePaths = new Set(
+            repoConfig?.worktrees.map((worktree) => worktree.path) ?? [],
+        );
         await putConfig({
             ...config,
             repos: config.repos.filter((repo) => repo.path !== repoPath),
             hiddenAiPane: config.hiddenAiPane.filter((path) => path !== repoPath),
+            hiddenWorktrees: config.hiddenWorktrees.filter((path) => !worktreePaths.has(path)),
         });
         await refresh(updateState);
     } catch (error: unknown) {
@@ -1100,6 +1156,44 @@ worktreePath
         // Reconciling failed — restore the real list so the optimistic removal doesn't
         // hide a worktree that's actually still on disk.
         await refresh(updateState);
+    }
+}
+
+async function toggleWorktreeHidden(
+    worktreePath: string,
+    updateState: SidebarUpdate,
+): Promise<void> {
+    try {
+        const config = await getConfig();
+        const isHidden = config.hiddenWorktrees.includes(worktreePath);
+        await putConfig({
+            ...config,
+            hiddenWorktrees: isHidden
+                ? config.hiddenWorktrees.filter((path) => path !== worktreePath)
+                : [
+                      ...config.hiddenWorktrees,
+                      worktreePath,
+                  ],
+        });
+        await refresh(updateState);
+    } catch (error: unknown) {
+        showError(updateState, 'Toggle worktree hidden failed', error);
+    }
+}
+
+async function toggleShowHidden(updateState: SidebarUpdate): Promise<void> {
+    try {
+        // Refetch rather than mutating the in-state snapshot — config can change from other
+        // clients between polls, and we don't want to overwrite a concurrent edit with stale
+        // values just because the toggle was clicked first.
+        const config = await getConfig();
+        await putConfig({
+            ...config,
+            showHiddenWorktrees: !config.showHiddenWorktrees,
+        });
+        await refresh(updateState);
+    } catch (error: unknown) {
+        showError(updateState, 'Toggle show-hidden failed', error);
     }
 }
 

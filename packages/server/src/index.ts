@@ -306,7 +306,17 @@ const implementation = implementService({
             });
             await removeWorktree(requestData);
             // Fast path: we know which worktree was removed; skip the full reconcile.
-            const postDeleteConfig = removeWorktreeFromConfig(config, requestData.worktreePath);
+            const reconciled = removeWorktreeFromConfig(config, requestData.worktreePath);
+            // Strip the deleted worktree from `hiddenWorktrees` too so the array doesn't
+            // accumulate dead paths after repeated create/delete cycles on the same name.
+            const postDeleteConfig = reconciled.hiddenWorktrees.includes(requestData.worktreePath)
+                ? {
+                      ...reconciled,
+                      hiddenWorktrees: reconciled.hiddenWorktrees.filter(
+                          (path) => path !== requestData.worktreePath,
+                      ),
+                  }
+                : reconciled;
             if (postDeleteConfig !== config) {
                 await saveConfig(postDeleteConfig);
             }

@@ -33,6 +33,7 @@ function normalizeConfig(config: Readonly<Config>): Config {
             isWorktreeLayout: repo.isWorktreeLayout ?? false,
         })),
         hiddenAiPane: config.hiddenAiPane.map((path) => normalizePath(path)),
+        hiddenWorktrees: (config.hiddenWorktrees ?? []).map((path) => normalizePath(path)),
     };
 }
 
@@ -71,6 +72,7 @@ export async function loadConfig(): Promise<Config> {
         ...parsed,
         repos: parsed.repos || defaultConfig.repos,
         hiddenAiPane: parsed.hiddenAiPane || defaultConfig.hiddenAiPane,
+        hiddenWorktrees: parsed.hiddenWorktrees || defaultConfig.hiddenWorktrees,
     };
     return normalizeConfig(merged);
 }
