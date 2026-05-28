@@ -34,3 +34,4 @@ At-a-glance list of features on this branch. Append one 10–15 word bullet per 
 - Merge steps support `dependsOn`; gated steps stay visible but render as plain unchecked until their deps land.
 - Worktrees can be marked hidden; sidebar three-dot menu toggles show-hidden visibility.
 - Disabled-polling sweeps preserve prior PR snapshot so auth/rate-limit backoff doesn't wipe sidebar badges.
+- Worktrees auto-delete on observed open-to-merged PR transition; skips dirty trees and live panes.

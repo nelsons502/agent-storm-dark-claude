@@ -8,6 +8,7 @@ import {awaitedForEach, log, wait} from '@augment-vir/common';
 import {mkdir, readFile, writeFile} from 'node:fs/promises';
 import {basename} from 'node:path';
 import {loadConfig, saveConfig} from './config.js';
+import {killFolderPanes, killVscode} from './daemon/daemon-client.js';
 import {folderInfoCachePath, githubCachePath, notCommittedDir} from './file-paths.js';
 import {
     fetchPrInfoForBranch,
@@ -18,12 +19,13 @@ import {
     hasUncommittedChanges,
     isWorktreeRoot,
     listWorktreeChildren,
+    removeWorktree,
     type GitHubPollingDisableReason,
     type PrInfo,
     type RepoSlug,
 } from './git.js';
 import {getPaneStatusLookup} from './pty.js';
-import {reconcileConfig} from './worktree-reconcile.js';
+import {reconcileConfig, removeWorktreeFromConfig} from './worktree-reconcile.js';
 
 type PaneStatusLookup = (folder: string, kind: PaneKind) => PaneStatus;
 
@@ -951,6 +953,77 @@ const perFolderDelayMs = 100;
  */
 const sweepIdleMs = 5000;
 
+/**
+ * Auto-delete a worktree the moment we observe its PR transition from open to merged. The
+ * transition must be witnessed by *this server*: a prior FolderInfo with `prUrl` set and
+ * `prMerged: false`, followed by a fresh `prMerged: true`. A first-observation merged PR
+ * (no prior, or `prUrl` was null) counts as "previous status unknown" and is never enough
+ * — we don't want a freshly-started server to nuke worktrees whose PRs were merged before
+ * we ever saw them open. Skips the base-branch worktree, dirty trees (would `--force` away
+ * uncommitted work), and worktrees with a live Claude/shell pane (would yank the rug).
+ */
+function shouldAutoDeleteOnMerge(
+    target: Readonly<RefreshTarget>,
+    prior: Readonly<FolderInfo> | undefined,
+    info: Readonly<FolderInfo>,
+): boolean {
+    if (target.isWorktreeRoot || target.isBase || !target.parentRepoPath) {
+        return false;
+    }
+    if (!prior || !prior.prUrl || prior.prMerged) {
+        return false;
+    }
+    if (!info.prMerged || !info.prUrl) {
+        return false;
+    }
+    if (info.git.dirty) {
+        return false;
+    }
+    if (isLivePaneStatus(info.panes.ai) || isLivePaneStatus(info.panes.shell)) {
+        return false;
+    }
+    return true;
+}
+
+async function autoDeleteMergedWorktree(target: Readonly<RefreshTarget>): Promise<void> {
+    log.info(`Auto-deleting merged worktree ${target.folder} (PR merged since last sweep).`);
+    await killFolderPanes({folder: target.folder}).catch(() => {
+        /* best effort — kill what panes exist, ignore daemon hiccups */
+    });
+    await killVscode({folder: target.folder}).catch(() => {
+        /* no vscode running for this folder is a no-op */
+    });
+    try {
+        await removeWorktree({worktreePath: target.folder});
+    } catch (error) {
+        log.error(
+            `Auto-delete failed for ${target.folder}: ${(error as Error).message}. Leaving worktree in place.`,
+        );
+        return;
+    }
+    const config = await loadConfig();
+    const reconciled = removeWorktreeFromConfig(config, target.folder);
+    /**
+     * Strip the deleted path from `hiddenWorktrees` too so the array doesn't accumulate
+     * dead entries after repeated auto-deletes on similarly-named branches. Mirrors the
+     * same cleanup the `/worktrees/delete` endpoint does.
+     */
+    const postDeleteConfig = reconciled.hiddenWorktrees.includes(target.folder)
+        ? {
+              ...reconciled,
+              hiddenWorktrees: reconciled.hiddenWorktrees.filter(
+                  (path) => path !== target.folder,
+              ),
+          }
+        : reconciled;
+    if (postDeleteConfig !== config) {
+        await saveConfig(postDeleteConfig).catch(() => {
+            /* persistence is best-effort — next sweep will reconcile reality either way */
+        });
+    }
+    publishTargets(postDeleteConfig);
+}
+
 async function refreshOnce(
     target: RefreshTarget,
     statusLookup: PaneStatusLookup,
@@ -958,13 +1031,18 @@ async function refreshOnce(
     repoHasActivePane: boolean,
 ): Promise<void> {
     try {
+        const prior = cache.get(target.folder);
         const info = await buildFolderInfo({
             target,
             statusLookup,
             disabledGitHubPolling,
             repoHasActivePane,
-            prior: cache.get(target.folder),
+            prior,
         });
+        if (shouldAutoDeleteOnMerge(target, prior, info)) {
+            await autoDeleteMergedWorktree(target);
+            return;
+        }
         cache.set(target.folder, info);
         persistCache();
     } catch {
