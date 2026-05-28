@@ -375,22 +375,101 @@ function enumerateTargets(config: Readonly<Config>): RefreshTarget[] {
     });
 }
 
+type PrSnapshot = Pick<
+    FolderInfo,
+    | 'prUrl'
+    | 'prMerged'
+    | 'branchCommitHash'
+    | 'prIsDraft'
+    | 'prCiPassing'
+    | 'prCiInProgress'
+    | 'prReviewCheckPassing'
+    | 'prReviewCheckInProgress'
+    | 'prApproved'
+    | 'prReviewChangesRequested'
+    | 'prReviewPending'
+    | 'prHasUnresolvedReviewComments'
+>;
+
+const emptyPrSnapshot: PrSnapshot = {
+    prUrl: null,
+    prMerged: false,
+    branchCommitHash: null,
+    prIsDraft: false,
+    prCiPassing: null,
+    prCiInProgress: false,
+    prReviewCheckPassing: null,
+    prReviewCheckInProgress: false,
+    prApproved: false,
+    prReviewChangesRequested: false,
+    prReviewPending: false,
+    prHasUnresolvedReviewComments: false,
+};
+
+function prSnapshotFromPr(pr: Readonly<PrInfo>): PrSnapshot {
+    return {
+        prUrl: pr.url || null,
+        prMerged: pr.merged,
+        branchCommitHash: pr.headRefOid || null,
+        prIsDraft: pr.isDraft,
+        prCiPassing: pr.ciPassing,
+        prCiInProgress: pr.ciInProgress,
+        prReviewCheckPassing: pr.reviewCheckPassing,
+        prReviewCheckInProgress: pr.reviewCheckInProgress,
+        prApproved: pr.approved,
+        prReviewChangesRequested: pr.reviewChangesRequested,
+        prReviewPending: pr.reviewPending,
+        prHasUnresolvedReviewComments: pr.hasUnresolvedReviewComments,
+    };
+}
+
+function prSnapshotFromPrior(prior: Readonly<FolderInfo>): PrSnapshot {
+    return {
+        prUrl: prior.prUrl,
+        prMerged: prior.prMerged,
+        branchCommitHash: prior.branchCommitHash,
+        prIsDraft: prior.prIsDraft,
+        prCiPassing: prior.prCiPassing,
+        prCiInProgress: prior.prCiInProgress,
+        prReviewCheckPassing: prior.prReviewCheckPassing,
+        prReviewCheckInProgress: prior.prReviewCheckInProgress,
+        prApproved: prior.prApproved,
+        prReviewChangesRequested: prior.prReviewChangesRequested,
+        prReviewPending: prior.prReviewPending,
+        prHasUnresolvedReviewComments: prior.prHasUnresolvedReviewComments,
+    };
+}
+
 async function buildFolderInfo({
     target,
     statusLookup,
     disabledGitHubPolling,
     repoHasActivePane,
+    prior,
 }: Readonly<{
     target: RefreshTarget;
     statusLookup: PaneStatusLookup;
     disabledGitHubPolling: boolean;
     repoHasActivePane: boolean;
+    prior: FolderInfo | undefined;
 }>): Promise<FolderInfo> {
     const git = await getGitInfo(target.folder);
     const pr =
         target.isWorktreeRoot || disabledGitHubPolling
             ? null
             : await getCachedPrInfo(target.folder, git.branch, repoHasActivePane);
+    /**
+     * When polling is disabled (user kill-switch or auto-disable backoff for rate-limit /
+     * unauthenticated), no GraphQL call ran this sweep. Carry the previous FolderInfo's PR
+     * fields forward so a transient `gh` auth blip doesn't wipe open-PR / draft / CI badges
+     * for the full 10-min auth backoff (or 1-hr rate-limit backoff). Worktree roots have no
+     * PR of their own, so they keep the empty defaults.
+     */
+    const prSnapshot: PrSnapshot = pr
+        ? prSnapshotFromPr(pr)
+        : disabledGitHubPolling && !target.isWorktreeRoot && prior
+          ? prSnapshotFromPrior(prior)
+          : emptyPrSnapshot;
     return {
         path: target.folder,
         name: basename(target.folder),
@@ -404,20 +483,9 @@ async function buildFolderInfo({
             dirty: git.dirty,
             notPushed: git.notPushed,
         },
-        prUrl: pr?.url || null,
-        prMerged: !!pr?.merged,
         hasUncommittedChanges: git.dirty,
         localCommitHash: git.localCommitHash,
-        branchCommitHash: pr?.headRefOid || null,
-        prIsDraft: !!pr?.isDraft,
-        prCiPassing: pr ? pr.ciPassing : null,
-        prCiInProgress: !!pr?.ciInProgress,
-        prReviewCheckPassing: pr ? pr.reviewCheckPassing : null,
-        prReviewCheckInProgress: !!pr?.reviewCheckInProgress,
-        prApproved: !!pr?.approved,
-        prReviewChangesRequested: !!pr?.reviewChangesRequested,
-        prReviewPending: !!pr?.reviewPending,
-        prHasUnresolvedReviewComments: !!pr?.hasUnresolvedReviewComments,
+        ...prSnapshot,
         lastReviewedSha: target.lastReviewedSha,
         mergeStepValues: target.mergeStepValues,
         panes: {
@@ -895,6 +963,7 @@ async function refreshOnce(
             statusLookup,
             disabledGitHubPolling,
             repoHasActivePane,
+            prior: cache.get(target.folder),
         });
         cache.set(target.folder, info);
         persistCache();
