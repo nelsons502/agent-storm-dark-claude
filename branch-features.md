@@ -31,7 +31,11 @@ At-a-glance list of features on this branch. Append one 10–15 word bullet per 
 - Session-resume path encoding maps dots to dashes so worktrees like `app.flax.ai` resume cleanly.
 - Self-review (code) popover gains "Stage trivial hunks" entry; staging now skips any import-only hunk.
 - "Get approval" stops flagging red for outdated review threads — only live unresolved comments count.
+- "Get approval" flags red on requested changes or unresolved live comments; re-requested review reverts to loading.
+- "Get approval" also flags red when the PR has merge conflicts (`mergeable: CONFLICTING`) against its base.
+- Changes-requested resolved per-reviewer server-side (latestReviews vs reviewRequests), so re-requests don't stick red.
+- Merge-step logic extracted to merge-steps.ts; covered by merge-steps.test.ts + git.test.ts (hasActiveChangesRequested).
 - Merge steps support `dependsOn`; gated steps stay visible but render as plain unchecked until their deps land.
 - Worktrees can be marked hidden; sidebar three-dot menu toggles show-hidden visibility.
-- Disabled-polling sweeps preserve prior PR snapshot so auth/rate-limit backoff doesn't wipe sidebar badges.
+- PR cache preserves prior snapshot across stale-cache, inactive-pane, and backoff cases; never wipes badges on a skipped fetch.
 - Worktrees auto-delete on observed open-to-merged PR transition; skips dirty trees and live panes.

@@ -220,15 +220,18 @@ export type PrInfo = {
     /** Remote head SHA. Empty string when unavailable. */
     headRefOid: string;
     /**
-     * Aggregated CI result: true if every check finished successfully, false if any failed,
-     * null while checks are still pending or no checks have been registered yet.
+     * Aggregated CI result: true if every check finished successfully, false if any failed, null
+     * while checks are still pending or no checks have been registered yet.
      */
     ciPassing: boolean | null;
     /** True when at least one CI check is currently running. */
     ciInProgress: boolean;
     /** True when GitHub's `reviewDecision` is APPROVED. */
     approved: boolean;
-    /** True when GitHub's `reviewDecision` is CHANGES_REQUESTED. */
+    /**
+     * True when at least one reviewer's current verdict is "changes requested" — excluding
+     * reviewers who have since been re-requested. See {@link hasActiveChangesRequested}.
+     */
     reviewChangesRequested: boolean;
     /** True when reviewers have been requested but haven't yet weighed in. */
     reviewPending: boolean;
@@ -241,6 +244,12 @@ export type PrInfo = {
     reviewCheckPassing: boolean | null;
     /** True while at least one review-flavoured check is still running. */
     reviewCheckInProgress: boolean;
+    /**
+     * True when GitHub reports the PR's `mergeable` state as `CONFLICTING` — the branch can't be
+     * merged without resolving conflicts against the base. `UNKNOWN` (GitHub still computing) and
+     * `MERGEABLE` both map to false so a transient unknown doesn't flash a false block.
+     */
+    hasMergeConflicts: boolean;
 };
 
 export type RepoSlug = {
@@ -361,13 +370,14 @@ export async function getRepoSlug(folder: string): Promise<RepoSlug | null> {
  * GraphQL hourly point budget.
  */
 /**
- * Upper bound on PRs returned per repo per call. The GraphQL "cost" the API charges scales with the
- * number of returned objects (rough rule: ~1 point per connection node, capped by `first:`), so
- * lowering this cuts our headroom against the 5000-points/hour primary rate limit. 20 is plenty for
- * the sidebar's use case (we only need to find any open / recently-terminal PR for the branches the
- * user has worktrees against).
+ * Upper bound on PRs returned per repo per call. Picked at the GraphQL ceiling of 100 because the
+ * empirical cost per call (~2-5 points for nested reviewThreads + statusCheckRollup connections) is
+ * trivial against the 5000-points/hour primary rate limit, and every PR we surface in the batch is
+ * one less worktree that has to fall back to a `gh pr view` subprocess. With many worktrees on
+ * older branches, those per-branch fallbacks were the dominant source of sweep latency and
+ * rate-limit pressure — pulling more PRs in the single batch eliminates most of them.
  */
-const fetchRepoPrsBatchSize = 40;
+const fetchRepoPrsBatchSize = 100;
 
 const repoPrsGraphqlQuery = [
     'query($owner: String!, $name: String!) {',
@@ -388,8 +398,10 @@ const repoPrsGraphqlQuery = [
     '        closedAt',
     '        mergedAt',
     '        isDraft',
+    '        mergeable',
     '        reviewDecision',
-    '        reviewRequests(first: 1) { totalCount }',
+    '        latestReviews(first: 20) { nodes { state author { login } } }',
+    '        reviewRequests(first: 20) { totalCount nodes { requestedReviewer { __typename ... on User { login } } } }',
     '        reviewThreads(first: 25) { nodes { isResolved isOutdated } }',
     '        commits(last: 1) { nodes { commit { statusCheckRollup {',
     '          contexts(first: 30) { nodes {',
@@ -421,9 +433,19 @@ type RawPrNode = {
     closedAt?: string | null;
     mergedAt?: string | null;
     isDraft?: boolean;
+    mergeable?: string | null;
     reviewDecision?: string | null;
+    latestReviews?: {
+        nodes?: ReadonlyArray<{
+            state?: string | null;
+            author?: {login?: string | null} | null;
+        }>;
+    };
     reviewRequests?: {
         totalCount?: number;
+        nodes?: ReadonlyArray<{
+            requestedReviewer?: {login?: string | null} | null;
+        }>;
     };
     reviewThreads?: {
         nodes?: ReadonlyArray<{
@@ -446,15 +468,42 @@ type RawPrNode = {
 
 /**
  * Identifies checks that represent code review (Claude review, reviewdog, etc.) rather than
- * build/lint/format/test CI. The "Pass CI" progress step ignores these — code review has its
- * own dedicated step ("Get approval") and a pending or failed review shouldn't make the CI
- * step look red.
+ * build/lint/format/test CI. The "Pass CI" progress step ignores these — code review has its own
+ * dedicated step ("Get approval") and a pending or failed review shouldn't make the CI step look
+ * red.
  */
 const reviewCheckPattern = /review/i;
 
 function isReviewCheck(check: Readonly<RawCheckRollupContext>): boolean {
     const label = check.name || check.context || '';
     return reviewCheckPattern.test(label);
+}
+
+type LatestReview = {
+    state?: string | null;
+    author?: {login?: string | null} | null;
+};
+
+/**
+ * True iff at least one reviewer's _current_ effective verdict is "changes requested". A reviewer
+ * counts only when their most-recent review requested changes AND they have not since been
+ * re-requested.
+ *
+ * GitHub's `reviewDecision` stays stuck on `CHANGES_REQUESTED` even after the author re-requests
+ * the reviewer — and the stale review keeps showing up in `latestReviews` — so neither signal alone
+ * can tell "still blocked" from "waiting on a fresh re-review". Re-requesting the reviewer re-adds
+ * them to `reviewRequests`, so a login that appears there means their old changes-requested verdict
+ * is no longer current and shouldn't flag the PR red.
+ */
+export function hasActiveChangesRequested(
+    latestReviews: ReadonlyArray<LatestReview>,
+    reRequestedLogins: ReadonlySet<string>,
+): boolean {
+    return latestReviews.some(
+        (review) =>
+            review.state === 'CHANGES_REQUESTED' &&
+            !(review.author?.login != null && reRequestedLogins.has(review.author.login)),
+    );
 }
 
 const failureConclusions = new Set([
@@ -470,9 +519,10 @@ const successConclusions = new Set([
     'SKIPPED',
 ]);
 
-function summarizeStatusCheckRollup(
-    checks: ReadonlyArray<RawCheckRollupContext> | undefined,
-): {passing: boolean | null; inProgress: boolean} {
+function summarizeStatusCheckRollup(checks: ReadonlyArray<RawCheckRollupContext> | undefined): {
+    passing: boolean | null;
+    inProgress: boolean;
+} {
     if (!checks || checks.length === 0) {
         return {passing: null, inProgress: false};
     }
@@ -624,6 +674,11 @@ export async function fetchRepoPrs(slug: Readonly<RepoSlug>): Promise<Map<string
             const reviewCheckStatus = summarizeStatusCheckRollup(reviewChecks);
             const reviewDecision = node.reviewDecision ?? '';
             const reviewRequestsCount = node.reviewRequests?.totalCount ?? 0;
+            const reRequestedLogins = new Set(
+                (node.reviewRequests?.nodes ?? [])
+                    .map((request) => request.requestedReviewer?.login)
+                    .filter((login): login is string => !!login),
+            );
             const reviewThreadNodes = node.reviewThreads?.nodes ?? [];
             // Outdated threads point at code that no longer exists in the diff — the reviewer's
             // concern is moot regardless of whether anyone clicked "Resolve conversation".
@@ -638,17 +693,21 @@ export async function fetchRepoPrs(slug: Readonly<RepoSlug>): Promise<Map<string
                 ciPassing: ciStatus.passing,
                 ciInProgress: ciStatus.inProgress,
                 approved: reviewDecision === 'APPROVED',
-                // CHANGES_REQUESTED is GitHub's authoritative "actively blocking" signal —
-                // re-requesting review flips the decision back to REVIEW_REQUIRED.
-                reviewChangesRequested: reviewDecision === 'CHANGES_REQUESTED',
+                // Per-reviewer "currently blocking" — re-requested reviewers are excluded even
+                // though GitHub leaves `reviewDecision` stuck on CHANGES_REQUESTED. See
+                // `hasActiveChangesRequested`.
+                reviewChangesRequested: hasActiveChangesRequested(
+                    node.latestReviews?.nodes ?? [],
+                    reRequestedLogins,
+                ),
                 // Only flag pending when there's an outstanding human action. PRs without
                 // required reviewers report `reviewDecision: ''` and shouldn't light up the
                 // approval step as loading forever.
-                reviewPending:
-                    reviewDecision === 'REVIEW_REQUIRED' && reviewRequestsCount > 0,
+                reviewPending: reviewDecision === 'REVIEW_REQUIRED' && reviewRequestsCount > 0,
                 hasUnresolvedReviewComments,
                 reviewCheckPassing: reviewCheckStatus.passing,
                 reviewCheckInProgress: reviewCheckStatus.inProgress,
+                hasMergeConflicts: node.mergeable === 'CONFLICTING',
             });
         }
     });
@@ -656,19 +715,16 @@ export async function fetchRepoPrs(slug: Readonly<RepoSlug>): Promise<Map<string
 }
 
 /**
- * Per-branch PR lookup for branches the batch `fetchRepoPrs` missed (e.g. the branch's PR
- * predates the 100 most-recently-updated PRs in the repo). Uses `gh pr view` against a single
- * branch — cheaper than expanding the batch query, and only triggered for cache misses, so a
- * repo where every active worktree matches a recent PR pays nothing extra.
+ * Per-branch PR lookup for branches the batch `fetchRepoPrs` missed (e.g. the branch's PR predates
+ * the 100 most-recently-updated PRs in the repo). Uses `gh pr view` against a single branch —
+ * cheaper than expanding the batch query, and only triggered for cache misses, so a repo where
+ * every active worktree matches a recent PR pays nothing extra.
  *
  * Returns null when there is no PR for the branch, or when the lookup hits a benign failure
- * (network blip, repo not on GitHub, etc.). Rate-limit / auth failures bubble up so the outer
- * cache layer can flip the kill-switch.
+ * (network blip, repo not on GitHub, etc.). Rate-limit / auth failures bubble up so the outer cache
+ * layer can flip the kill-switch.
  */
-export async function fetchPrInfoForBranch(
-    folder: string,
-    branch: string,
-): Promise<PrInfo | null> {
+export async function fetchPrInfoForBranch(folder: string, branch: string): Promise<PrInfo | null> {
     if (!(await isGhAvailable())) {
         return null;
     }
@@ -680,7 +736,7 @@ export async function fetchPrInfoForBranch(
      * `hasUnresolvedReviewComments` here rather than running a second per-branch GraphQL call.
      */
     const result = await runShellCommand(
-        `gh pr view ${safeBranch} --json url,state,mergedAt,isDraft,headRefOid,statusCheckRollup,reviewDecision,reviewRequests`,
+        `gh pr view ${safeBranch} --json url,state,mergedAt,isDraft,mergeable,headRefOid,statusCheckRollup,reviewDecision,latestReviews,reviewRequests`,
         {cwd: folder},
     );
     if (result.exitCode !== 0) {
@@ -702,10 +758,15 @@ export async function fetchPrInfoForBranch(
         state?: string;
         mergedAt?: string | null;
         isDraft?: boolean;
+        mergeable?: string | null;
         headRefOid?: string;
         statusCheckRollup?: ReadonlyArray<RawCheckRollupContext>;
         reviewDecision?: string | null;
-        reviewRequests?: ReadonlyArray<unknown>;
+        latestReviews?: ReadonlyArray<{
+            state?: string | null;
+            author?: {login?: string | null} | null;
+        }>;
+        reviewRequests?: ReadonlyArray<{login?: string | null}>;
     };
     try {
         parsed = JSON.parse(result.stdout);
@@ -722,6 +783,11 @@ export async function fetchPrInfoForBranch(
     const reviewCheckStatus = summarizeStatusCheckRollup(reviewChecks);
     const reviewDecision = parsed.reviewDecision ?? '';
     const reviewRequestsCount = parsed.reviewRequests?.length ?? 0;
+    const reRequestedLogins = new Set(
+        (parsed.reviewRequests ?? [])
+            .map((request) => request.login)
+            .filter((login): login is string => !!login),
+    );
     return {
         url: parsed.url,
         merged: parsed.state === 'MERGED',
@@ -730,7 +796,12 @@ export async function fetchPrInfoForBranch(
         ciPassing: ciStatus.passing,
         ciInProgress: ciStatus.inProgress,
         approved: reviewDecision === 'APPROVED',
-        reviewChangesRequested: reviewDecision === 'CHANGES_REQUESTED',
+        // See `hasActiveChangesRequested` — re-requested reviewers don't count even though
+        // GitHub leaves `reviewDecision` stuck on CHANGES_REQUESTED.
+        reviewChangesRequested: hasActiveChangesRequested(
+            parsed.latestReviews ?? [],
+            reRequestedLogins,
+        ),
         reviewPending: reviewDecision === 'REVIEW_REQUIRED' && reviewRequestsCount > 0,
         // `gh pr view --json` doesn't expose reviewThreads, so this stays false on the fallback
         // path. Live data for branches in the batch window comes through the full GraphQL query
@@ -738,6 +809,7 @@ export async function fetchPrInfoForBranch(
         hasUnresolvedReviewComments: false,
         reviewCheckPassing: reviewCheckStatus.passing,
         reviewCheckInProgress: reviewCheckStatus.inProgress,
+        hasMergeConflicts: parsed.mergeable === 'CONFLICTING',
     };
 }
 
@@ -765,7 +837,9 @@ export async function inspectRepoPath(folder: string): Promise<RepoInspection> {
     } else if (await isWorktreeRoot(folder)) {
         const children = await listWorktreeChildren(folder);
         const branches = (
-            await Promise.all(children.map((child) => getGitInfo(child).then((info) => info.branch)))
+            await Promise.all(
+                children.map((child) => getGitInfo(child).then((info) => info.branch)),
+            )
         ).filter((branch): branch is string => !!branch);
         return {
             state: RepoInspectionState.Worktree,
@@ -789,7 +863,9 @@ export async function inspectRepoPath(folder: string): Promise<RepoInspection> {
             const children = await listWorktreeChildren(parent);
             const branches = (
                 await Promise.all(
-                    children.map((child) => getGitInfo(child).then((childInfo) => childInfo.branch)),
+                    children.map((child) =>
+                        getGitInfo(child).then((childInfo) => childInfo.branch),
+                    ),
                 )
             ).filter((branch): branch is string => !!branch);
             return {

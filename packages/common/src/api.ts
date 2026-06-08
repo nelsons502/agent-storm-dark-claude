@@ -206,9 +206,11 @@ export const folderInfoShape = defineShape({
     prReviewCheckInProgress: false,
     prApproved: false,
     /**
-     * True when GitHub's `reviewDecision` is `CHANGES_REQUESTED` — at least one reviewer is
-     * actively blocking the PR and the author hasn't re-requested review since. Powers the
-     * red-exclamation failure state on the "Get approval" step.
+     * True when at least one reviewer's current verdict is "changes requested" — i.e. their
+     * latest review requested changes and they have NOT since been re-requested. Re-requesting a
+     * reviewer leaves GitHub's `reviewDecision` stuck on `CHANGES_REQUESTED`, so the server
+     * resolves this per-reviewer against the pending review requests rather than trusting the
+     * aggregate decision. Powers the red-exclamation failure state on the "Get approval" step.
      */
     prReviewChangesRequested: false,
     /**
@@ -226,6 +228,13 @@ export const folderInfoShape = defineShape({
      * alongside `prReviewChangesRequested`.
      */
     prHasUnresolvedReviewComments: false,
+    /**
+     * True when GitHub reports the PR as having merge conflicts against its base branch
+     * (`mergeable: CONFLICTING`). Drives the red-exclam failure state on the "Get approval" step —
+     * the author has to resolve conflicts before the PR can land. `UNKNOWN`/`MERGEABLE` both map to
+     * false so a still-computing state doesn't flash a spurious block.
+     */
+    prHasMergeConflicts: false,
     /** SHA captured the last time the user checked Self-review (code). Mirrors worktree config. */
     lastReviewedSha: nullableShape(''),
     /**

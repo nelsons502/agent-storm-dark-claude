@@ -42,6 +42,27 @@ const repoPrCacheTtlMs = 60 * 1000;
 type RepoPrCacheEntry = {
     fetchedAt: number;
     prsByBranch: Map<string, PrInfo>;
+    /**
+     * Branches we've already looked up during this cache window (either via the batch fetch
+     * or the per-branch fallback). Used to short-circuit `fetchPrInfoForBranch` for branches
+     * confirmed to have no PR — otherwise every sweep would re-shell `gh pr view` for a worktree
+     * with no PR, wasting subprocess time and rate-limit budget. Reset on each new batch fetch
+     * so a freshly-created PR is picked up within one cache TTL.
+     */
+    checkedBranches: Set<string>;
+};
+
+/**
+ * Outcome of a PR lookup. `authoritative: true` means GitHub gave us a current answer
+ * (found the PR, or confirmed there's no PR for this branch) — `info: null` here means
+ * "no PR exists" and the caller should clear any stale UI badges. `authoritative: false`
+ * means we couldn't query GitHub (polling disabled, no active pane and cache stale, network
+ * blip) — the caller should preserve whatever PR snapshot it last saw rather than wiping
+ * the sidebar's open-PR / draft / CI badges.
+ */
+type PrLookupResult = {
+    info: PrInfo | null;
+    authoritative: boolean;
 };
 
 /** Key: `${owner}/${name}`. See {@link repoCacheKey}. */
@@ -176,7 +197,7 @@ function markAutoDisabled(reason: GitHubPollingDisableReason, message: string): 
 /**
  * Mirror of `config.disabledGitHubPolling`, refreshed on each sweep + on startup. Lets the
  * lowest-level fetch site short-circuit without re-reading the config file on every call. The
- * config is still the source of truth — this is just a hot cache so `getCachedRepoPrMap` can gate
+ * config is still the source of truth — this is just a hot cache so `getOrFetchRepoCacheEntry` can gate
  * without I/O.
  */
 const userPollingState: {manuallyDisabled: boolean} = {
@@ -201,54 +222,60 @@ async function ensureRepoSlug(folder: string): Promise<RepoSlug | null> {
     return slug;
 }
 
-async function getCachedRepoPrMap(
+/**
+ * Resolve the per-repo cache entry, refreshing from GitHub when stale and allowed. Returns
+ * the cached entry alongside an `isFresh` flag so the caller can tell "we just fetched this"
+ * from "we're serving stale data because we couldn't refresh." Returns `null` only when there
+ * is no cached data at all and we couldn't fetch — that's the case where the caller must
+ * preserve the prior FolderInfo snapshot to avoid wiping the sidebar.
+ *
+ * Stale-but-cached data is still returned (with `isFresh: false`) on inactive panes,
+ * auto-disable backoff, and benign fetch failures. The previous behavior dropped to an empty
+ * map any time a fresh fetch couldn't run, which is what was causing the sidebar's PR badges
+ * to vanish whenever the user closed all Claude panes.
+ */
+async function getOrFetchRepoCacheEntry(
     slug: Readonly<RepoSlug>,
     allowFetch: boolean,
-): Promise<Map<string, PrInfo>> {
-    /**
-     * Belt-and-braces gate against the user's manual kill-switch. The high-level caller in
-     * `buildFolderInfo` already short-circuits on `disabledGitHubPolling`, but checking here too
-     * means any future call path can't accidentally bypass the user's preference — even cache
-     * misses get short-circuited before any network call could be attempted.
-     */
+): Promise<{entry: RepoPrCacheEntry; isFresh: boolean} | null> {
     if (isUserPollingDisabled()) {
-        return new Map();
+        const existing = repoPrCache.get(repoCacheKey(slug));
+        return existing ? {entry: existing, isFresh: false} : null;
     }
     const key = repoCacheKey(slug);
     const existing = repoPrCache.get(key);
     if (existing && Date.now() - existing.fetchedAt < repoPrCacheTtlMs) {
-        return existing.prsByBranch;
-        /**
-         * The caller-decided gate: skip the network trip entirely when the repo has no active
-         * panes. Cache hits above still serve stale data (within the TTL) so the sidebar's PR
-         * badges stay accurate for inactive folders; we just don't spend GraphQL points refreshing
-         * them.
-         */
-    } else if (!allowFetch) {
-        return new Map();
-        /**
-         * Belt-and-braces gate: `buildFolderInfo` already short-circuits on the per-sweep
-         * `disabledGitHubPolling` flag, but that flag is captured once at sweep start so a folder
-         * that triggers auto-disable mid-sweep would still let later folders in the same sweep hit
-         * the API. Re-check on every call so the very next folder skips its own GraphQL trip.
-         */
-    } else if (isAutoDisabled()) {
-        return new Map();
+        return {entry: existing, isFresh: true};
+    }
+    /**
+     * Stale or missing. The caller-decided activity gate and the auto-disable backoff both
+     * mean "don't pay for a fresh fetch right now" — but we still want the caller to see
+     * whatever we last had, so the sidebar's PR badges survive an idle period or a transient
+     * auth blip. Empty Map is only returned when there's literally nothing cached yet.
+     */
+    if (!allowFetch || isAutoDisabled()) {
+        return existing ? {entry: existing, isFresh: false} : null;
     }
     try {
         const prsByBranch = await fetchRepoPrs(slug);
-        repoPrCache.set(key, {
+        const entry: RepoPrCacheEntry = {
             fetchedAt: Date.now(),
             prsByBranch,
-        });
+            /**
+             * Seed `checkedBranches` with every branch returned by the batch. Subsequent
+             * fallbacks add to this set so a branch confirmed-no-PR isn't re-checked every
+             * sweep until the next batch refresh.
+             */
+            checkedBranches: new Set(prsByBranch.keys()),
+        };
+        repoPrCache.set(key, entry);
         persistGithubCache();
-        return prsByBranch;
+        return {entry, isFresh: true};
     } catch (error) {
         if (error instanceof GitHubPollingError) {
             markAutoDisabled(error.reason, error.message);
-            return new Map();
         }
-        throw error;
+        return existing ? {entry: existing, isFresh: false} : null;
     }
 }
 
@@ -256,40 +283,52 @@ async function getCachedPrInfo(
     folder: string,
     branch: string | null,
     allowFetch: boolean,
-): Promise<PrInfo | null> {
+): Promise<PrLookupResult> {
     if (!branch) {
-        return null;
+        /** No branch = no PR possible; authoritative. */
+        return {info: null, authoritative: true};
     }
     const slug = await ensureRepoSlug(folder);
     if (!slug) {
-        return null;
+        /** Not a GitHub repo; authoritative. */
+        return {info: null, authoritative: true};
     }
-    const prsByBranch = await getCachedRepoPrMap(slug, allowFetch);
-    const hit = prsByBranch.get(branch);
+    const result = await getOrFetchRepoCacheEntry(slug, allowFetch);
+    if (!result) {
+        /** No cache and couldn't fetch — preserve whatever the caller last knew. */
+        return {info: null, authoritative: false};
+    }
+    const {entry, isFresh} = result;
+    const hit = entry.prsByBranch.get(branch);
     if (hit) {
-        return hit;
+        return {info: hit, authoritative: true};
     }
     /**
-     * Batch fetch only returns the 100 most-recently-updated PRs per repo. A worktree against an
-     * older branch whose PR isn't in that window falls back to a per-branch `gh pr view` lookup
-     * here. Stored back into the same per-branch map so the next sweep gets the cache hit and
-     * doesn't re-shell. Gated by `allowFetch` so inactive folders don't keep paying per-sweep.
+     * Branch not in the batch. Two cases: we've already fallen back for this branch in the
+     * current cache window (or it was just confirmed missing from a fresh batch we seeded
+     * `checkedBranches` from) → authoritative no-PR. Otherwise we need to fall back via
+     * `gh pr view` if we're allowed.
      */
-    if (!allowFetch || isAutoDisabled()) {
-        return null;
+    if (entry.checkedBranches.has(branch)) {
+        return {info: null, authoritative: true};
+    }
+    if (!isFresh || !allowFetch || isAutoDisabled()) {
+        /** Couldn't confirm — preserve prior. */
+        return {info: null, authoritative: false};
     }
     try {
         const info = await fetchPrInfoForBranch(folder, branch);
+        entry.checkedBranches.add(branch);
         if (info) {
-            prsByBranch.set(branch, info);
-            persistGithubCache();
+            entry.prsByBranch.set(branch, info);
         }
-        return info;
+        persistGithubCache();
+        return {info, authoritative: true};
     } catch (error) {
         if (error instanceof GitHubPollingError) {
             markAutoDisabled(error.reason, error.message);
         }
-        return null;
+        return {info: null, authoritative: false};
     }
 }
 
@@ -391,6 +430,7 @@ type PrSnapshot = Pick<
     | 'prReviewChangesRequested'
     | 'prReviewPending'
     | 'prHasUnresolvedReviewComments'
+    | 'prHasMergeConflicts'
 >;
 
 const emptyPrSnapshot: PrSnapshot = {
@@ -406,6 +446,7 @@ const emptyPrSnapshot: PrSnapshot = {
     prReviewChangesRequested: false,
     prReviewPending: false,
     prHasUnresolvedReviewComments: false,
+    prHasMergeConflicts: false,
 };
 
 function prSnapshotFromPr(pr: Readonly<PrInfo>): PrSnapshot {
@@ -422,6 +463,7 @@ function prSnapshotFromPr(pr: Readonly<PrInfo>): PrSnapshot {
         prReviewChangesRequested: pr.reviewChangesRequested,
         prReviewPending: pr.reviewPending,
         prHasUnresolvedReviewComments: pr.hasUnresolvedReviewComments,
+        prHasMergeConflicts: pr.hasMergeConflicts,
     };
 }
 
@@ -439,6 +481,7 @@ function prSnapshotFromPrior(prior: Readonly<FolderInfo>): PrSnapshot {
         prReviewChangesRequested: prior.prReviewChangesRequested,
         prReviewPending: prior.prReviewPending,
         prHasUnresolvedReviewComments: prior.prHasUnresolvedReviewComments,
+        prHasMergeConflicts: prior.prHasMergeConflicts,
     };
 }
 
@@ -456,22 +499,31 @@ async function buildFolderInfo({
     prior: FolderInfo | undefined;
 }>): Promise<FolderInfo> {
     const git = await getGitInfo(target.folder);
-    const pr =
-        target.isWorktreeRoot || disabledGitHubPolling
-            ? null
-            : await getCachedPrInfo(target.folder, git.branch, repoHasActivePane);
     /**
-     * When polling is disabled (user kill-switch or auto-disable backoff for rate-limit /
-     * unauthenticated), no GraphQL call ran this sweep. Carry the previous FolderInfo's PR
-     * fields forward so a transient `gh` auth blip doesn't wipe open-PR / draft / CI badges
-     * for the full 10-min auth backoff (or 1-hr rate-limit backoff). Worktree roots have no
-     * PR of their own, so they keep the empty defaults.
+     * Worktree roots are bare and never have a PR — short-circuit to an authoritative empty.
+     * User-disabled polling or auto-disable backoff means no GitHub call ran this sweep —
+     * treat as non-authoritative so the prior snapshot carries forward instead of nulling
+     * out badges. Everything else goes through the per-repo cache lookup.
      */
-    const prSnapshot: PrSnapshot = pr
-        ? prSnapshotFromPr(pr)
-        : disabledGitHubPolling && !target.isWorktreeRoot && prior
-          ? prSnapshotFromPrior(prior)
-          : emptyPrSnapshot;
+    const prLookup: PrLookupResult = target.isWorktreeRoot
+        ? {info: null, authoritative: true}
+        : disabledGitHubPolling
+          ? {info: null, authoritative: false}
+          : await getCachedPrInfo(target.folder, git.branch, repoHasActivePane);
+    /**
+     * Tri-state branch:
+     *   found → fresh snapshot from the PR.
+     *   authoritative miss → GitHub confirmed no PR; clear stale UI badges.
+     *   non-authoritative → couldn't query (inactive pane + stale cache, disabled polling,
+     *     fetch error); keep showing the last-known snapshot so the sidebar doesn't blank.
+     */
+    const prSnapshot: PrSnapshot = prLookup.info
+        ? prSnapshotFromPr(prLookup.info)
+        : prLookup.authoritative
+          ? emptyPrSnapshot
+          : prior
+            ? prSnapshotFromPrior(prior)
+            : emptyPrSnapshot;
     return {
         path: target.folder,
         name: basename(target.folder),
@@ -591,6 +643,7 @@ function placeholderFolderInfo(target: RefreshTarget): FolderInfo {
         prReviewChangesRequested: false,
         prReviewPending: false,
         prHasUnresolvedReviewComments: false,
+        prHasMergeConflicts: false,
         lastReviewedSha: target.lastReviewedSha,
         mergeStepValues: target.mergeStepValues,
         panes: {
@@ -790,6 +843,8 @@ function normalizeCachedFolderInfo(info: FolderInfo): FolderInfo {
             typeof info.prHasUnresolvedReviewComments === 'boolean'
                 ? info.prHasUnresolvedReviewComments
                 : false,
+        prHasMergeConflicts:
+            typeof info.prHasMergeConflicts === 'boolean' ? info.prHasMergeConflicts : false,
         lastReviewedSha:
             typeof info.lastReviewedSha === 'string' || info.lastReviewedSha === null
                 ? info.lastReviewedSha
@@ -865,6 +920,12 @@ type PersistedGithubCache = {
                         PrInfo,
                     ]
                 >;
+                /**
+                 * Branches confirmed-checked during the cache window — populated from the batch
+                 * keys at fetch time and grown by per-branch fallbacks. Optional in the persisted
+                 * shape for backward compatibility with caches written before this field existed.
+                 */
+                checkedBranches?: ReadonlyArray<string>;
             },
         ]
     >;
@@ -886,6 +947,7 @@ function persistGithubCache(): void {
                 {
                     fetchedAt: entry.fetchedAt,
                     prs: Array.from(entry.prsByBranch.entries()),
+                    checkedBranches: Array.from(entry.checkedBranches),
                 },
             ],
         ),
@@ -918,17 +980,31 @@ async function loadPersistedGithubCache(): Promise<void> {
                     key,
                     entry,
                 ]) => {
-                    if (
-                        typeof entry?.fetchedAt !== 'number' ||
-                        !Array.isArray(entry.prs) ||
-                        /** Drop already-expired entries so we don't pretend stale data is fresh. */
-                        Date.now() - entry.fetchedAt >= repoPrCacheTtlMs
-                    ) {
+                    if (typeof entry?.fetchedAt !== 'number' || !Array.isArray(entry.prs)) {
                         return;
                     }
+                    /**
+                     * Restore every persisted entry regardless of TTL. Entries older than
+                     * `repoPrCacheTtlMs` are still useful as the "preserve prior" fallback
+                     * when the new sweep can't reach GitHub (no active pane + cache stale,
+                     * auth backoff, etc.) — they'll be refreshed naturally on the next
+                     * eligible sweep, but until then we serve them rather than blanking the
+                     * sidebar. The previous load logic dropped these entries, which is why a
+                     * cold restart followed by a stretch of inactivity wiped PR badges.
+                     */
+                    const prsByBranch: Map<string, PrInfo> = new Map(entry.prs);
+                    const rawChecked: unknown = entry.checkedBranches;
+                    const checkedBranches = Array.isArray(rawChecked)
+                        ? new Set(
+                              rawChecked.filter(
+                                  (value: unknown): value is string => typeof value === 'string',
+                              ),
+                          )
+                        : new Set(prsByBranch.keys());
                     repoPrCache.set(key, {
                         fetchedAt: entry.fetchedAt,
-                        prsByBranch: new Map(entry.prs),
+                        prsByBranch,
+                        checkedBranches,
                     });
                 },
             );
@@ -1106,7 +1182,7 @@ async function runSweep(): Promise<void> {
     const disabledGitHubPolling = isGitHubPollingDisabled(config);
     /**
      * Snapshot which repos have at least one live pane (AI or Shell, Busy or Idle) at sweep start.
-     * `getCachedRepoPrMap` uses this to skip the GraphQL fetch for repos the user isn't actively
+     * `getOrFetchRepoCacheEntry` uses this to skip the GraphQL fetch for repos the user isn't actively
      * working with — cache hits still serve their stale data, but no network trip is spent
      * refreshing PRs for an inactive repo.
      */
