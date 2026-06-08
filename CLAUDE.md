@@ -40,3 +40,4 @@ Combined output is teed to `.logs/dev.log` — see the `read-backend-logs` skill
 - Playwright is in `node_modules` via `eslint-plugin-playwright` (transitive) — usable in scripts without explicit install.
 - Frontend reporter only catches uncaught errors; caught API failures need explicit reportClientError calls.
 - Electron ESM main hangs on `await app.whenReady()` at top-level; use `.then()` callback instead.
+- Adding a field to `folderInfoShape` requires backfilling it in BOTH persisted caches or `/folders` shape-validation fails on restart: `normalizeCachedFolderInfo` (folder-info-cache.json) and the `PrInfo` path (`prSnapshotFromPr` must coerce stale github-cache.json entries that predate the field).

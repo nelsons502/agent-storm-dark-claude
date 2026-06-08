@@ -38,4 +38,4 @@ At-a-glance list of features on this branch. Append one 10–15 word bullet per 
 - Merge steps support `dependsOn`; gated steps stay visible but render as plain unchecked until their deps land.
 - Worktrees can be marked hidden; sidebar three-dot menu toggles show-hidden visibility.
 - PR cache preserves prior snapshot across stale-cache, inactive-pane, and backoff cases; never wipes badges on a skipped fetch.
-- Worktrees auto-delete on observed open-to-merged PR transition; skips dirty trees and live panes.
+- Worktrees auto-hide (not delete) on observed open-to-merged PR transition; skips base and live panes.
