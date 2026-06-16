@@ -64,6 +64,7 @@ const buttonIconSize = 16;
 const plusIcon = createSizedIcon(lucideIcons.Plus, buttonIconSize);
 const settingsIcon = createSizedIcon(lucideIcons.Settings, buttonIconSize);
 const ellipsisIcon = createSizedIcon(lucideIcons.Ellipsis, buttonIconSize);
+const addWorktreeIcon = createSizedIcon(lucideIcons.GitBranchPlus, buttonIconSize);
 const filterIcon = createSizedIcon(lucideIcons.ListFilter, buttonIconSize);
 const brandMarkIcon = createSizedIcon(AgentStormMarkIcon, 16);
 
@@ -345,6 +346,15 @@ export const VirSidebar = defineElement<{
 
         .actions {
             display: inline-flex;
+            gap: 2px;
+        }
+
+        /* Groups the always-visible "add worktree" button with the hover-gated actions menu so the
+           "+" stays visible regardless of hover (it sits outside the actions span, whose opacity
+           gating would otherwise dim it along with the ellipsis). */
+        .repo-header-right {
+            display: inline-flex;
+            align-items: center;
             gap: 2px;
         }
 
@@ -683,47 +693,68 @@ export const VirSidebar = defineElement<{
                             ?data-menu-open=${state.openMenuKey === repoMenuKey}
                         >
                             <span>${root.name}</span>
-                            <span class="actions">
-                                <${ViraMenuTrigger.assign({
-                                    horizontalAnchor: HorizontalAnchor.Right,
+                            <span class="repo-header-right">
+                                <${ViraButton.assign({
+                                    icon: addWorktreeIcon,
+                                    buttonSize: ViraSize.Small,
+                                    buttonEmphasis: ViraEmphasis.Subtle,
+                                    color: ViraColorVariant.Positive,
                                 })}
-                                    ${listen(ViraMenuTrigger.events.openChange, (event) => {
-                                        updateState({
-                                            openMenuKey: event.detail ? repoMenuKey : undefined,
-                                        });
+                                    title="Add worktree"
+                                    ${listen('click', () => {
+                                        void openAddWorktreeModal(root.path, updateState);
                                     })}
-                                >
-                                    <${ViraButton.assign({
-                                        icon: ellipsisIcon,
-                                        buttonSize: ViraSize.Small,
-                                        buttonEmphasis: ViraEmphasis.Subtle,
-                                        color: ViraColorVariant.Neutral,
+                                ></${ViraButton}>
+                                <span class="actions">
+                                    <${ViraMenuTrigger.assign({
+                                        horizontalAnchor: HorizontalAnchor.Right,
                                     })}
-                                        slot=${ViraMenuTrigger.slotNames.trigger}
-                                        title="Repo actions"
-                                    ></${ViraButton}>
-                                    ${renderMenuItemEntries([
-                                        {
-                                            content: 'Add worktree',
-                                            iconOverride: lucideIcons.GitBranchPlus,
-                                            onClick: () => {
-                                                void openAddWorktreeModal(root.path, updateState);
-                                            },
-                                        },
-                                        {
-                                            content: 'Remove repo',
-                                            iconOverride: lucideIcons.X,
-                                            onClick: () => {
-                                                void confirmRemoveRepo(root.path, updateState, () =>
-                                                    emitFoldersRemoved([
+                                        ${listen(ViraMenuTrigger.events.openChange, (event) => {
+                                            updateState({
+                                                openMenuKey: event.detail ? repoMenuKey : undefined,
+                                            });
+                                        })}
+                                    >
+                                        <${ViraButton.assign({
+                                            icon: ellipsisIcon,
+                                            buttonSize: ViraSize.Small,
+                                            buttonEmphasis: ViraEmphasis.Subtle,
+                                            color: ViraColorVariant.Neutral,
+                                        })}
+                                            slot=${ViraMenuTrigger.slotNames.trigger}
+                                            title="Repo actions"
+                                        ></${ViraButton}>
+                                        ${renderMenuItemEntries([
+                                            {
+                                                content: 'Add worktree',
+                                                iconOverride: lucideIcons.GitBranchPlus,
+                                                onClick: () => {
+                                                    void openAddWorktreeModal(
                                                         root.path,
-                                                        ...children.map((child) => child.path),
-                                                    ]),
-                                                );
+                                                        updateState,
+                                                    );
+                                                },
                                             },
-                                        },
-                                    ])}
-                                </${ViraMenuTrigger}>
+                                            {
+                                                content: 'Remove repo',
+                                                iconOverride: lucideIcons.X,
+                                                onClick: () => {
+                                                    void confirmRemoveRepo(
+                                                        root.path,
+                                                        updateState,
+                                                        () =>
+                                                            emitFoldersRemoved([
+                                                                root.path,
+                                                                ...children.map(
+                                                                    (child) => child.path,
+                                                                ),
+                                                            ]),
+                                                    );
+                                                },
+                                            },
+                                        ])}
+                                    </${ViraMenuTrigger}>
+                                </span>
                             </span>
                         </div>
                         ${children.map((child) =>
