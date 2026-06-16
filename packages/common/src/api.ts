@@ -1,7 +1,7 @@
 import {AnyOrigin, defineService, HttpMethod} from '@rest-vir/define-service';
 import {defineShape, enumShape, nullableShape, tupleShape, unionShape} from 'object-shape-tester';
 import {mapSchemaToShape, type JSONSchema, type SchemaShapeToType} from 'schema-vir';
-import {PaneKind, PaneStatus, SidebarGrouping} from './enums.js';
+import {PaneKind, PaneStatus, SidebarGrouping, Theme} from './enums.js';
 
 const port = 41_880;
 
@@ -247,6 +247,23 @@ export const configJsonSchema = {
             title: 'Disable update checks',
             description:
                 "When on, agent-storm stops checking GitHub for new commits on the dev branch and hides the sidebar's update banner.",
+        },
+        /**
+         * Frontend color theme. Intentionally absent from `required` so older configs without the
+         * field still load — a missing value reads as `undefined`, which `enumShape` resolves to
+         * the first variant (`Theme.Light`), matching the original out-of-the-box look.
+         */
+        theme: {
+            type: 'string',
+            enum: [
+                Theme.Light,
+                Theme.DarkClaude,
+                Theme.Auto,
+            ],
+            default: Theme.Light,
+            title: 'Theme',
+            description:
+                'Color theme for the app. "light" is the original, unchanged look; "dark-claude" applies a dark theme modeled after the Claude desktop / Claude Code aesthetic; "auto" follows your operating system\'s light/dark setting.',
         },
     },
     required: [

@@ -290,7 +290,13 @@ export const VirSidebar = defineElement<{
         }
 
         .row[data-active] {
-            background-color: ${viraThemeByKeys.blue['behind-fg']['small-body'].background.value};
+            /* Mirror the Claude desktop app: the selected row is a subtly lighter dark grey, not a
+               colored tint. theme.ts sets --active-row-bg in dark mode; light mode falls back to
+               vira's stock blue tint. */
+            background-color: var(
+                --active-row-bg,
+                ${viraThemeByKeys.blue['behind-fg']['small-body'].background.value}
+            );
         }
 
         .row[data-indented] {

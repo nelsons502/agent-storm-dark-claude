@@ -1,4 +1,4 @@
-import {agentStormService, PaneKind} from '@agent-storm/common';
+import {agentStormService, PaneKind, type Theme} from '@agent-storm/common';
 import {connectWebSocket} from '@rest-vir/define-service';
 import {FitAddon} from '@xterm/addon-fit';
 import {WebLinksAddon} from '@xterm/addon-web-links';
@@ -8,6 +8,7 @@ import {css, defineElement, html, onDomCreated, unsafeCSS} from 'element-vir';
 import {viraThemeByKeys} from 'vira';
 import {getConfig, uploadFile} from '../../util/api-client.js';
 import {ensureSecret} from '../../util/auth.js';
+import {resolveIsDarkClaude, terminalThemeBackground} from '../../util/theme.js';
 import {defaultXtermStyles} from './xterm-styles.js';
 
 const uploadErrorDismissMs = 5000;
@@ -125,8 +126,8 @@ function extractDroppedPaths(transfer: DataTransfer): string[] {
     return [];
 }
 
-const terminalAppTheme: ITheme = {
-    background: '#ffffff',
+const lightTerminalTheme: ITheme = {
+    background: terminalThemeBackground.light,
     foreground: '#0220b3',
     cursor: '#ff2600',
     cursorAccent: '#ffffff',
@@ -153,6 +154,57 @@ const terminalAppTheme: ITheme = {
     brightCyan: '#2799bb',
     brightWhite: '#bababa',
 };
+
+/**
+ * Warm, low-contrast dark palette tuned to feel like Claude Code's terminal: a warm near-black
+ * background, warm off-white text, and the Claude clay/coral (`#d97757`) cursor. ANSI colors are
+ * softened (not pure/neon) so output reads comfortably on the dark background.
+ */
+const darkTerminalTheme: ITheme = {
+    background: terminalThemeBackground.dark,
+    /*
+     * Warm off-white body text. Claude Code's bold headers render in this default foreground (bold
+     * weight, not an ANSI color — xterm's ITheme has no separate bold color), so bold reads as
+     * heavier off-white, matching Claude Code's own dark mode where bold is bright text and orange
+     * is reserved for emphasis/inline tokens (see brightBlue below).
+     */
+    foreground: '#edece8',
+    cursor: '#d97757',
+    cursorAccent: terminalThemeBackground.dark,
+    selectionBackground: 'rgba(217, 119, 87, 0.24)',
+    black: '#3a3833',
+    red: '#e5704b',
+    green: '#7fa86b',
+    yellow: '#d9a55c',
+    /*
+     * Claude Code colors its emphasized / inline tokens with ANSI bright-blue (its bold headers use
+     * default white, not a palette color). We remap both blue slots to a light, warm orange so that
+     * accent matches the clay theme; brightBlue (index 12) is the one Claude actually uses, blue
+     * (index 4) is kept in step for any plain-blue output.
+     */
+    blue: '#dd9a54',
+    magenta: '#b98bc9',
+    cyan: '#6cb6b6',
+    white: '#d3cdc0',
+    brightBlack: '#5c5850',
+    brightRed: '#ff8a66',
+    brightGreen: '#9bc784',
+    brightYellow: '#f0c074',
+    brightBlue: '#e6a55e',
+    brightMagenta: '#d3a5e0',
+    brightCyan: '#87cccc',
+    brightWhite: '#f5f0e6',
+};
+
+/**
+ * Pick the xterm theme matching the configured app theme. `Auto` follows the OS
+ * `prefers-color-scheme` at terminal-creation time (a live OS switch won't re-theme an already-open
+ * terminal — it picks up the change on next reload, same as the rest of the app's reload-on-change
+ * model). Undefined (older config) resolves to light, matching the schema default.
+ */
+function resolveTerminalTheme(theme: Theme | undefined): ITheme {
+    return resolveIsDarkClaude(theme) ? darkTerminalTheme : lightTerminalTheme;
+}
 
 export const VirTerminal = defineElement<{
     folder: string;
@@ -190,7 +242,10 @@ export const VirTerminal = defineElement<{
             height: 100%;
             box-sizing: border-box;
             padding: 2px;
-            background: ${unsafeCSS(terminalAppTheme.background || 'transparent')};
+            /* Driven by theme.ts's applyResolvedTheme so the padding tracks the active theme; the
+               light default covers the brief pre-apply window on first paint. The xterm canvas
+               paints its own matching background over the rest of the host. */
+            background: var(--terminal-host-bg, ${unsafeCSS(terminalThemeBackground.light)});
         }
 
         .terminal-host {
@@ -308,7 +363,7 @@ export const VirTerminal = defineElement<{
                         cursorStyle: 'bar',
                         cursorWidth: 3,
                         scrollback: terminalScrollbackLines,
-                        theme: terminalAppTheme,
+                        theme: resolveTerminalTheme(config?.theme),
                         /**
                          * Seed xterm with the daemon's spawn-default dims (see `pty-pool.ts`'s
                          * `spawn({cols: 120, rows: 32})`). Until `fitAndResend` runs successfully —

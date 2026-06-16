@@ -197,7 +197,9 @@ export const VirPaneGroup = defineElement<{
             height: calc(100% + var(--vscode-titlebar-offset));
             margin-top: calc(-1 * var(--vscode-titlebar-offset));
             border: none;
-            background: white;
+            /* Wrapper shown behind the VS Code iframe while it loads; track the theme default so it
+               doesn't flash white in dark mode (VS Code applies its own theme once loaded). */
+            background: var(--vira-default-bg, #ffffff);
         }
 
         .vscode-status {

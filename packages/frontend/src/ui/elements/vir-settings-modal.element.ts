@@ -1,4 +1,4 @@
-import {configJsonSchema, defaultConfig, type Config} from '@agent-storm/common';
+import {configJsonSchema, defaultConfig, type Config, type Theme} from '@agent-storm/common';
 import {css, defineElement, defineElementEvent, html, listen, onDomCreated} from 'element-vir';
 import {type JsonValue} from 'type-fest';
 import {
@@ -89,6 +89,13 @@ export const VirSettingsModal = defineElement<{
              * page reload — existing terminals only read the config at construction.
              */
             useWebgl: undefined as boolean | undefined,
+            /**
+             * The theme value at load time, captured so save() can detect a change and trigger a
+             * page reload — `vir-app` applies the theme once, in its `init` hook, so the simplest
+             * correct way to re-apply a freshly-saved theme is a full reload (same pattern as
+             * `useWebgl`).
+             */
+            theme: undefined as Theme | undefined,
             loadError: undefined as string | undefined,
             saveError: undefined as string | undefined,
             saving: false,
@@ -132,6 +139,7 @@ export const VirSettingsModal = defineElement<{
                 pending: undefined,
                 loaded: undefined,
                 useWebgl: undefined,
+                theme: undefined,
                 loadError: undefined,
                 saveError: undefined,
                 saving: false,
@@ -173,6 +181,7 @@ export const VirSettingsModal = defineElement<{
                     loaded: config,
                     // optionalShape default is true; coerce undefined → true for comparison.
                     useWebgl: config.useWebgl,
+                    theme: config.theme,
                     loadError: undefined,
                 });
             } catch (error: unknown) {
@@ -196,11 +205,12 @@ export const VirSettingsModal = defineElement<{
                 const nextUseWebgl = next.useWebgl;
                 const webglChanged =
                     state.useWebgl !== undefined && state.useWebgl !== nextUseWebgl;
+                const themeChanged = state.theme !== undefined && state.theme !== next.theme;
                 reset();
                 dispatch(new events.closeRequested());
-                if (webglChanged) {
-                    // Existing terminals only read useWebgl at construction; reload so the
-                    // new renderer choice applies everywhere.
+                if (webglChanged || themeChanged) {
+                    // Existing terminals only read useWebgl at construction, and vir-app applies the
+                    // theme once in its init hook; reload so either change applies everywhere.
                     window.location.reload();
                 }
             } catch (error: unknown) {

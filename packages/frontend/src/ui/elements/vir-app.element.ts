@@ -10,7 +10,7 @@ import {
     ViraSize,
     viraThemeByKeys,
 } from 'vira';
-import {getFolders, touchRepo} from '../../util/api-client.js';
+import {getConfig, getFolders, touchRepo} from '../../util/api-client.js';
 import {localStorageClient, sidebarWidth} from '../../util/local-storage-client.js';
 import {
     defaultFrontendTab,
@@ -21,6 +21,7 @@ import {
 } from '../../util/router.js';
 import {determineScreenSize, ScreenSize} from '../../util/screen-size.js';
 import '../../util/service-origin.js';
+import {applyTheme} from '../../util/theme.js';
 import {VirAuthModal} from './vir-auth-modal.element.js';
 import {VirBook} from './vir-book.element.js';
 import {VirPaneGroup} from './vir-pane-group.element.js';
@@ -164,6 +165,12 @@ type AppState = {
      */
     disconnectVisualViewport: (() => void) | undefined;
     /**
+     * Disposer for the color-theme application kicked off in `init`. Only does work for the `auto`
+     * theme (tears down the `prefers-color-scheme` listener); undefined until the initial config
+     * fetch resolves, or a no-op for the fixed light/dark themes.
+     */
+    disposeTheme: (() => void) | undefined;
+    /**
      * Mobile-only: whether the popup sidebar modal is open. Ignored on desktop (sidebar is docked
      * there). Resets to false when the user selects a folder or the modal emits its close event.
      */
@@ -193,6 +200,7 @@ export const VirApp = defineElement()({
             screenSize: ScreenSize.Desktop,
             disconnectScreenSizeObserver: undefined,
             disconnectVisualViewport: undefined,
+            disposeTheme: undefined,
             mobileSidebarOpen: false,
             paneRestartKeys: {},
         };
@@ -214,6 +222,16 @@ export const VirApp = defineElement()({
              */
             height: var(--app-viewport-height, 100dvh);
             font-family: sans-serif;
+            /*
+             * Bind the whole app surface to vira's page-default color pair. vira only paints this
+             * default on its own components, so transparent app surfaces (sidebar, tab strip) used
+             * to fall through to the browser's white — invisible in light mode, wrong in dark. The
+             * dark-claude theme (see theme.ts) sets these vars; light mode leaves them unset, so
+             * these declarations become invalid-at-computed-value (transparent background, inherited
+             * color) — i.e. exactly the original upstream :host with no background/color at all.
+             */
+            background: var(--vira-default-bg);
+            color: var(--vira-default-fg);
             /*
              * Belt-and-braces against the browser's "scroll the focused input into view"
              * behavior: if the layout ever overflows the visible viewport (e.g. during the
@@ -327,6 +345,22 @@ export const VirApp = defineElement()({
         }
     `,
     init({updateState, host}) {
+        /**
+         * Apply the user's configured color theme as soon as the config loads. Resolves async (one
+         * `/config` fetch), so there's a brief default-light window before this lands — acceptable
+         * since the app is still booting (auth / folder load) at that point. The disposer is
+         * stashed in state for `cleanup` to tear down the `auto` theme's `prefers-color-scheme`
+         * listener.
+         */
+        void getConfig()
+            .then((config) => {
+                updateState({
+                    disposeTheme: applyTheme(config.theme),
+                });
+            })
+            .catch(() => {
+                // Leave the default light theme applied if config can't be fetched.
+            });
         void refreshFolderInfo(updateState);
         const pollHandle = setInterval(() => {
             void refreshFolderInfo(updateState);
@@ -417,6 +451,7 @@ export const VirApp = defineElement()({
         state.removeRouteListener?.();
         state.disconnectScreenSizeObserver?.();
         state.disconnectVisualViewport?.();
+        state.disposeTheme?.();
     },
     render({state, updateState, host}) {
         if (state.route.paths[0] === 'book') {

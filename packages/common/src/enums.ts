@@ -27,3 +27,19 @@ export enum SidebarGrouping {
     Repo = 'repo',
     Status = 'status',
 }
+
+/**
+ * Which color theme the frontend applies. `Light` is the original, upstream look and is left
+ * completely untouched by this fork. `DarkClaude` applies a dark color theme modeled after the
+ * Claude desktop / Claude Code aesthetic (warm near-black surfaces, clay accent). `Auto` follows
+ * the OS `prefers-color-scheme`, picking `Light` or the `DarkClaude` styling accordingly.
+ *
+ * The first variant is the default (object-shape-tester's `enumShape` picks the first value when
+ * the field is absent from config), so existing configs without a `theme` field keep rendering in
+ * `Light` exactly as before.
+ */
+export enum Theme {
+    Light = 'light',
+    DarkClaude = 'dark-claude',
+    Auto = 'auto',
+}
