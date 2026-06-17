@@ -1,12 +1,13 @@
 // cspell:words titlebar
 
-import {agentStormService, PaneKind} from '@agent-storm/common';
+import {PaneKind} from '@agent-storm/common';
 import {css, defineElement, defineElementEvent, html, listen, repeat} from 'element-vir';
 import {viraThemeByKeys} from 'vira';
 import {ensureVscode, killVscode} from '../../util/api-client.js';
 import {localStorageClient, paneSplit} from '../../util/local-storage-client.js';
 import {type FrontendTab} from '../../util/router.js';
 import {ScreenSize} from '../../util/screen-size.js';
+import {getBackendBaseUrl} from '../../util/service-origin.js';
 import {VirTerminal} from './vir-terminal.element.js';
 
 function clampSplit(value: number): number {
@@ -86,6 +87,36 @@ export const VirPaneGroup = defineElement<{
             height: 100%;
         }
 
+        /*
+         * Mobile-only strip naming the active folder. Sits above the tab bar and is tall enough to
+         * fully contain vir-app's absolutely-positioned hamburger (top-left of the stage), so the
+         * tab bar below it stays clear of the hamburger and needs no left padding of its own. The
+         * symmetric horizontal padding keeps the name centered while clearing the hamburger.
+         */
+        .folder-name-bar {
+            flex-grow: 0;
+            flex-shrink: 0;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            box-sizing: border-box;
+            min-height: 44px;
+            padding: 0 44px;
+            border-bottom: 1px solid
+                ${viraThemeByKeys.grey['behind-bg'].decoration.background.value};
+        }
+
+        .folder-name-label {
+            min-width: 0;
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+            font-family: ui-sans-serif, system-ui, sans-serif;
+            font-size: 13px;
+            font-weight: 600;
+            color: ${viraThemeByKeys.grey.foreground.body.foreground.value};
+        }
+
         .tab-bar {
             display: flex;
             flex: 0 0 auto;
@@ -93,16 +124,6 @@ export const VirPaneGroup = defineElement<{
                 ${viraThemeByKeys.grey['behind-bg'].decoration.background.value};
             font-family: ui-sans-serif, system-ui, sans-serif;
             font-size: 12px;
-        }
-
-        /*
-         * On mobile, the hamburger button that opens the sidebar modal lives in the top-left of
-         * the stage (vir-app owns it). It's absolutely positioned and sits ON TOP of this tab
-         * strip, which would otherwise cover the leftmost tab. Reserve enough left padding for
-         * the button + its margin so the first tab starts to its right.
-         */
-        .tab-bar[data-mobile] {
-            padding-left: 44px;
         }
 
         .tab {
@@ -369,6 +390,8 @@ export const VirPaneGroup = defineElement<{
 
         const isCodeTab = inputs.activeTab === 'code';
         const isMobile = inputs.screenSize === ScreenSize.Mobile;
+        /** Basename of the folder path — matches how folder names are derived elsewhere. */
+        const folderName = inputs.folder.split('/').findLast(Boolean) || inputs.folder;
         /**
          * Pane visibility decision matrix:
          *
@@ -401,7 +424,7 @@ export const VirPaneGroup = defineElement<{
                 folder,
             })
                 .then(({basePath}) => {
-                    const url = `${agentStormService.serviceOrigin}${basePath}/?folder=${encodeURIComponent(folder)}`;
+                    const url = `${getBackendBaseUrl()}${basePath}/?folder=${encodeURIComponent(folder)}`;
                     updateState({
                         vscodeUrl: url,
                         vscodeLoading: false,
@@ -490,6 +513,13 @@ export const VirPaneGroup = defineElement<{
         };
 
         return html`
+            ${isMobile
+                ? html`
+                      <div class="folder-name-bar" title=${inputs.folder}>
+                          <span class="folder-name-label">${folderName}</span>
+                      </div>
+                  `
+                : ''}
             <div class="tab-bar" role="tablist" ?data-mobile=${isMobile}>
                 ${tabButtons.map(
                     ({label, tab, isActive}) => html`
@@ -565,6 +595,7 @@ export const VirPaneGroup = defineElement<{
                                                   folder: inputs.folder,
                                                   kind: PaneKind.Ai,
                                                   active: inputs.active,
+                                                  showAccessoryKeys: isMobile,
                                               })}></${VirTerminal}>
                                           `,
                                       )}
@@ -594,6 +625,7 @@ export const VirPaneGroup = defineElement<{
                                 folder: inputs.folder,
                                 kind: PaneKind.Shell,
                                 active: inputs.active,
+                                showAccessoryKeys: isMobile,
                             })}></${VirTerminal}>
                         </div>
                     </div>
