@@ -243,13 +243,14 @@ export const configJsonSchema = {
             type: 'string',
             enum: [
                 Theme.Light,
+                Theme.Dark,
                 Theme.DarkClaude,
                 Theme.Auto,
             ],
             default: Theme.Light,
             title: 'Theme',
             description:
-                'Color theme for the app. "light" is the original, unchanged look; "dark-claude" applies a dark theme modeled after the Claude desktop / Claude Code aesthetic; "auto" follows your operating system\'s light/dark setting.',
+                'Color theme for the app. "light" is the original, unchanged look; "dark" is electrovir\'s built-in dark mode; "dark-claude" applies a dark theme modeled after the Claude desktop / Claude Code aesthetic; "auto" follows your operating system\'s light/dark setting (dark system → "dark").',
         },
     },
     required: [

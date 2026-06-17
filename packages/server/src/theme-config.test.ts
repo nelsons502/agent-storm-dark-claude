@@ -41,4 +41,17 @@ describe('config theme', () => {
 
         assert.strictEquals(merged.theme, Theme.DarkClaude);
     });
+
+    it("preserves electrovir's plain dark choice over the default", () => {
+        const stored: Partial<Config> = {
+            theme: Theme.Dark,
+        };
+
+        const merged: Config = {
+            ...defaultConfig,
+            ...stored,
+        };
+
+        assert.strictEquals(merged.theme, Theme.Dark);
+    });
 });

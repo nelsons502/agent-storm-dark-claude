@@ -8,7 +8,7 @@ import {css, defineElement, html, listen, onDomCreated, unsafeCSS} from 'element
 import {createSizedIcon, lucideIcons, ViraIcon, viraThemeByKeys} from 'vira';
 import {client, getConfig, uploadFile} from '../../util/api-client.js';
 import {ensureSecret} from '../../util/auth.js';
-import {resolveIsDarkClaude, terminalThemeBackground} from '../../util/theme.js';
+import {resolveTheme, terminalThemeBackground} from '../../util/theme.js';
 import {defaultXtermStyles} from './xterm-styles.js';
 
 const uploadErrorDismissMs = 5000;
@@ -161,7 +161,7 @@ const lightTerminalTheme: ITheme = {
  * softened (not pure/neon) so output reads comfortably on the dark background.
  */
 const darkTerminalTheme: ITheme = {
-    background: terminalThemeBackground.dark,
+    background: terminalThemeBackground.darkClaude,
     /*
      * Warm off-white body text. Claude Code's bold headers render in this default foreground (bold
      * weight, not an ANSI color — xterm's ITheme has no separate bold color), so bold reads as
@@ -170,7 +170,7 @@ const darkTerminalTheme: ITheme = {
      */
     foreground: '#edece8',
     cursor: '#d97757',
-    cursorAccent: terminalThemeBackground.dark,
+    cursorAccent: terminalThemeBackground.darkClaude,
     selectionBackground: 'rgba(217, 119, 87, 0.24)',
     black: '#3a3833',
     red: '#e5704b',
@@ -197,13 +197,47 @@ const darkTerminalTheme: ITheme = {
 };
 
 /**
+ * Neutral dark xterm palette for electrovir's plain `dark` theme — a cool, standard dark terminal
+ * (grey cursor, conventional ANSI), distinct from the warm clay {@link darkTerminalTheme}.
+ */
+const darkNeutralTerminalTheme: ITheme = {
+    background: terminalThemeBackground.dark,
+    foreground: '#d4d4d4',
+    cursor: '#d4d4d4',
+    cursorAccent: terminalThemeBackground.dark,
+    selectionBackground: 'rgba(255, 255, 255, 0.18)',
+    black: '#1d1d1d',
+    red: '#f14c4c',
+    green: '#23d18b',
+    yellow: '#d7ba7d',
+    blue: '#3b8eea',
+    magenta: '#bc3fbc',
+    cyan: '#29b8db',
+    white: '#d4d4d4',
+    brightBlack: '#666666',
+    brightRed: '#f14c4c',
+    brightGreen: '#23d18b',
+    brightYellow: '#f5f543',
+    brightBlue: '#3b8eea',
+    brightMagenta: '#d670d6',
+    brightCyan: '#29b8db',
+    brightWhite: '#e5e5e5',
+};
+
+/**
  * Pick the xterm theme matching the configured app theme. `Auto` follows the OS
  * `prefers-color-scheme` at terminal-creation time (a live OS switch won't re-theme an already-open
  * terminal — it picks up the change on next reload, same as the rest of the app's reload-on-change
  * model). Undefined (older config) resolves to light, matching the schema default.
  */
 function resolveTerminalTheme(theme: Theme | undefined): ITheme {
-    return resolveIsDarkClaude(theme) ? darkTerminalTheme : lightTerminalTheme;
+    const resolved = resolveTheme(theme);
+    if (resolved === 'dark-claude') {
+        return darkTerminalTheme;
+    } else if (resolved === 'dark') {
+        return darkNeutralTerminalTheme;
+    }
+    return lightTerminalTheme;
 }
 
 /**

@@ -1,22 +1,26 @@
 import {Theme} from '@agent-storm/common';
 import {applyColorThemeViaStyleElement} from 'theme-vir';
-import {viraTheme, viraThemeDarkOverride} from 'vira';
+import {viraTheme, viraThemeByKeys, viraThemeDarkOverride} from 'vira';
 
 const prefersDarkQuery = '(prefers-color-scheme: dark)';
 
 /**
- * Whether the Claude-modeled dark styling should be active for a given config value. `DarkClaude`
- * is always dark; `Auto` follows the OS; everything else (including `Light` and an absent/legacy
- * value) is light. Shared so the favicon swap here and the terminal palette agree on "is
- * dark-claude active".
+ * The effective look a config `theme` value resolves to. `Auto` follows the OS: a dark system →
+ * electrovir's neutral `'dark'`, a light system → `'light'`. Shared so the favicon swap here and
+ * the terminal palette in `vir-terminal` agree on the active look. `Light` and an absent/legacy
+ * value both resolve to `'light'`.
  */
-export function resolveIsDarkClaude(theme: Theme | undefined): boolean {
+export type ResolvedTheme = 'light' | 'dark' | 'dark-claude';
+
+export function resolveTheme(theme: Theme | undefined): ResolvedTheme {
     if (theme === Theme.DarkClaude) {
-        return true;
+        return 'dark-claude';
+    } else if (theme === Theme.Dark) {
+        return 'dark';
     } else if (theme === Theme.Auto) {
-        return globalThis.matchMedia(prefersDarkQuery).matches;
+        return globalThis.matchMedia(prefersDarkQuery).matches ? 'dark' : 'light';
     }
-    return false;
+    return 'light';
 }
 
 /**
@@ -65,7 +69,10 @@ function setFavicons(useClaude: boolean): void {
  */
 export const terminalThemeBackground = {
     light: '#ffffff',
-    dark: '#1b1a18',
+    /** Neutral dark — electrovir's plain `dark` theme. */
+    dark: '#1d1d1d',
+    /** Warm near-black — the `dark-claude` theme. */
+    darkClaude: '#1b1a18',
 } as const;
 
 /**
@@ -79,8 +86,8 @@ const activeRowBackgroundDark = '#34332f';
 /**
  * Warm Claude-style values for vira's page-default color pair in dark mode. The chrome surface
  * (`--vira-default-bg`) is intentionally a touch lighter than the terminal background
- * ({@link terminalThemeBackground}`.dark`) so the terminal panes read as inset. `vira` itself only
- * paints this default on its own components (modals, etc.); the app root binds to it too (see
+ * ({@link terminalThemeBackground}`.darkClaude`) so the terminal panes read as inset. `vira` itself
+ * only paints this default on its own components (modals, etc.); the app root binds to it too (see
  * `vir-app`'s `:host`) so every transparent surface — sidebar, tab strip — follows the theme.
  */
 const claudeDarkDefault = {
@@ -140,6 +147,28 @@ function clearAccentRecolor(): void {
     }
 }
 
+/**
+ * Apply electrovir's upstream dark mode: vira's built-in dark override plus the neutral dark page
+ * surface. Unlike {@link applyDarkClaudeTheme}, no warm retint, clay accent, or Claude favicon —
+ * it's vira's stock dark. vira's dark override doesn't touch the page-default pair
+ * (`--vira-default-bg`/`--vira-default-fg`, which `vir-app`'s `:host` binds to), so point those at
+ * vira's dark grey surface vars — the same surface vira's own dark panels use — so the app root,
+ * sidebar, and tab strip darken too.
+ */
+function applyDarkTheme(): void {
+    const root = document.documentElement;
+    applyColorThemeViaStyleElement(viraTheme, viraThemeDarkOverride);
+    root.style.setProperty('--terminal-host-bg', terminalThemeBackground.dark);
+    root.style.setProperty(
+        '--vira-default-bg',
+        String(viraThemeByKeys.grey['behind-bg'].body.background.value),
+    );
+    root.style.setProperty(
+        '--vira-default-fg',
+        String(viraThemeByKeys.grey.foreground.body.foreground.value),
+    );
+}
+
 /** Apply the Claude-modeled dark theme: vira's dark override + the warm surface vars + clay accent. */
 function applyDarkClaudeTheme(): void {
     const root = document.documentElement;
@@ -149,7 +178,7 @@ function applyDarkClaudeTheme(): void {
      * xterm canvas paints its own (matching) background over the rest. Set on `documentElement` so
      * it crosses the shadow DOM boundary into every terminal instance.
      */
-    root.style.setProperty('--terminal-host-bg', terminalThemeBackground.dark);
+    root.style.setProperty('--terminal-host-bg', terminalThemeBackground.darkClaude);
     /**
      * Warm vira's page-default pair toward Claude's palette. `applyColorThemeViaStyleElement` sets
      * these vars via a `:root` `<style>`; an inline property on `documentElement` (which _is_
@@ -164,11 +193,13 @@ function applyDarkClaudeTheme(): void {
 }
 
 /**
- * Revert everything {@link applyDarkClaudeTheme} did, back to the original light look. Only reached
- * via {@link Theme.Auto} on a dark→light OS switch (no page reload happens in that path). A fixed
+ * Revert everything the dark appliers ({@link applyDarkTheme} / {@link applyDarkClaudeTheme}) did,
+ * back to the original light look. Removes every var either applier may have set (harmless when a
+ * given one wasn't), so it cleanly reverts whichever dark variant was active. Only reached via
+ * {@link Theme.Auto} on a dark→light OS switch (no page reload happens in that path). A fixed
  * {@link Theme.Light} selection never calls this — see {@link applyTheme}.
  */
-function clearDarkClaudeTheme(): void {
+function clearTheme(): void {
     const root = document.documentElement;
     applyColorThemeViaStyleElement(viraTheme, undefined);
     root.style.removeProperty('--terminal-host-bg');
@@ -194,9 +225,9 @@ export function applyTheme(theme: Theme | undefined): () => void {
         const media = globalThis.matchMedia(prefersDarkQuery);
         const onChange = () => {
             if (media.matches) {
-                applyDarkClaudeTheme();
+                applyDarkTheme();
             } else {
-                clearDarkClaudeTheme();
+                clearTheme();
             }
         };
         onChange();
@@ -204,7 +235,9 @@ export function applyTheme(theme: Theme | undefined): () => void {
         return () => media.removeEventListener('change', onChange);
     }
 
-    if (theme === Theme.DarkClaude) {
+    if (theme === Theme.Dark) {
+        applyDarkTheme();
+    } else if (theme === Theme.DarkClaude) {
         applyDarkClaudeTheme();
     }
     return () => {};
