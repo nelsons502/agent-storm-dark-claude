@@ -1,9 +1,12 @@
+// cspell:words Hyperlegible, upserted
+
 import {
     type FolderInfo,
     PaneKind,
     PaneStatus,
     type RepoConfig,
     SidebarGrouping,
+    SidebarSorting,
     type UpdateStatus,
 } from '@agent-storm/common';
 import {check} from '@augment-vir/assert';
@@ -15,6 +18,7 @@ import {
     createUtcFullDate,
     getNowInUtcTimezone,
     isDateAfter,
+    toTimestamp,
 } from 'date-vir';
 import {css, defineElement, defineElementEvent, html, listen} from 'element-vir';
 import {parseUrl} from 'url-vir';
@@ -46,9 +50,9 @@ import {
     getConfig,
     getFolders,
     getUpdateStatus,
+    hideRepo,
     killFolderPanes,
     putConfig,
-    resetAiSession,
     restartPane,
     touchRepo,
 } from '../../util/api-client.js';
@@ -83,9 +87,28 @@ const mobilePlusIcon = createSizedIcon(lucideIcons.Plus, mobileButtonIconSize);
 const mobileEllipsisIcon = createSizedIcon(lucideIcons.Ellipsis, mobileButtonIconSize);
 const mobileFilterIcon = createSizedIcon(lucideIcons.ListFilter, mobileButtonIconSize);
 
+/**
+ * Icons for the per-folder / repo / worktree row (⋯) menu items. Sized down from lucide's native
+ * 24px so they sit proportionally next to the menu label text.
+ */
+const menuIconSize = 16;
+const menuOpenPrIcon = createSizedIcon(lucideIcons.ExternalLink, menuIconSize);
+const menuShowAiIcon = createSizedIcon(lucideIcons.Eye, menuIconSize);
+const menuHideAiIcon = createSizedIcon(lucideIcons.EyeOff, menuIconSize);
+const menuEditCommandsIcon = createSizedIcon(lucideIcons.Terminal, menuIconSize);
+const menuKillPanesIcon = createSizedIcon(lucideIcons.PowerOff, menuIconSize);
+const menuHideRepoIcon = createSizedIcon(lucideIcons.Archive, menuIconSize);
+const menuDeleteWorktreeIcon = createSizedIcon(lucideIcons.Trash2, menuIconSize);
+const menuRemoveRepoIcon = createSizedIcon(lucideIcons.X, menuIconSize);
+
 const sidebarGroupingLabels: Record<SidebarGrouping, string> = {
     [SidebarGrouping.Repo]: 'Group by repo',
     [SidebarGrouping.Status]: 'Group by status',
+};
+
+const sidebarSortingLabels: Record<SidebarSorting, string> = {
+    [SidebarSorting.Name]: 'Sort by name',
+    [SidebarSorting.Date]: 'Sort by date',
 };
 
 const paneStatusColor: Record<PaneStatus, string> = {
@@ -134,6 +157,12 @@ type SidebarState = {
      */
     sidebarGrouping: SidebarGrouping | undefined;
     /**
+     * Mirrors `config.sidebarSorting`. Picks the comparator used for the standalone list, the
+     * worktree roots, and each root's children. `undefined` while config hasn't loaded, which sorts
+     * the same as {@link SidebarSorting.Name}.
+     */
+    sidebarSorting: SidebarSorting | undefined;
+    /**
      * Mirrors `config.onlyShowRecent`. When true the sidebar hides standalone repos that lack
      * recent activity AND have no running panes; worktree-roots and their children are always
      * shown. `undefined` while config hasn't loaded yet, which renders the same as `false`.
@@ -142,7 +171,8 @@ type SidebarState = {
     /**
      * Live text from the header search pop-up. While non-empty it temporarily overrides the
      * hide-inactive filter and shows only repos/worktrees whose names match (searching active and
-     * inactive repos alike). Cleared when the search pop-up closes.
+     * inactive repos alike). Persists after the pop-up closes — clearing the input (or its clear
+     * button) is what ends the search.
      */
     searchQuery: string;
     /**
@@ -223,6 +253,7 @@ export const VirSidebar = defineElement<{
             editFolderGlobalResetAiSessionCmd: '',
             editFolderSubmitting: false,
             sidebarGrouping: undefined,
+            sidebarSorting: undefined,
             onlyShowRecent: undefined,
             searchQuery: '',
             repos: [],
@@ -628,14 +659,13 @@ export const VirSidebar = defineElement<{
             : state.onlyShowRecent
               ? filterByRecency(state.folders, state.repos)
               : state.folders;
+        const folderComparator = folderComparators[state.sidebarSorting ?? SidebarSorting.Name];
         const standaloneFolders = visibleFolders
             .filter((folder) => !folder.isWorktreeRoot && !folder.parentRepoPath)
-            .toSorted((a, b) =>
-                a.name.localeCompare(b.name, undefined, {
-                    sensitivity: 'base',
-                }),
-            );
-        const worktreeRoots = visibleFolders.filter((folder) => folder.isWorktreeRoot);
+            .toSorted(folderComparator);
+        const worktreeRoots = visibleFolders
+            .filter((folder) => folder.isWorktreeRoot)
+            .toSorted(folderComparator);
         /**
          * Closes over `state.folders` from the latest render so the optimistic-delete handler can
          * filter against the freshest snapshot without having to ask for a re-read.
@@ -654,6 +684,33 @@ export const VirSidebar = defineElement<{
             dispatch(new events.foldersRemoved(paths));
         };
         const emitFolderActivated = (path: string) => {
+            /**
+             * Optimistically bump the owning repo's `lastInteractedAtMs` in the local repos mirror
+             * so the hide-inactive filter keeps the repo visible the instant the search query is
+             * cleared and the view reverts to the recency filter. The backend touch — fired from
+             * vir-app's `folderActivated` handler — persists this, but it's async and wouldn't land
+             * before the re-filter, so an inactive repo would otherwise vanish until the next poll.
+             * Resolve the owning repo the same way the backend does: a worktree's parent repo, else
+             * the folder itself.
+             */
+            const folder = state.folders.find((entry) => entry.path === path);
+            const owningRepoPath = folder?.parentRepoPath ?? folder?.path ?? path;
+            const now = toTimestamp(getNowInUtcTimezone());
+            updateState({
+                /**
+                 * Clear the active search once the user picks a folder — they've found what they
+                 * were looking for, so the sidebar reverts to its normal (hide-inactive) view.
+                 */
+                searchQuery: '',
+                repos: state.repos.map((repo) =>
+                    repo.path === owningRepoPath
+                        ? {
+                              ...repo,
+                              lastInteractedAtMs: now,
+                          }
+                        : repo,
+                ),
+            });
             dispatch(new events.folderActivated(path));
         };
         const emitPaneRestarted = (detail: PaneRestartedEvent) => {
@@ -727,23 +784,24 @@ export const VirSidebar = defineElement<{
                         keepOpenAfterInteraction: true,
                     })}
                         ${listen(ViraPopUpTrigger.events.openChange, (event) => {
-                            /**
-                             * Clear the query when the pop-up closes so the sidebar returns to its
-                             * normal (hide-inactive) view — the search filter is meant to be
-                             * temporary, only while the pop-up is open.
-                             */
-                            if (!event.detail) {
-                                updateState({
-                                    searchQuery: '',
-                                });
+                            if (event.detail) {
+                                focusSearchInput(host);
                             }
                         })}
                     >
                         <${ViraButton.assign({
                             icon: inputs.mobileModal ? mobileSearchIcon : searchIcon,
                             buttonSize: inputs.mobileModal ? ViraSize.Large : ViraSize.Small,
-                            buttonEmphasis: ViraEmphasis.Subtle,
-                            color: ViraColorVariant.Neutral,
+                            /**
+                             * Bump the search button to Standard emphasis while a search is active
+                             * so it stays visibly "on" after the pop-up closes — the query persists
+                             * past close, so the filter is still applied even with the pop-up
+                             * shut.
+                             */
+                            buttonEmphasis: trimmedSearchQuery
+                                ? ViraEmphasis.Standard
+                                : ViraEmphasis.Subtle,
+                            color: ViraColorVariant.Plain,
                         })}
                             slot=${ViraPopUpTrigger.slotNames['vira-pop-up-trigger-trigger']}
                             title="Search repos & worktrees"
@@ -757,6 +815,7 @@ export const VirSidebar = defineElement<{
                                 placeholder: 'Search repos & worktrees',
                                 showClearButton: true,
                             })}
+                                class="search-input"
                                 ${listen(ViraInput.events.valueChange, (event) => {
                                     updateState({
                                         searchQuery: event.detail,
@@ -800,6 +859,7 @@ export const VirSidebar = defineElement<{
                         ${renderMenuItemEntries(
                             buildFilterMenuEntries({
                                 sidebarGrouping: state.sidebarGrouping,
+                                sidebarSorting: state.sidebarSorting,
                                 onlyShowRecent: state.onlyShowRecent,
                                 updateState,
                             }),
@@ -880,18 +940,13 @@ export const VirSidebar = defineElement<{
                         onActivate: emitFolderActivated,
                         removeFolderLocally,
                         emitFoldersRemoved,
-                        emitPaneRestarted,
                         updateState,
                     }),
                 )}
                 ${worktreeRoots.map((root) => {
                     const children = visibleFolders
                         .filter((folder) => folder.parentRepoPath === root.path)
-                        .toSorted((a, b) =>
-                            a.name.localeCompare(b.name, undefined, {
-                                sensitivity: 'base',
-                            }),
-                        );
+                        .toSorted(folderComparator);
                     const repoMenuKey = `repo:${root.path}`;
                     return html`
                         <div
@@ -975,7 +1030,6 @@ export const VirSidebar = defineElement<{
                                 onActivate: emitFolderActivated,
                                 removeFolderLocally,
                                 emitFoldersRemoved,
-                                emitPaneRestarted,
                                 updateState,
                             }),
                         )}
@@ -1004,6 +1058,7 @@ export const VirSidebar = defineElement<{
                         value: state.repoPath,
                         placeholder: '~/src/project',
                         showClearButton: true,
+                        disableBrowserHelps: true,
                         disabled: state.repoSubmitting,
                     })}
                         ${listen(ViraInput.events.valueChange, (event) => {
@@ -1022,6 +1077,7 @@ export const VirSidebar = defineElement<{
                         value: state.repoAiCmd,
                         placeholder: state.repoGlobalAiCmd || 'claude',
                         showClearButton: true,
+                        disableBrowserHelps: true,
                         disabled: state.repoSubmitting,
                     })}
                         ${listen(ViraInput.events.valueChange, (event) => {
@@ -1040,6 +1096,7 @@ export const VirSidebar = defineElement<{
                         value: state.repoResetAiSessionCmd,
                         placeholder: state.repoGlobalResetAiSessionCmd || '/clear',
                         showClearButton: true,
+                        disableBrowserHelps: true,
                         disabled: state.repoSubmitting,
                     })}
                         ${listen(ViraInput.events.valueChange, (event) => {
@@ -1084,6 +1141,7 @@ export const VirSidebar = defineElement<{
                         value: state.worktreeName,
                         placeholder: 'branch-name',
                         showClearButton: true,
+                        disableBrowserHelps: true,
                         disabled: state.worktreeSubmitting,
                     })}
                         ${listen(ViraInput.events.valueChange, (event) => {
@@ -1102,6 +1160,7 @@ export const VirSidebar = defineElement<{
                         value: state.worktreeAiCmd,
                         placeholder: state.worktreeGlobalAiCmd || 'claude',
                         showClearButton: true,
+                        disableBrowserHelps: true,
                         disabled: state.worktreeSubmitting,
                     })}
                         ${listen(ViraInput.events.valueChange, (event) => {
@@ -1120,6 +1179,7 @@ export const VirSidebar = defineElement<{
                         value: state.worktreeResetAiSessionCmd,
                         placeholder: state.worktreeGlobalResetAiSessionCmd || '/clear',
                         showClearButton: true,
+                        disableBrowserHelps: true,
                         disabled: state.worktreeSubmitting,
                     })}
                         ${listen(ViraInput.events.valueChange, (event) => {
@@ -1218,6 +1278,23 @@ export const VirSidebar = defineElement<{
     },
 });
 
+/**
+ * Focuses the native input inside the header search pop-up once it opens. The pop-up content is
+ * slotted into vir-sidebar's shadow root, and `ViraInput` keeps its real `<input>` in its own
+ * shadow root, so we reach through both. Deferred a frame because the pop-up manager
+ * mounts/positions the element after `openChange` fires — focusing synchronously would target a
+ * not-yet-visible node.
+ */
+function focusSearchInput(host: HTMLElement): void {
+    requestAnimationFrame(() => {
+        const searchInput = host.shadowRoot?.querySelector('.search-input');
+        const nativeInput = searchInput?.shadowRoot?.querySelector('input');
+        if (nativeInput instanceof HTMLInputElement) {
+            nativeInput.focus();
+        }
+    });
+}
+
 function renderPaneChip(label: string, status: PaneStatus) {
     if (status === PaneStatus.None) {
         return html`
@@ -1252,7 +1329,6 @@ function renderRow({
     onActivate,
     removeFolderLocally,
     emitFoldersRemoved,
-    emitPaneRestarted,
     updateState,
 }: Readonly<{
     folder: FolderInfo;
@@ -1263,7 +1339,6 @@ function renderRow({
     onActivate: (folder: string) => void;
     removeFolderLocally: (path: string) => void;
     emitFoldersRemoved: (paths: ReadonlyArray<string>) => void;
-    emitPaneRestarted: (detail: PaneRestartedEvent) => void;
     updateState: SidebarUpdate;
 }>) {
     const nameWithMarkers = [
@@ -1331,13 +1406,12 @@ function renderRow({
                         title="Folder actions"
                     ></${ViraButton}>
                     ${renderMenuItemEntries(
-                        buildRowMenuEntries(
+                        buildRowMenuEntries({
                             folder,
                             updateState,
                             removeFolderLocally,
                             emitFoldersRemoved,
-                            emitPaneRestarted,
-                        ),
+                        }),
                     )}
                 </${ViraMenuTrigger}>
             </span>
@@ -1364,35 +1438,73 @@ function isValidPrUrl(url: string | null | undefined): boolean {
     }
 }
 
+const folderComparators: Record<SidebarSorting, (a: FolderInfo, b: FolderInfo) => number> = {
+    [SidebarSorting.Name]: (a, b) =>
+        a.name.localeCompare(b.name, undefined, {
+            sensitivity: 'base',
+        }),
+    /**
+     * Newest-created first. Folders the backend couldn't stat carry `createdAtMs: 0` and land at
+     * the end, where they fall back to the name comparator.
+     */
+    [SidebarSorting.Date]: (a, b) =>
+        b.createdAtMs - a.createdAtMs || folderComparators[SidebarSorting.Name](a, b),
+};
+
 function buildFilterMenuEntries({
     sidebarGrouping,
+    sidebarSorting,
     onlyShowRecent,
     updateState,
 }: Readonly<{
     sidebarGrouping: SidebarGrouping | undefined;
+    sidebarSorting: SidebarSorting | undefined;
     onlyShowRecent: boolean | undefined;
     updateState: SidebarUpdate;
 }>): ReadonlyArray<ViraMenuItemEntry> {
     const groupingEntries: ReadonlyArray<ViraMenuItemEntry> = [
         SidebarGrouping.Repo,
         SidebarGrouping.Status,
-    ].map((grouping) => ({
-        content: sidebarGroupingLabels[grouping],
-        /**
-         * Mark the active grouping with a check; non-active entries get no icon. `iconOverride` is
-         * the menu's per-item icon slot — leaving it undefined leaves blank space, which keeps the
-         * labels visually aligned across rows.
-         */
-        iconOverride: sidebarGrouping === grouping ? lucideIcons.Check : undefined,
-        onClick: () => {
-            if (sidebarGrouping === grouping) {
-                return;
-            }
-            void setSidebarGrouping(grouping, updateState);
-        },
-    }));
+    ].map((grouping) => {
+        return {
+            content: sidebarGroupingLabels[grouping],
+            /**
+             * Mark the active grouping with a check; non-active entries get no icon. `iconOverride`
+             * is the menu's per-item icon slot — leaving it undefined leaves blank space, which
+             * keeps the labels visually aligned across rows.
+             */
+            iconOverride: sidebarGrouping === grouping ? lucideIcons.Check : undefined,
+            onClick: () => {
+                if (sidebarGrouping === grouping) {
+                    return;
+                }
+                void setSidebarGrouping(grouping, updateState);
+            },
+        };
+    });
+    /**
+     * The two sort options are mutually exclusive: picking one writes the single
+     * `config.sidebarSorting` value, which drops the check from the other.
+     */
+    const sortingEntries: ReadonlyArray<ViraMenuItemEntry> = [
+        SidebarSorting.Name,
+        SidebarSorting.Date,
+    ].map((sorting) => {
+        return {
+            content: sidebarSortingLabels[sorting],
+            iconOverride:
+                (sidebarSorting ?? SidebarSorting.Name) === sorting ? lucideIcons.Check : undefined,
+            onClick: () => {
+                if ((sidebarSorting ?? SidebarSorting.Name) === sorting) {
+                    return;
+                }
+                void setSidebarSorting(sorting, updateState);
+            },
+        };
+    });
     return [
         ...groupingEntries,
+        ...sortingEntries,
         {
             content: 'Hide Inactive',
             /**
@@ -1407,13 +1519,17 @@ function buildFilterMenuEntries({
     ];
 }
 
-function buildRowMenuEntries(
-    folder: FolderInfo,
-    updateState: SidebarUpdate,
-    removeFolderLocally: (path: string) => void,
-    emitFoldersRemoved: (paths: ReadonlyArray<string>) => void,
-    emitPaneRestarted: (detail: PaneRestartedEvent) => void,
-): ReadonlyArray<ViraMenuItemEntry> {
+function buildRowMenuEntries({
+    folder,
+    updateState,
+    removeFolderLocally,
+    emitFoldersRemoved,
+}: Readonly<{
+    folder: FolderInfo;
+    updateState: SidebarUpdate;
+    removeFolderLocally: (path: string) => void;
+    emitFoldersRemoved: (paths: ReadonlyArray<string>) => void;
+}>): ReadonlyArray<ViraMenuItemEntry> {
     return [
         folder.prUrl &&
             isValidPrUrl(folder.prUrl) && {
@@ -1428,73 +1544,25 @@ function buildRowMenuEntries(
                         Open PR
                     </${ViraLink}>
                 `,
-                iconOverride: lucideIcons.ExternalLink,
+                iconOverride: menuOpenPrIcon,
             },
         {
             content: folder.aiHidden ? 'Show AI pane' : 'Hide AI pane',
-            iconOverride: folder.aiHidden ? lucideIcons.Eye : lucideIcons.EyeOff,
+            iconOverride: folder.aiHidden ? menuShowAiIcon : menuHideAiIcon,
             onClick: () => {
                 void toggleAiHidden(folder.path, updateState);
             },
         },
         {
-            content: 'Restart AI',
-            iconOverride: lucideIcons.RotateCw,
-            onClick: () => {
-                void (async () => {
-                    try {
-                        await restartPane({
-                            folder: folder.path,
-                            kind: PaneKind.Ai,
-                        });
-                        emitPaneRestarted({
-                            folder: folder.path,
-                            kind: PaneKind.Ai,
-                        });
-                    } catch (error: unknown) {
-                        showError(updateState, error);
-                    }
-                })();
-            },
-        },
-        /**
-         * Surface the "Restart AI session" item only when a command is actually configured (per-
-         * folder override → global default — backend has already resolved that and put the result
-         * into `folder.resetAiSessionCmd`). Acts exactly like "Restart AI" — kills the AI pty and
-         * spawns a fresh one — but launches the reset-session command instead of the folder's
-         * normal `aiCmd`. Emits `paneRestarted` the same way so the mounted terminal reconnects.
-         */
-        folder.resetAiSessionCmd
-            ? {
-                  content: 'Restart AI session',
-                  iconOverride: lucideIcons.RefreshCcw,
-                  onClick: () => {
-                      void (async () => {
-                          try {
-                              await resetAiSession({
-                                  folder: folder.path,
-                              });
-                              emitPaneRestarted({
-                                  folder: folder.path,
-                                  kind: PaneKind.Ai,
-                              });
-                          } catch (error: unknown) {
-                              showError(updateState, error);
-                          }
-                      })();
-                  },
-              }
-            : undefined,
-        {
             content: 'Edit folder commands',
-            iconOverride: lucideIcons.Terminal,
+            iconOverride: menuEditCommandsIcon,
             onClick: () => {
                 void openEditFolderModal(folder, updateState);
             },
         },
         {
             content: 'Kill folder panes',
-            iconOverride: lucideIcons.PowerOff,
+            iconOverride: menuKillPanesIcon,
             onClick: () => {
                 void (async () => {
                     try {
@@ -1519,22 +1587,55 @@ function buildRowMenuEntries(
                 })();
             },
         },
+        /**
+         * Standalone repos only (worktree children carry a `parentRepoPath`). Clears the repo's
+         * `lastInteractedAtMs`, which the recency filter treats as hidden — the repo drops out of
+         * the default sidebar list but still surfaces in search and the unfiltered view. Also kills
+         * the folder's panes (same as "Kill folder panes") so hiding a repo tears down its running
+         * PTYs and drops it from `openedFolders`/route via `foldersRemoved`, rather than leaving a
+         * hidden-but-running session behind. Refresh the config mirror afterward so the filter
+         * (which reads `state.repos`) reflects the cleared timestamp without waiting for the next
+         * poll.
+         */
+        !folder.parentRepoPath && {
+            content: 'Hide repo',
+            iconOverride: menuHideRepoIcon,
+            onClick: () => {
+                void (async () => {
+                    try {
+                        await hideRepo({
+                            folder: folder.path,
+                        });
+                        await killFolderPanes({
+                            folder: folder.path,
+                        });
+                        emitFoldersRemoved([folder.path]);
+                        const refreshedConfig = await getConfig();
+                        updateState({
+                            repos: refreshedConfig.repos,
+                        });
+                    } catch (error: unknown) {
+                        showError(updateState, error);
+                    }
+                })();
+            },
+        },
         folder.parentRepoPath
             ? {
                   content: 'Delete worktree',
-                  iconOverride: lucideIcons.Trash2,
+                  iconOverride: menuDeleteWorktreeIcon,
                   onClick: () => {
-                      void confirmDeleteWorktree(
-                          folder.path,
+                      void confirmDeleteWorktree({
+                          worktreePath: folder.path,
                           updateState,
                           removeFolderLocally,
-                          () => emitFoldersRemoved([folder.path]),
-                      );
+                          notifyRemoved: () => emitFoldersRemoved([folder.path]),
+                      });
                   },
               }
             : {
                   content: 'Remove repo',
-                  iconOverride: lucideIcons.X,
+                  iconOverride: menuRemoveRepoIcon,
                   onClick: () => {
                       void confirmRemoveRepo(folder.path, updateState, () =>
                           emitFoldersRemoved([folder.path]),
@@ -1577,6 +1678,7 @@ async function refresh(updateState: SidebarUpdate): Promise<void> {
                 : folders,
             loadError: undefined,
             sidebarGrouping: config.sidebarGrouping,
+            sidebarSorting: config.sidebarSorting,
             onlyShowRecent: config.onlyShowRecent,
             repos: config.repos,
             updateStatus,
@@ -1600,6 +1702,24 @@ async function setSidebarGrouping(
         });
         updateState({
             sidebarGrouping: grouping,
+        });
+    } catch (error: unknown) {
+        showError(updateState, error);
+    }
+}
+
+async function setSidebarSorting(
+    sorting: SidebarSorting,
+    updateState: SidebarUpdate,
+): Promise<void> {
+    try {
+        const config = await getConfig();
+        await putConfig({
+            ...config,
+            sidebarSorting: sorting,
+        });
+        updateState({
+            sidebarSorting: sorting,
         });
     } catch (error: unknown) {
         showError(updateState, error);
@@ -1703,8 +1823,9 @@ function filterBySearch(folders: ReadonlyArray<FolderInfo>, query: string): Fold
             );
         } else if (folder.parentRepoPath) {
             return nameMatches(folder) || matchingRootPaths.has(folder.parentRepoPath);
+        } else {
+            return nameMatches(folder);
         }
-        return nameMatches(folder);
     });
 }
 
@@ -1975,7 +2096,14 @@ async function confirmRemoveRepo(
     updateState: SidebarUpdate,
     notifyRemoved: () => void,
 ): Promise<void> {
-    if (!window.confirm(`Remove repo ${repoPath}?`)) {
+    if (
+        !window.confirm(
+            [
+                `Remove repo ${repoPath}?`,
+                'This only removes it from agent-storm; the repo stays on disk.',
+            ].join('\n\n'),
+        )
+    ) {
         return;
     }
     /**
@@ -2069,12 +2197,17 @@ async function submitAddWorktree({
     }
 }
 
-async function confirmDeleteWorktree(
-    worktreePath: string,
-    updateState: SidebarUpdate,
-    removeFolderLocally: (path: string) => void,
-    notifyRemoved: () => void,
-): Promise<void> {
+async function confirmDeleteWorktree({
+    worktreePath,
+    updateState,
+    removeFolderLocally,
+    notifyRemoved,
+}: Readonly<{
+    worktreePath: string;
+    updateState: SidebarUpdate;
+    removeFolderLocally: (path: string) => void;
+    notifyRemoved: () => void;
+}>): Promise<void> {
     if (!window.confirm(`Delete worktree ${worktreePath}?`)) {
         return;
     }

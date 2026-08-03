@@ -1,7 +1,21 @@
+// cspell:words numstat, unstages
+
 import {defineApi, defineEndpoint, defineWebSocket, HttpMethod, HttpStatus} from '@rest-vir/api';
 import {defineShape, enumShape, nullableShape, unionShape} from 'object-shape-tester';
 import {mapSchemaToShape, type JSONSchema, type SchemaShapeToType} from 'schema-vir';
-import {PaneKind, PaneStatus, SidebarGrouping, Theme} from './enums.js';
+import {
+    GitDiffSide,
+    GitFileChange,
+    GitHubCheckState,
+    GitHubPrState,
+    GitHubReaction,
+    GitHubReviewState,
+    PaneKind,
+    PaneStatus,
+    SidebarGrouping,
+    SidebarSorting,
+    Theme,
+} from './enums.js';
 
 const stringMessageShape = defineShape('');
 
@@ -205,6 +219,17 @@ export const configJsonSchema = {
             description:
                 'How the sidebar arranges folders. "repo" keeps the existing layout (worktrees nested under their repo root); "status" regroups folders by their AI pane status. Selectable from the filter icon next to the Add button in the sidebar as well.',
         },
+        sidebarSorting: {
+            type: 'string',
+            enum: [
+                SidebarSorting.Name,
+                SidebarSorting.Date,
+            ],
+            default: SidebarSorting.Name,
+            title: 'Sidebar sorting',
+            description:
+                'How the sidebar orders folders. "name" sorts alphabetically; "date" puts the most recently created repos and worktrees first. Selectable from the filter icon next to the Add button in the sidebar as well.',
+        },
         /**
          * When on, the sidebar hides standalone repos that haven't been activated within the last 7
          * days (and have no running panes). Worktree-roots and their children are always shown
@@ -274,6 +299,12 @@ export const folderInfoShape = defineShape({
     path: '',
     name: '',
     parentRepoPath: nullableShape(''),
+    /**
+     * Filesystem creation time of the folder in milliseconds since epoch, used by the sidebar's
+     * "Sort by date" option. `0` when the backend couldn't stat the folder, which sorts the folder
+     * last.
+     */
+    createdAtMs: 0,
     isWorktreeRoot: false,
     aiHidden: false,
     aiCmd: '',
@@ -305,9 +336,65 @@ const folderActionRequestShape = defineShape({
     folder: '',
 });
 
+/**
+ * One session tab within a folder's pane. `id` is opaque and is the third segment of the daemon's
+ * pane key; the display label is `name || String(index + 1)`, so an unnamed session shows its
+ * 1-based position. Order within the owning array is the tab order and therefore defines the
+ * index.
+ */
+export const sessionMetaShape = defineShape({
+    id: '',
+    name: '',
+});
+
+/**
+ * Full session list for one folder, both kinds at once. Every session mutation returns this so the
+ * frontend replaces its list wholesale instead of patching and risking drift from the server's
+ * ordering.
+ */
+const sessionsResponseShape = defineShape({
+    ai: [sessionMetaShape],
+    shell: [sessionMetaShape],
+});
+
+const sessionListRequestShape = defineShape({
+    folder: '',
+});
+
+const sessionCreateRequestShape = defineShape({
+    folder: '',
+    kind: enumShape(PaneKind),
+});
+
+const sessionRenameRequestShape = defineShape({
+    folder: '',
+    kind: enumShape(PaneKind),
+    sessionId: '',
+    /** Empty clears the custom name, reverting the tab's label to its 1-based index. */
+    name: '',
+});
+
+const sessionCloseRequestShape = defineShape({
+    folder: '',
+    kind: enumShape(PaneKind),
+    sessionId: '',
+});
+
+/**
+ * `sessionId` is optional so a browser left open across an upgrade (a phone on the LAN page, say)
+ * keeps working: an omitted value resolves to the folder's first session, which is exactly the
+ * single-pane behavior that client was built against.
+ */
 const paneActionRequestShape = defineShape({
     folder: '',
     kind: enumShape(PaneKind),
+    sessionId: nullableShape(''),
+});
+
+/** See {@link paneActionRequestShape} for why `sessionId` is optional. */
+const paneSessionFolderRequestShape = defineShape({
+    folder: '',
+    sessionId: nullableShape(''),
 });
 
 const createWorktreeRequestShape = defineShape({
@@ -375,6 +462,324 @@ const repoTouchRequestShape = defineShape({
      */
     folder: '',
 });
+
+/**
+ * One changed file in the Diff pane's file list. `insertions` / `deletions` come from `git diff
+ * --numstat` and are both `0` for untracked files (git has nothing to compare against) and for
+ * binary files.
+ */
+const gitDiffFileShape = defineShape({
+    /** Repo-relative path, always the current (post-rename) path. */
+    path: '',
+    change: enumShape(GitFileChange),
+    /** Previous path, only set when `change` is {@link GitFileChange.Renamed}. */
+    oldPath: nullableShape(''),
+    insertions: 0,
+    deletions: 0,
+});
+
+/**
+ * The two halves of `git status`, kept separate rather than merged. A partially-staged file is in
+ * both lists at once, with different content on each side.
+ */
+const gitDiffStatusResponseShape = defineShape({
+    staged: [gitDiffFileShape],
+    unstaged: [gitDiffFileShape],
+});
+
+const gitDiffFileRequestShape = defineShape({
+    folder: '',
+    /** Repo-relative path, exactly as it came back from {@link gitDiffStatusEndpoint}. */
+    path: '',
+    /**
+     * The file's pre-rename path, when it has one. Without it a renamed file has no `HEAD:<path>`
+     * to read and would render as an all-new file instead of a diff.
+     */
+    oldPath: nullableShape(''),
+    side: enumShape(GitDiffSide),
+});
+
+/** Both sides of one file's diff as plain text, for the requested {@link GitDiffSide}. */
+const gitDiffFileResponseShape = defineShape({
+    /** Contents at `HEAD` (staged side) or in the index (unstaged side). */
+    oldContent: '',
+    /** Contents in the index (staged side) or the working tree (unstaged side). */
+    newContent: '',
+    /**
+     * True when either side is binary or past {@link maxDiffFileBytes}. Both content fields are
+     * empty in that case and the pane shows a placeholder instead of a diff.
+     */
+    tooLargeOrBinary: false,
+});
+
+const gitFileRequestShape = defineShape({
+    folder: '',
+    path: '',
+});
+
+const gitStageFileRequestShape = defineShape({
+    folder: '',
+    path: '',
+    /**
+     * Which direction to move the whole file. `Unstaged` means "this file is currently on the
+     * unstaged side", so the operation stages it; `Staged` unstages it.
+     */
+    side: enumShape(GitDiffSide),
+});
+
+/**
+ * One contiguous change to move across the index, addressed by the line ranges the client is
+ * already displaying. Ranges are 0-based and half-open, into the `oldContent` / `newContent` the
+ * client got from {@link gitDiffFileEndpoint} for this same `side`. The server rebuilds those two
+ * documents and turns the ranges into a real patch, so a stale range fails the `git apply` instead
+ * of silently staging the wrong lines.
+ */
+const gitStageHunkRequestShape = defineShape({
+    folder: '',
+    path: '',
+    oldPath: nullableShape(''),
+    side: enumShape(GitDiffSide),
+    fromOldLine: 0,
+    toOldLine: 0,
+    fromNewLine: 0,
+    toNewLine: 0,
+});
+
+/**
+ * One reaction bucket on a comment. `count` is everyone's reactions of that kind;
+ * `viewerHasReacted` is what makes the button a toggle rather than a duplicate-add.
+ */
+const gitHubReactionGroupShape = defineShape({
+    reaction: enumShape(GitHubReaction),
+    count: 0,
+    viewerHasReacted: false,
+});
+
+/**
+ * A single comment, in either a review thread or the PR's main conversation. `id` is the GraphQL
+ * node id, which is what the reaction and reply mutations address. `body` is raw markdown — the
+ * pane renders it as preformatted text rather than pulling in a markdown renderer or injecting
+ * GitHub's `bodyHTML` into the page.
+ */
+const gitHubCommentShape = defineShape({
+    id: '',
+    author: '',
+    authorAvatarUrl: '',
+    body: '',
+    /**
+     * GitHub's own rendering of `body`, which is what github.com displays. Rendering markdown from
+     * this rather than parsing `body` in the browser keeps code fences, task lists, issue
+     * references, and `@mentions` looking exactly like they do on GitHub, at the cost of the
+     * frontend having to scrub the HTML before it goes into the DOM.
+     */
+    bodyHtml: '',
+    /** UTC ISO 8601, straight from GitHub. */
+    createdAt: '',
+    url: '',
+    reactions: [gitHubReactionGroupShape],
+});
+
+/**
+ * One inline review conversation, anchored to a file and line. `line` is null once the thread goes
+ * outdated (GitHub can no longer map it onto the current diff), which is also when `isOutdated`
+ * flips.
+ */
+const gitHubReviewThreadShape = defineShape({
+    id: '',
+    path: '',
+    line: nullableShape(0),
+    isResolved: false,
+    isOutdated: false,
+    /** False for threads the token's account isn't allowed to (un)resolve — the button disables. */
+    viewerCanResolve: false,
+    /** The diff excerpt GitHub anchors the thread to, as a unified patch fragment. */
+    diffHunk: '',
+    comments: [gitHubCommentShape],
+});
+
+/** One reviewer's latest verdict. Body is empty for a bare approval with no written summary. */
+const gitHubReviewShape = defineShape({
+    id: '',
+    author: '',
+    authorAvatarUrl: '',
+    state: enumShape(GitHubReviewState),
+    body: '',
+    /** See {@link gitHubCommentShape}'s `bodyHtml`. */
+    bodyHtml: '',
+    createdAt: '',
+    url: '',
+});
+
+/**
+ * Someone asked to review who hasn't submitted one yet. A team request carries the team's name;
+ * GitHub gives no way to tell it apart from a user by name alone, and the pane doesn't need to.
+ */
+const gitHubReviewRequestShape = defineShape({
+    reviewer: '',
+    reviewerAvatarUrl: '',
+});
+
+/**
+ * A single CI entry on the PR's head commit — one GitHub Actions job, or one third-party commit
+ * status. `workflow` is the owning workflow's name for an Actions job and empty for a status;
+ * together with `name` it reproduces github.com's "Workflow / job" label.
+ */
+const gitHubCheckShape = defineShape({
+    name: '',
+    workflow: '',
+    state: enumShape(GitHubCheckState),
+    /** Link to the run's logs. Empty when GitHub didn't supply one. */
+    url: '',
+    /** The status's one-line summary. Actions jobs don't have one. */
+    description: '',
+});
+
+const gitHubPrShape = defineShape({
+    /** GraphQL node id of the PR itself — the subject a new conversation comment attaches to. */
+    id: '',
+    number: 0,
+    url: '',
+    title: '',
+    /** GitHub's rendering of `title`, so inline code spans in a title survive. */
+    titleHtml: '',
+    /** The PR description. Empty when the author left it blank. */
+    body: '',
+    bodyHtml: '',
+    state: enumShape(GitHubPrState),
+    author: '',
+    authorAvatarUrl: '',
+    baseRefName: '',
+    headRefName: '',
+    createdAt: '',
+    /** Rollup verdict across every entry in `checkRuns`. */
+    checks: enumShape(GitHubCheckState),
+    checkRuns: [gitHubCheckShape],
+    reviews: [gitHubReviewShape],
+    /** Outstanding review requests, including re-requests from someone who already reviewed. */
+    reviewRequests: [gitHubReviewRequestShape],
+    threads: [gitHubReviewThreadShape],
+    /** Top-level conversation comments, oldest first. Review summaries are in `reviews`. */
+    comments: [gitHubCommentShape],
+});
+
+/**
+ * Null `pr` means "no GitHub tab for this folder": no PR on the branch, no github.com `origin`, or
+ * `gh` isn't installed / authenticated. Callers can't tell those apart, and don't need to — all
+ * four mean the same thing to the UI.
+ */
+const gitHubPrResponseShape = defineShape({
+    pr: nullableShape(gitHubPrShape),
+});
+
+const gitHubPrRequestShape = defineShape({
+    folder: '',
+    /**
+     * True skips the server's per-folder cache and queries GitHub. Used by the refresh button and
+     * after posting anything, where the point is to see what actually landed.
+     */
+    forceRefresh: false,
+});
+
+export const gitDiffStatusEndpoint = defineEndpoint({
+    path: '/git/diff/status',
+    requests: {
+        [HttpMethod.Post]: {
+            requestData: folderActionRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: gitDiffStatusResponseShape,
+                },
+            },
+        },
+    },
+});
+
+export const gitDiffFileEndpoint = defineEndpoint({
+    path: '/git/diff/file',
+    requests: {
+        [HttpMethod.Post]: {
+            requestData: gitDiffFileRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: gitDiffFileResponseShape,
+                },
+            },
+        },
+    },
+});
+
+export const gitStageFileEndpoint = defineEndpoint({
+    path: '/git/stage/file',
+    requests: {
+        [HttpMethod.Post]: {
+            requestData: gitStageFileRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: okResponseShape,
+                },
+            },
+        },
+    },
+});
+
+/**
+ * Throws away every change to one file, on both sides of the index at once: the index entry goes
+ * back to `HEAD` and the working tree copy follows. An untracked file is deleted, since it has no
+ * `HEAD` state to return to. Irreversible, so the frontend confirms before calling it.
+ */
+export const gitDiscardFileEndpoint = defineEndpoint({
+    path: '/git/discard/file',
+    requests: {
+        [HttpMethod.Post]: {
+            requestData: gitFileRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: okResponseShape,
+                },
+            },
+        },
+    },
+});
+
+export const gitStageHunkEndpoint = defineEndpoint({
+    path: '/git/stage/hunk',
+    requests: {
+        [HttpMethod.Post]: {
+            requestData: gitStageHunkRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: okResponseShape,
+                },
+            },
+        },
+    },
+});
+
+/**
+ * Everything the GitHub pane shows, in one call: the PR itself, each reviewer's verdict, every
+ * inline review thread, and the main conversation. One round trip because it's one GraphQL query —
+ * splitting it per section would multiply the rate-limit cost for no benefit.
+ */
+export const gitHubPrEndpoint = defineEndpoint({
+    path: '/github/pr',
+    requests: {
+        [HttpMethod.Post]: {
+            requestData: gitHubPrRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: gitHubPrResponseShape,
+                },
+            },
+        },
+    },
+});
+
+/**
+ * Files above this size skip content loading entirely. A multi-megabyte file would be diffed
+ * character-by-character in the browser, which is exactly the mobile stall the Diff pane exists to
+ * avoid.
+ */
+export const maxDiffFileBytes = 2 * 1024 * 1024;
 
 export const configEndpoint = defineEndpoint({
     path: '/config',
@@ -485,11 +890,72 @@ export const killPanesEndpoint = defineEndpoint({
  * resolved command is non-empty. Returns a no-op 200 when no command is configured so a stale
  * frontend doesn't surface errors after the user clears the setting.
  */
+export const sessionListEndpoint = defineEndpoint({
+    path: '/sessions/list',
+    requests: {
+        [HttpMethod.Post]: {
+            requestData: sessionListRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: sessionsResponseShape,
+                },
+            },
+        },
+    },
+});
+
+/**
+ * Appends a new session to the end of the folder+kind list. The PTY is not spawned here — it spawns
+ * lazily on the first `/pty` attach, matching how the original single session per pane behaves.
+ */
+export const sessionCreateEndpoint = defineEndpoint({
+    path: '/sessions/create',
+    requests: {
+        [HttpMethod.Post]: {
+            requestData: sessionCreateRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: sessionsResponseShape,
+                },
+            },
+        },
+    },
+});
+
+export const sessionRenameEndpoint = defineEndpoint({
+    path: '/sessions/rename',
+    requests: {
+        [HttpMethod.Post]: {
+            requestData: sessionRenameRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: sessionsResponseShape,
+                },
+            },
+        },
+    },
+});
+
+/** Drops the session from the store and kills its PTY. Closing the last session is a no-op. */
+export const sessionCloseEndpoint = defineEndpoint({
+    path: '/sessions/close',
+    requests: {
+        [HttpMethod.Post]: {
+            requestData: sessionCloseRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: sessionsResponseShape,
+                },
+            },
+        },
+    },
+});
+
 export const resetAiSessionEndpoint = defineEndpoint({
     path: '/panes/reset-ai-session',
     requests: {
         [HttpMethod.Post]: {
-            requestData: folderActionRequestShape,
+            requestData: paneSessionFolderRequestShape,
             responses: {
                 [HttpStatus.Ok]: {
                     responseData: okResponseShape,
@@ -516,6 +982,26 @@ export const touchRepoEndpoint = defineEndpoint({
     path: '/repos/touch',
     requests: {
         [HttpMethod.Post]: {
+            requestData: repoTouchRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: okResponseShape,
+                },
+            },
+        },
+    },
+});
+
+export const hideRepoEndpoint = defineEndpoint({
+    path: '/repos/hide',
+    requests: {
+        [HttpMethod.Post]: {
+            /**
+             * Reuses {@link repoTouchRequestShape} — same `{folder}` payload and same owning-repo
+             * resolution. Clears the repo's `lastInteractedAtMs` (the inverse of touch), which the
+             * sidebar treats as "hidden": dropped from the recency-filtered list while still
+             * showing in search and the unfiltered view.
+             */
             requestData: repoTouchRequestShape,
             responses: {
                 [HttpStatus.Ok]: {
@@ -575,6 +1061,20 @@ export const ptyWebSocket = defineWebSocket({
     searchParams: {
         folder: defineShape(''),
         kind: enumShape(PaneKind),
+        /**
+         * Which session tab within this folder+kind to attach to. Empty resolves to the folder's
+         * first session, so a client predating multi-session (or one whose session list hasn't
+         * loaded yet) lands on the same PTY it always did.
+         */
+        sessionId: defineShape(''),
+        /**
+         * Max scrollback lines this client wants replayed on attach, as a decimal string (search
+         * params are strings). The backend truncates the pane's buffered scrollback to the last N
+         * lines before sending it, so a client that keeps a small xterm buffer doesn't pay to
+         * transfer and process history it will immediately discard. Empty or invalid means "no
+         * client limit" and the full buffered scrollback is replayed.
+         */
+        scrollbackLimit: defineShape(''),
     },
 });
 
@@ -588,12 +1088,23 @@ export const agentStormService = defineApi({
         deleteWorktreeEndpoint,
         restartPaneEndpoint,
         killPanesEndpoint,
+        sessionListEndpoint,
+        sessionCreateEndpoint,
+        sessionRenameEndpoint,
+        sessionCloseEndpoint,
         resetAiSessionEndpoint,
         restartDaemonEndpoint,
         touchRepoEndpoint,
+        hideRepoEndpoint,
         checkPathEndpoint,
         createPathEndpoint,
         uploadEndpoint,
+        gitDiffStatusEndpoint,
+        gitDiffFileEndpoint,
+        gitStageFileEndpoint,
+        gitStageHunkEndpoint,
+        gitDiscardFileEndpoint,
+        gitHubPrEndpoint,
     ],
     webSockets: [ptyWebSocket],
 });
@@ -608,3 +1119,15 @@ export type Config = SchemaShapeToType<typeof configJsonSchema, NonNullable<unkn
 export type RepoConfig = Config['repos'][number];
 export type FolderInfo = typeof folderInfoShape.runtimeType;
 export type UpdateStatus = typeof updateStatusResponseShape.runtimeType;
+export type SessionMeta = typeof sessionMetaShape.runtimeType;
+export type FolderSessions = typeof sessionsResponseShape.runtimeType;
+export type GitDiffFile = typeof gitDiffFileShape.runtimeType;
+export type GitDiffFileContents = typeof gitDiffFileResponseShape.runtimeType;
+export type GitDiffStatus = typeof gitDiffStatusResponseShape.runtimeType;
+export type GitHubPr = typeof gitHubPrShape.runtimeType;
+export type GitHubComment = typeof gitHubCommentShape.runtimeType;
+export type GitHubReviewThread = typeof gitHubReviewThreadShape.runtimeType;
+export type GitHubReview = typeof gitHubReviewShape.runtimeType;
+export type GitHubReviewRequest = typeof gitHubReviewRequestShape.runtimeType;
+export type GitHubCheck = typeof gitHubCheckShape.runtimeType;
+export type GitHubReactionGroup = typeof gitHubReactionGroupShape.runtimeType;

@@ -15,9 +15,6 @@ import {
     type SimpleResponse,
     type StatusEntry,
     type StatusResponse,
-    type VscodeEnsureResponse,
-    type VscodeListEntry,
-    type VscodeListResponse,
 } from './protocol.js';
 
 function connect(): Promise<Socket> {
@@ -62,10 +59,24 @@ export async function fetchPaneStatuses(): Promise<StatusEntry[]> {
     return response.panes;
 }
 
+/**
+ * Read the running daemon's wire-contract version. Probes with `Status` because that is the only
+ * introspection action every historical daemon understands — a version-1 daemon treats any
+ * unrecognized action as "shutdown" and would kill every pane before we learned anything. A daemon
+ * that answers without the field is version 1.
+ */
+export async function fetchDaemonProtocolVersion(): Promise<number> {
+    const response = await singleShot<StatusResponse>({
+        action: DaemonAction.Status,
+    });
+    return response.protocolVersion ?? 1;
+}
+
 export async function restartPane(
     params: Readonly<{
         folder: string;
         kind: PaneKind;
+        sessionId?: string | undefined;
         aiCmd?: string | undefined;
     }>,
 ): Promise<void> {
@@ -73,7 +84,23 @@ export async function restartPane(
         action: DaemonAction.Restart,
         folder: params.folder,
         kind: params.kind,
+        sessionId: params.sessionId,
         aiCmd: params.aiCmd,
+    });
+}
+
+export async function killPaneSession(
+    params: Readonly<{
+        folder: string;
+        kind: PaneKind;
+        sessionId: string;
+    }>,
+): Promise<void> {
+    await singleShot<SimpleResponse>({
+        action: DaemonAction.SessionKill,
+        folder: params.folder,
+        kind: params.kind,
+        sessionId: params.sessionId,
     });
 }
 
@@ -90,31 +117,6 @@ export async function shutdownDaemon(): Promise<void> {
     });
 }
 
-export async function ensureVscode(
-    params: Readonly<{folder: string; basePath: string}>,
-): Promise<number> {
-    const response = await singleShot<VscodeEnsureResponse>({
-        action: DaemonAction.VscodeEnsure,
-        folder: params.folder,
-        basePath: params.basePath,
-    });
-    return response.port;
-}
-
-export async function killVscode(params: Readonly<{folder: string}>): Promise<void> {
-    await singleShot<SimpleResponse>({
-        action: DaemonAction.VscodeKill,
-        folder: params.folder,
-    });
-}
-
-export async function listVscode(): Promise<VscodeListEntry[]> {
-    const response = await singleShot<VscodeListResponse>({
-        action: DaemonAction.VscodeList,
-    });
-    return response.instances;
-}
-
 export type PaneAttachment = {
     isNew: boolean;
     write(data: string): void;
@@ -125,18 +127,28 @@ export type PaneAttachment = {
 export async function attachPane({
     folder,
     kind,
+    sessionId,
     aiCmd,
+    scrollbackLimit,
     onData,
     onExit,
 }: Readonly<{
     folder: string;
     kind: PaneKind;
+    /** Which session tab to attach to. Empty/omitted resolves to the folder+kind's default. */
+    sessionId?: string | undefined;
     /**
      * Current `aiCmd` from agent-storm config — forwarded to the daemon's attach handshake so a
      * fresh AI PTY honors the user's configured command rather than whatever was in env when the
      * daemon started.
      */
     aiCmd?: string | undefined;
+    /**
+     * Client-requested cap on replayed scrollback lines, forwarded to the daemon's attach
+     * handshake. The daemon truncates the buffered scrollback to the last N lines before replaying
+     * it.
+     */
+    scrollbackLimit?: number | undefined;
     onData: (data: string) => void;
     onExit: (exitCode: number | undefined) => void;
 }>): Promise<PaneAttachment> {
@@ -148,7 +160,9 @@ export async function attachPane({
             action: DaemonAction.Attach,
             folder,
             kind,
+            sessionId,
             aiCmd,
+            scrollbackLimit,
         }),
     );
 

@@ -1,3 +1,5 @@
+// cspell:words Favicons, retint
+
 import {Theme} from '@agent-storm/common';
 import {applyColorThemeViaStyleElement} from 'theme-vir';
 import {viraTheme, viraThemeByKeys, viraThemeDarkOverride} from 'vira';
@@ -25,8 +27,9 @@ export function resolveTheme(theme: Theme | undefined): ResolvedTheme {
         return 'dark';
     } else if (theme === Theme.Auto) {
         return globalThis.matchMedia(prefersDarkQuery).matches ? 'dark' : 'light';
+    } else {
+        return 'light';
     }
-    return 'light';
 }
 
 /**

@@ -1,15 +1,17 @@
 export function shouldSurfaceAttention({
     sameFolder,
+    sameSession,
     aiPaneVisible,
     pageVisible,
     pageFocused,
 }: Readonly<{
     sameFolder: boolean;
+    sameSession: boolean;
     aiPaneVisible: boolean;
     pageVisible: boolean;
     pageFocused: boolean;
 }>): boolean {
-    return !(sameFolder && aiPaneVisible && pageVisible && pageFocused);
+    return !(sameFolder && sameSession && aiPaneVisible && pageVisible && pageFocused);
 }
 import {type PaneKind} from '@agent-storm/common';
 import {type FrontendTab} from './router.js';
@@ -17,29 +19,38 @@ import {type FrontendTab} from './router.js';
 export const defaultTabOrder: ReadonlyArray<FrontendTab> = [
     'ai',
     'shell',
-    'code',
+    'diff',
+    'github',
 ];
 
 export function sanitizeTabOrder(value: unknown): ReadonlyArray<FrontendTab> {
     if (!Array.isArray(value)) {
         return defaultTabOrder;
     }
-    const tabs = value.filter(
+    const validTabs = value.filter(
         (entry): entry is FrontendTab =>
             typeof entry === 'string' && (defaultTabOrder as ReadonlyArray<string>).includes(entry),
     );
-    if (tabs.length !== defaultTabOrder.length || new Set(tabs).size !== tabs.length) {
+    if (new Set(validTabs).size !== validTabs.length) {
         return defaultTabOrder;
     }
-    return tabs;
+    return [
+        ...validTabs,
+        ...defaultTabOrder.filter((tab) => !validTabs.includes(tab)),
+    ];
 }
 
-export function moveTabGroup(
-    order: ReadonlyArray<FrontendTab>,
-    draggedTabs: ReadonlyArray<FrontendTab>,
-    targetTabs: ReadonlyArray<FrontendTab>,
-    position: 'before' | 'after',
-): ReadonlyArray<FrontendTab> {
+export function moveTabGroup({
+    order,
+    draggedTabs,
+    targetTabs,
+    position,
+}: Readonly<{
+    order: ReadonlyArray<FrontendTab>;
+    draggedTabs: ReadonlyArray<FrontendTab>;
+    targetTabs: ReadonlyArray<FrontendTab>;
+    position: 'before' | 'after';
+}>): ReadonlyArray<FrontendTab> {
     const dragged = new Set(draggedTabs);
     const targets = new Set(targetTabs);
     if ([...dragged].some((tab) => targets.has(tab))) {
@@ -65,4 +76,5 @@ export function moveTabGroup(
 export type PaneAttentionRequest = Readonly<{
     folder: string;
     kind: PaneKind;
+    sessionId: string;
 }>;

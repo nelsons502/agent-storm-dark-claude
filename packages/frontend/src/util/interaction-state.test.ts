@@ -8,31 +8,43 @@ describe(shouldSurfaceAttention.name, () => {
             [
                 {
                     sameFolder: true,
+                    sameSession: true,
                     aiPaneVisible: true,
                     pageVisible: true,
                     pageFocused: true,
                 },
                 {
                     sameFolder: false,
+                    sameSession: true,
                     aiPaneVisible: true,
                     pageVisible: true,
                     pageFocused: true,
                 },
                 {
                     sameFolder: true,
+                    sameSession: true,
                     aiPaneVisible: false,
                     pageVisible: true,
                     pageFocused: true,
                 },
                 {
                     sameFolder: true,
+                    sameSession: true,
                     aiPaneVisible: true,
                     pageVisible: false,
                     pageFocused: false,
                 },
+                {
+                    sameFolder: true,
+                    sameSession: false,
+                    aiPaneVisible: true,
+                    pageVisible: true,
+                    pageFocused: true,
+                },
             ].map(shouldSurfaceAttention),
             [
                 false,
+                true,
                 true,
                 true,
                 true,
@@ -53,25 +65,28 @@ describe('persisted tab order', () => {
                 sanitizeTabOrder([
                     'ai',
                     'ai',
-                    'code',
+                    'github',
                 ]),
                 sanitizeTabOrder('invalid'),
             ],
             [
                 [
-                    'code',
                     'ai',
                     'shell',
+                    'diff',
+                    'github',
                 ],
                 [
                     'ai',
                     'shell',
-                    'code',
+                    'diff',
+                    'github',
                 ],
                 [
                     'ai',
                     'shell',
-                    'code',
+                    'diff',
+                    'github',
                 ],
             ],
         );
@@ -81,31 +96,39 @@ describe('persisted tab order', () => {
         const order = [
             'ai',
             'shell',
-            'code',
+            'diff',
+            'github',
         ] as const;
         assert.deepEquals(
             [
-                moveTabGroup(order, ['code'], ['ai'], 'before'),
-                moveTabGroup(
+                moveTabGroup({
                     order,
-                    [
+                    draggedTabs: ['github'],
+                    targetTabs: ['ai'],
+                    position: 'before',
+                }),
+                moveTabGroup({
+                    order,
+                    draggedTabs: [
                         'ai',
                         'shell',
                     ],
-                    ['code'],
-                    'after',
-                ),
+                    targetTabs: ['diff'],
+                    position: 'after',
+                }),
             ],
             [
                 [
-                    'code',
+                    'github',
                     'ai',
                     'shell',
+                    'diff',
                 ],
                 [
-                    'code',
+                    'diff',
                     'ai',
                     'shell',
+                    'github',
                 ],
             ],
         );

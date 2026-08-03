@@ -1,3 +1,5 @@
+// cspell:words Meslo, Menlo, keymap, Toggleable
+
 import {PaneKind, ptyWebSocket, type Theme} from '@agent-storm/common';
 import {FitAddon} from '@xterm/addon-fit';
 import {WebLinksAddon} from '@xterm/addon-web-links';
@@ -16,11 +18,18 @@ import {createSizedIcon, lucideIcons, ViraIcon, viraThemeByKeys} from 'vira';
 import {client, getConfig, uploadFile} from '../../util/api-client.js';
 import {ensureSecret} from '../../util/auth.js';
 import {type PaneAttentionRequest} from '../../util/interaction-state.js';
+import {localStorageClient} from '../../util/local-storage-client.js';
 import {resolveTheme, terminalThemeBackground} from '../../util/theme.js';
 import {defaultXtermStyles} from './xterm-styles.js';
 
 const uploadErrorDismissMs = 5000;
-const terminalScrollbackLines = 20_000;
+
+/**
+ * How many animation frames a fit will wait for xterm to produce a usable cell measurement before
+ * giving up. Measurement normally lands on the frame right after a hidden pane is revealed; the
+ * ceiling only exists so a pane that never becomes measurable can't retry forever.
+ */
+const maxFitRetryFrames = 30;
 
 function fileToBase64(file: File): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -271,8 +280,9 @@ function resolveTerminalTheme(theme: Theme | undefined): ITheme {
         return darkCodexTerminalTheme;
     } else if (resolved === 'dark') {
         return darkNeutralTerminalTheme;
+    } else {
+        return lightTerminalTheme;
     }
-    return lightTerminalTheme;
 }
 
 /**
@@ -369,6 +379,13 @@ export const VirTerminal = defineElement<{
     folder: string;
     kind: PaneKind;
     /**
+     * Which session tab within `folder` + `kind` this terminal is attached to. Baked into the
+     * `/pty` search params when the socket opens, so switching sessions must mount a _new_ element
+     * rather than re-assign this input — the `onDomCreated` hook below doesn't re-run on input
+     * changes. `vir-pane-group` guarantees that by keying its `repeat` on the session id.
+     */
+    sessionId: string;
+    /**
      * True when this terminal's pane is the user's currently active folder. Used to re-fit and push
      * a fresh size to the server on the false→true transition: a CSS-hidden pane reports a 0×0
      * content rect and won't have observed live window-resize events, so its server-side dimensions
@@ -412,6 +429,14 @@ export const VirTerminal = defineElement<{
             sendBytes: undefined as ((bytes: string) => void) | undefined,
             /** Toggle the sticky Ctrl modifier on/off. Set once the socket connects. */
             toggleCtrl: undefined as (() => void) | undefined,
+            /**
+             * Flipped by `cleanup` so the async setup below can tell it was unmounted mid-flight.
+             * Setup awaits font loading, config, the auth secret, and the WebSocket handshake
+             * before it has anything to store in `disconnect` — without this flag, an element torn
+             * down during that window leaves a socket open with nothing holding a reference to
+             * close it. Switching session tabs makes that window routine rather than rare.
+             */
+            unmounted: false,
         };
     },
     styles: css`
@@ -544,7 +569,10 @@ export const VirTerminal = defineElement<{
             }
         }
     `,
-    cleanup({state}) {
+    cleanup({state, updateState}) {
+        updateState({
+            unmounted: true,
+        });
         state.resizeObserver?.disconnect();
         state.disconnect?.();
         state.terminal?.dispose();
@@ -611,13 +639,20 @@ export const VirTerminal = defineElement<{
                     const useWebgl = config?.useWebgl !== false;
                     const clickableLinks = config?.terminalClickableLinks !== false;
 
+                    /**
+                     * User-controlled cap on how many scrollback lines this pane retains. Read once
+                     * here (not persisted to the backend config) and reused below as the connect
+                     * search param so the daemon replays at most this many lines on attach.
+                     */
+                    const scrollbackLimit = localStorageClient.scrollbackLimit.read();
+
                     const terminal = new Terminal({
                         fontFamily: '"MesloLGS NF", Menlo, monospace',
                         fontSize: 13,
                         cursorBlink: true,
                         cursorStyle: 'bar',
                         cursorWidth: 3,
-                        scrollback: terminalScrollbackLines,
+                        scrollback: scrollbackLimit,
                         theme: resolveTerminalTheme(config?.theme),
                         /**
                          * Seed xterm with the daemon's spawn-default dims (see `pty-pool.ts`'s
@@ -656,6 +691,7 @@ export const VirTerminal = defineElement<{
                             new events.attentionRequested({
                                 folder: inputs.folder,
                                 kind: inputs.kind,
+                                sessionId: inputs.sessionId,
                             }),
                         );
                     });
@@ -742,11 +778,29 @@ export const VirTerminal = defineElement<{
                         () => true,
                     );
 
+                    /**
+                     * Read the flag through a call so TypeScript can't narrow it across the awaits
+                     * below. It genuinely flips when `cleanup` runs partway through this setup,
+                     * which is exactly what the checks are here to catch.
+                     */
+                    const isUnmounted = () => state.unmounted;
+
                     const secret = await ensureSecret();
+                    /**
+                     * Bail before opening the socket if this element was torn down while the awaits
+                     * above were in flight (a fast session-tab or folder switch). Opening it now
+                     * would attach a PTY subscriber that nothing can ever detach.
+                     */
+                    if (isUnmounted()) {
+                        terminal.dispose();
+                        return;
+                    }
                     const socket = await client.connectWebSocket(ptyWebSocket, {
                         searchParams: {
                             folder: inputs.folder,
                             kind: inputs.kind,
+                            sessionId: inputs.sessionId,
+                            scrollbackLimit: String(scrollbackLimit),
                         },
                         protocols: [secret],
                         listeners: {
@@ -758,6 +812,17 @@ export const VirTerminal = defineElement<{
                             },
                         },
                     });
+
+                    /**
+                     * The handshake itself is another await, so re-check: if the element went away
+                     * while it completed, close the socket here since `cleanup` has already run and
+                     * will not run again.
+                     */
+                    if (isUnmounted()) {
+                        void socket.close();
+                        terminal.dispose();
+                        return;
+                    }
 
                     const sendResize = () => {
                         socket.send({
@@ -987,7 +1052,11 @@ export const VirTerminal = defineElement<{
                         true,
                     );
 
-                    const fitAndResend = () => {
+                    /**
+                     * Recursion is why this carries a return-type annotation: it re-schedules
+                     * itself on the next frame while xterm's cell measurement is still invalid.
+                     */
+                    const fitAndResendWithRetries = (remainingFrames: number): void => {
                         /**
                          * Bail when the host has no real layout — the pane is `display: none`
                          * because the user switched to a different folder. If we fit anyway,
@@ -1001,9 +1070,39 @@ export const VirTerminal = defineElement<{
                         if (element.offsetWidth < 10 || element.offsetHeight < 10) {
                             return;
                         }
+                        /**
+                         * A terminal `open()`ed inside a hidden pane measures its cell box as 0×0,
+                         * and xterm only re-measures when its own IntersectionObserver reports the
+                         * screen element visible — which lands _after_ the ResizeObserver entry and
+                         * the activation `requestAnimationFrame` that brought us here. While the
+                         * measurement is invalid `fitAddon.fit()` silently no-ops (its
+                         * `proposeDimensions` returns undefined on a 0-width cell), so fitting and
+                         * sending unconditionally pushes xterm's construction-time 120×32 to the
+                         * pty even though the pane is some other size. The pty then wraps at 120
+                         * cols while xterm renders, say, 95 — invisible until something repaints
+                         * the whole screen (Claude's `/clear`, another folder switch), at which
+                         * point the pane looks shredded and only a manual resize fixes it. So skip
+                         * the send while dims are unreadable and retry on later frames until xterm
+                         * has measured.
+                         */
+                        const proposed = fitAddon.proposeDimensions();
+                        if (
+                            !proposed ||
+                            !Number.isFinite(proposed.cols) ||
+                            !Number.isFinite(proposed.rows)
+                        ) {
+                            if (remainingFrames > 0) {
+                                requestAnimationFrame(() =>
+                                    fitAndResendWithRetries(remainingFrames - 1),
+                                );
+                            }
+                            return;
+                        }
                         fitAddon.fit();
                         sendResize();
                     };
+
+                    const fitAndResend = () => fitAndResendWithRetries(maxFitRetryFrames);
 
                     /**
                      * One-shot initial fit replacing the previous unconditional pair. If the host
@@ -1015,7 +1114,7 @@ export const VirTerminal = defineElement<{
                      */
                     fitAndResend();
 
-                    const resizeObserver = new ResizeObserver(fitAndResend);
+                    const resizeObserver = new ResizeObserver(() => fitAndResend());
                     resizeObserver.observe(element);
 
                     /**

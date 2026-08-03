@@ -1,3 +1,5 @@
+// cspell:words mkdirs
+
 import {
     agentStormService,
     checkPathEndpoint,
@@ -6,18 +8,29 @@ import {
     createWorktreeEndpoint,
     deleteWorktreeEndpoint,
     foldersEndpoint,
+    gitDiffFileEndpoint,
+    gitDiffStatusEndpoint,
+    gitDiscardFileEndpoint,
+    gitHubPrEndpoint,
+    gitStageFileEndpoint,
+    gitStageHunkEndpoint,
+    hideRepoEndpoint,
     killPanesEndpoint,
     PaneKind,
     ptyWebSocket,
     resetAiSessionEndpoint,
     restartDaemonEndpoint,
     restartPaneEndpoint,
+    sessionCloseEndpoint,
+    sessionCreateEndpoint,
+    sessionListEndpoint,
+    sessionRenameEndpoint,
     touchRepoEndpoint,
     updateCheckEndpoint,
     uploadEndpoint,
 } from '@agent-storm/common';
 import {check} from '@augment-vir/assert';
-import {HttpMethod, HttpStatus, log, wait} from '@augment-vir/common';
+import {HttpMethod, HttpStatus, log, omitObjectKeys, wait} from '@augment-vir/common';
 import {type OriginRequirement} from '@rest-vir/api';
 import {attachApi, createApiImplementor, implementApi, silentServerLogger} from '@rest-vir/host';
 import fastify from 'fastify';
@@ -37,7 +50,7 @@ import {
 import {
     attachPane,
     killFolderPanes,
-    killVscode,
+    killPaneSession,
     restartPane,
     shutdownDaemon,
     type PaneAttachment,
@@ -45,11 +58,27 @@ import {
 import {ensureDaemon, waitForDaemonGone} from './daemon/ensure-daemon.js';
 import {serverLogPath} from './file-paths.js';
 import {getCachedFolders, refreshFolderInfoNow, startFolderInfoRefreshLoop} from './folder-info.js';
+import {
+    discardFileChanges,
+    getDiffFileContents,
+    getDiffStatus,
+    moveHunkAcrossIndex,
+    setFileStaged,
+} from './git-diff.js';
 import {addWorktree, listWorktreeChildren, removeWorktree} from './git.js';
+import {fetchFolderPr} from './github-pr.js';
 import {normalizePath} from './paths.js';
+import {getLivePaneSessionIds} from './pty.js';
+import {
+    createFolderSession,
+    forgetFolderSessions,
+    reconcileFolderSessions,
+    removeFolderSession,
+    renameFolderSession,
+    resolveSessionId,
+} from './sessions.js';
 import {getUpdateStatus} from './update-check.js';
 import {saveUpload} from './uploads.js';
-import {attachVscodeProxy} from './vscode-proxy.js';
 
 /**
  * Mirror stdout/stderr to `serverLogPath` so the assistant can tail the backend output instead of
@@ -297,21 +326,102 @@ const deleteWorktreeImplementation = implementor.implementEndpoint(deleteWorktre
         }).catch(() => {
             /* if the daemon has no live panes for this folder, continue with deletion */
         });
-        await killVscode({
-            folder: requestData.worktreePath,
-        }).catch(() => {
-            /* if no vscode was running for this folder, killVscode is a no-op */
-        });
         await wait({
             milliseconds: 250,
         });
         await removeWorktree(requestData);
+        /**
+         * Drop the folder's session tabs now that the folder is gone. Worktree paths are derived
+         * deterministically from the worktree name, so leaving them behind means a later worktree
+         * created with the same name inherits this one's named, PTY-less tabs.
+         */
+        await forgetFolderSessions(requestData.worktreePath);
         await refreshFolderInfoNow();
         return {
             [HttpStatus.Ok]: {
                 responseData: {
                     ok: true,
                 },
+            },
+        };
+    },
+});
+
+/**
+ * Reads the folder's tab list, merged with whatever sessions the daemon actually holds a PTY for,
+ * so a running session can never lack a tab. Also materializes the implicit first session for
+ * folders that predate multi-session.
+ */
+const sessionListImplementation = implementor.implementEndpoint(sessionListEndpoint, {
+    async [HttpMethod.Post]({requestData}) {
+        const folder = normalizePath(requestData.folder);
+        return {
+            [HttpStatus.Ok]: {
+                responseData: await reconcileFolderSessions({
+                    folder,
+                    liveSessionIds: {
+                        [PaneKind.Ai]: await getLivePaneSessionIds(folder, PaneKind.Ai),
+                        [PaneKind.Shell]: await getLivePaneSessionIds(folder, PaneKind.Shell),
+                    },
+                }),
+            },
+        };
+    },
+});
+
+const sessionCreateImplementation = implementor.implementEndpoint(sessionCreateEndpoint, {
+    async [HttpMethod.Post]({requestData}) {
+        return {
+            [HttpStatus.Ok]: {
+                responseData: await createFolderSession({
+                    folder: normalizePath(requestData.folder),
+                    kind: requestData.kind,
+                }),
+            },
+        };
+    },
+});
+
+const sessionRenameImplementation = implementor.implementEndpoint(sessionRenameEndpoint, {
+    async [HttpMethod.Post]({requestData}) {
+        return {
+            [HttpStatus.Ok]: {
+                responseData: await renameFolderSession({
+                    folder: normalizePath(requestData.folder),
+                    kind: requestData.kind,
+                    sessionId: requestData.sessionId,
+                    name: requestData.name,
+                }),
+            },
+        };
+    },
+});
+
+const sessionCloseImplementation = implementor.implementEndpoint(sessionCloseEndpoint, {
+    async [HttpMethod.Post]({requestData}) {
+        const folder = normalizePath(requestData.folder);
+        const {sessions, removed} = await removeFolderSession({
+            folder,
+            kind: requestData.kind,
+            sessionId: requestData.sessionId,
+        });
+        /**
+         * Only kill the PTY once the store actually dropped the tab. Closing the last remaining
+         * session is refused store-side, and killing its process while the tab stays visible would
+         * leave the user looking at a dead terminal with no obvious way to revive it.
+         */
+        if (removed) {
+            await killPaneSession({
+                folder,
+                kind: requestData.kind,
+                sessionId: requestData.sessionId,
+            }).catch(() => {
+                /* no live PTY for this session (never attached, or daemon restarted) */
+            });
+        }
+        return {
+            [HttpStatus.Ok]: {
+                responseData: sessions,
             },
         };
     },
@@ -324,8 +434,15 @@ const restartPaneImplementation = implementor.implementEndpoint(restartPaneEndpo
          * command (the daemon caches nothing about config — every fresh spawn uses whatever the
          * backend hands it).
          */
+        const folder = normalizePath(requestData.folder);
         await restartPane({
-            ...requestData,
+            folder,
+            kind: requestData.kind,
+            sessionId: await resolveSessionId({
+                folder,
+                kind: requestData.kind,
+                sessionId: requestData.sessionId ?? undefined,
+            }),
             aiCmd: await resolveAiCmdForFolder(requestData.folder),
         });
         return {
@@ -342,12 +459,10 @@ const killPanesImplementation = implementor.implementEndpoint(killPanesEndpoint,
     async [HttpMethod.Post]({requestData}) {
         await killFolderPanes(requestData);
         /**
-         * Pair the VS Code instance lifecycle with the pane lifecycle — "kill folder panes" implies
-         * "tear down the editor I have for this folder too". Silently ignore the no-vscode case.
+         * "Kill folder panes" means all of them, so the tab lists go too — the folder should come
+         * back with a clean single tab per kind rather than a row of tabs whose PTYs are all dead.
          */
-        await killVscode({
-            folder: requestData.folder,
-        }).catch(() => {});
+        await forgetFolderSessions(requestData.folder);
         return {
             [HttpStatus.Ok]: {
                 responseData: {
@@ -399,6 +514,11 @@ const resetAiSessionImplementation = implementor.implementEndpoint(resetAiSessio
         await restartPane({
             folder,
             kind: PaneKind.Ai,
+            sessionId: await resolveSessionId({
+                folder,
+                kind: PaneKind.Ai,
+                sessionId: requestData.sessionId ?? undefined,
+            }),
             aiCmd: cmd,
         });
         return {
@@ -473,6 +593,40 @@ const touchRepoImplementation = implementor.implementEndpoint(touchRepoEndpoint,
     },
 });
 
+const hideRepoImplementation = implementor.implementEndpoint(hideRepoEndpoint, {
+    async [HttpMethod.Post]({requestData}) {
+        /**
+         * Clear `lastInteractedAtMs` on the owning repo's config entry — the inverse of the touch
+         * endpoint. The sidebar's recency filter treats a repo with no timestamp as hidden. Resolve
+         * the owning repo exactly like `touchRepo` (a worktree resolves to its parent, else the
+         * folder itself) and no-op on unknown folders / transient load failures — best-effort,
+         * never error.
+         */
+        const target = normalizePath(requestData.folder);
+        const cached = await getCachedFolders();
+        const folder = cached.find((entry) => entry.path === target);
+        const repoPath = folder?.parentRepoPath ?? folder?.path ?? target;
+        const config = await loadConfig().catch(() => undefined);
+        const repoIndex = config?.repos.findIndex((repo) => repo.path === repoPath) ?? -1;
+        if (config && repoIndex !== -1) {
+            const updatedRepos = config.repos.map((repo, index) =>
+                index === repoIndex ? omitObjectKeys(repo, ['lastInteractedAtMs']) : repo,
+            );
+            await saveConfig({
+                ...config,
+                repos: updatedRepos,
+            });
+        }
+        return {
+            [HttpStatus.Ok]: {
+                responseData: {
+                    ok: true,
+                },
+            },
+        };
+    },
+});
+
 const checkPathImplementation = implementor.implementEndpoint(checkPathEndpoint, {
     async [HttpMethod.Post]({requestData}) {
         const resolvedPath = normalizePath(requestData.path);
@@ -524,10 +678,106 @@ const uploadImplementation = implementor.implementEndpoint(uploadEndpoint, {
     },
 });
 
+const gitDiffStatusImplementation = implementor.implementEndpoint(gitDiffStatusEndpoint, {
+    async [HttpMethod.Post]({requestData}) {
+        return {
+            [HttpStatus.Ok]: {
+                responseData: await getDiffStatus(normalizePath(requestData.folder)),
+            },
+        };
+    },
+});
+
+const gitDiffFileImplementation = implementor.implementEndpoint(gitDiffFileEndpoint, {
+    async [HttpMethod.Post]({requestData}) {
+        return {
+            [HttpStatus.Ok]: {
+                responseData: await getDiffFileContents({
+                    ...requestData,
+                    folder: normalizePath(requestData.folder),
+                    oldPath: requestData.oldPath ?? undefined,
+                }),
+            },
+        };
+    },
+});
+
+const gitStageFileImplementation = implementor.implementEndpoint(gitStageFileEndpoint, {
+    async [HttpMethod.Post]({requestData}) {
+        await setFileStaged({
+            ...requestData,
+            folder: normalizePath(requestData.folder),
+        });
+        return {
+            [HttpStatus.Ok]: {
+                responseData: {
+                    ok: true,
+                },
+            },
+        };
+    },
+});
+
+const gitStageHunkImplementation = implementor.implementEndpoint(gitStageHunkEndpoint, {
+    async [HttpMethod.Post]({requestData}) {
+        await moveHunkAcrossIndex({
+            ...requestData,
+            folder: normalizePath(requestData.folder),
+            oldPath: requestData.oldPath ?? undefined,
+        });
+        return {
+            [HttpStatus.Ok]: {
+                responseData: {
+                    ok: true,
+                },
+            },
+        };
+    },
+});
+
+const gitDiscardFileImplementation = implementor.implementEndpoint(gitDiscardFileEndpoint, {
+    async [HttpMethod.Post]({requestData}) {
+        await discardFileChanges({
+            ...requestData,
+            folder: normalizePath(requestData.folder),
+        });
+        return {
+            [HttpStatus.Ok]: {
+                responseData: {
+                    ok: true,
+                },
+            },
+        };
+    },
+});
+
+const gitHubPrImplementation = implementor.implementEndpoint(gitHubPrEndpoint, {
+    async [HttpMethod.Post]({requestData}) {
+        return {
+            [HttpStatus.Ok]: {
+                responseData: {
+                    pr: await fetchFolderPr({
+                        folder: normalizePath(requestData.folder),
+                        forceRefresh: requestData.forceRefresh,
+                    }),
+                },
+            },
+        };
+    },
+});
+
 const ptyImplementation = implementor.implementWebSocket(ptyWebSocket, {
     async open({webSocket, searchParams}) {
         const folder = searchParams.folder;
         const kind = searchParams.kind;
+        /**
+         * Client-requested scrollback line cap (see `ptyWebSocket` search params). Empty or invalid
+         * → undefined, which the daemon treats as "replay the full buffer".
+         */
+        const parsedScrollbackLimit = Number.parseInt(searchParams.scrollbackLimit, 10);
+        const scrollbackLimit = Number.isFinite(parsedScrollbackLimit)
+            ? parsedScrollbackLimit
+            : undefined;
         /**
          * Look up the current AI command from agent-storm's config on every attach so the daemon's
          * spawned PTY (when this is the first attach for the folder + kind pair) uses whatever the
@@ -537,7 +787,18 @@ const ptyImplementation = implementor.implementWebSocket(ptyWebSocket, {
         const attachment = await attachPane({
             folder,
             kind,
+            /**
+             * Resolve against the stored tab list so a hand-edited URL or a client whose session
+             * list hasn't loaded attaches to a real session rather than spawning a PTY under an id
+             * no tab points at.
+             */
+            sessionId: await resolveSessionId({
+                folder,
+                kind,
+                sessionId: searchParams.sessionId,
+            }),
             aiCmd: await resolveAiCmdForFolder(folder),
+            scrollbackLimit,
             onData(data) {
                 webSocket.send(data);
             },
@@ -608,12 +869,23 @@ const implementation = implementApi<undefined>()(agentStormService, {
         deleteWorktreeImplementation,
         restartPaneImplementation,
         killPanesImplementation,
+        sessionListImplementation,
+        sessionCreateImplementation,
+        sessionRenameImplementation,
+        sessionCloseImplementation,
         resetAiSessionImplementation,
         restartDaemonImplementation,
         touchRepoImplementation,
+        hideRepoImplementation,
         checkPathImplementation,
         createPathImplementation,
         uploadImplementation,
+        gitDiffStatusImplementation,
+        gitDiffFileImplementation,
+        gitStageFileImplementation,
+        gitStageHunkImplementation,
+        gitDiscardFileImplementation,
+        gitHubPrImplementation,
     ],
     webSockets: [ptyImplementation],
 });
@@ -629,12 +901,6 @@ const server = fastify({
 await attachApi(server, implementation, {
     externalOrigin: `http://localhost:${port}`,
 });
-/**
- * Mount the embedded-VS-Code proxy after the main service so its `/vscode-proxy/*` route doesn't
- * collide with rest-vir's path handling. Owns its own routes (`/vscode/ensure`, `/vscode/kill`, the
- * proxy itself) and an HTTP-server `upgrade` listener for WebSocket forwarding.
- */
-attachVscodeProxy(server);
 /**
  * Bind to `0.0.0.0` so the dev server is reachable over LAN (testing the UI from a phone or another
  * laptop after running the vite frontend with `--host`). The auth-secret check in

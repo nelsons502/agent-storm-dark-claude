@@ -1,4 +1,7 @@
+// cspell:words grabbable
+
 import {PaneKind, type FolderInfo} from '@agent-storm/common';
+import {omitObjectKeys} from '@augment-vir/common';
 import {attachOnResize, css, defineElement, html, listen, repeat} from 'element-vir';
 import {
     createSizedIcon,
@@ -15,7 +18,11 @@ import {shouldSurfaceAttention, type PaneAttentionRequest} from '../../util/inte
 import {localStorageClient, sidebarWidth} from '../../util/local-storage-client.js';
 import {
     defaultFrontendTab,
+    rememberedTabForFolder,
+    rememberTabForFolder,
     router,
+    sessionIndexFromRoute,
+    sessionSearchParamByKind,
     tabFromRoute,
     type AppRoute,
     type FrontendPaths,
@@ -179,7 +186,7 @@ type AppState = {
      */
     mobileSidebarOpen: boolean;
     paneRestartKeys: Record<string, number | undefined>;
-    attentionFolders: ReadonlySet<string>;
+    attentionSessions: ReadonlyMap<string, ReadonlySet<string>>;
 };
 
 type AppUpdate = (newState: Partial<AppState>) => void;
@@ -207,7 +214,7 @@ export const VirApp = defineElement()({
             disposeTheme: undefined,
             mobileSidebarOpen: false,
             paneRestartKeys: {},
-            attentionFolders: new Set(),
+            attentionSessions: new Map(),
         };
     },
     styles: css`
@@ -547,11 +554,23 @@ export const VirApp = defineElement()({
             });
         }
 
-        const attentionCount = state.attentionFolders.size;
+        const attentionCount = state.attentionSessions.size;
         const titlePrefix = attentionCount ? `(${attentionCount}) ` : '';
         document.title = resolution.folder
             ? `${titlePrefix}agent-storm • ${resolution.folder.name}`
             : `${titlePrefix}agent-storm`;
+
+        /**
+         * On mobile, only mount the currently-active folder's pane group. Every mounted pane group
+         * holds live `/pty` WebSocket(s), and keeping the whole `openedFolders` superset mounted
+         * (as we do on desktop, so switching folders is instant) means a phone can end up holding
+         * many open sockets at once — a real battery drain. Unmounting the inactive groups closes
+         * only the frontend's socket; the daemon keeps each pane's PTY alive and replays its
+         * scrollback when the user switches back. Desktop keeps the full superset mounted.
+         */
+        const renderedFolders = isMobile
+            ? state.openedFolders.filter((folder) => folder === activeFolder)
+            : state.openedFolders;
 
         const onDividerPointerDown = (event: PointerEvent) => {
             event.preventDefault();
@@ -624,19 +643,28 @@ export const VirApp = defineElement()({
          * sidebar (mobile) can share them. `folderActivated` also closes the mobile sidebar modal —
          * a no-op on desktop because the modal isn't open there anyway.
          */
-        const clearFolderAttention = (folderPath: string) => {
-            if (!state.attentionFolders.has(folderPath)) {
+        const clearSessionAttention = ({
+            folderPath,
+            sessionId,
+        }: Readonly<{folderPath: string; sessionId: string}>) => {
+            const folderSessions = state.attentionSessions.get(folderPath);
+            if (!folderSessions?.has(sessionId)) {
                 return;
             }
-            const attentionFolders = new Set(state.attentionFolders);
-            attentionFolders.delete(folderPath);
+            const attentionSessions = new Map(state.attentionSessions);
+            const remainingSessions = new Set(folderSessions);
+            remainingSessions.delete(sessionId);
+            if (remainingSessions.size) {
+                attentionSessions.set(folderPath, remainingSessions);
+            } else {
+                attentionSessions.delete(folderPath);
+            }
             updateState({
-                attentionFolders,
+                attentionSessions,
             });
         };
 
         const handleFolderActivated = (folderPath: string) => {
-            clearFolderAttention(folderPath);
             /**
              * Synchronous activation path: the folder is already in vir-app's `folderInfo` cache,
              * so we can set the route immediately. Most clicks hit this branch.
@@ -654,14 +682,21 @@ export const VirApp = defineElement()({
                 folderInfo: ReadonlyMap<string, FolderInfo>,
             ): void => {
                 /**
-                 * Wipe `search` on a sidebar click so the new repo starts on the default tab (AI).
-                 * Without this, the `?tab=...` value from the previous repo carries over and the
-                 * user can land on, say, the Code tab of the freshly- selected repo, which is
-                 * usually surprising.
+                 * Restore whichever tab this folder was last on rather than carrying the previous
+                 * folder's `?tab=...` across (landing on another repo's Diff tab is surprising) or
+                 * resetting everything to AI (which loses the pane you were deliberately using in
+                 * this folder). Session params are dropped either way — they belong to the folder
+                 * you just left.
                  */
+                const rememberedTab = rememberedTabForFolder(folder.path);
                 router.setRoute({
                     paths: pathsForFolder(folder, folderInfo),
-                    search: undefined,
+                    search:
+                        rememberedTab === defaultFrontendTab
+                            ? undefined
+                            : {
+                                  tab: [rememberedTab],
+                              },
                 });
             };
             const known = state.folderInfo.get(folderPath);
@@ -711,29 +746,35 @@ export const VirApp = defineElement()({
             }
         };
 
-        const handleAttentionRequested = ({folder, kind}: PaneAttentionRequest) => {
+        const handleAttentionRequested = ({folder, kind, sessionId}: PaneAttentionRequest) => {
             if (kind !== PaneKind.Ai) {
                 return;
             }
             const aiPaneVisible =
                 !state.folderInfo.get(folder)?.aiHidden &&
-                (isMobile ? activeTab === 'ai' : activeTab !== 'code');
+                (isMobile ? activeTab === 'ai' : activeTab === 'ai' || activeTab === 'shell');
             if (
                 !shouldSurfaceAttention({
                     sameFolder: activeFolder === folder,
+                    sameSession: true,
                     aiPaneVisible,
                     pageVisible: document.visibilityState === 'visible',
                     pageFocused: document.hasFocus(),
                 })
             ) {
-                clearFolderAttention(folder);
+                clearSessionAttention({
+                    folderPath: folder,
+                    sessionId,
+                });
                 return;
             }
 
-            const attentionFolders = new Set(state.attentionFolders);
-            attentionFolders.add(folder);
+            const attentionSessions = new Map(state.attentionSessions);
+            const folderSessions = new Set(attentionSessions.get(folder));
+            folderSessions.add(sessionId);
+            attentionSessions.set(folder, folderSessions);
             updateState({
-                attentionFolders,
+                attentionSessions,
             });
 
             if (Notification.permission !== 'granted') {
@@ -744,7 +785,7 @@ export const VirApp = defineElement()({
             const notification = new Notification('Claude needs your input', {
                 body: `${folderName} is waiting for your response.`,
                 icon: '/claude-favicon-96x96.png',
-                tag: `agent-storm-attention:${folder}`,
+                tag: `agent-storm-attention:${folder}:${sessionId}`,
             });
             notification.addEventListener('click', () => {
                 notification.close();
@@ -765,8 +806,11 @@ export const VirApp = defineElement()({
                     paths: [],
                 });
             }
+            const attentionSessions = new Map(state.attentionSessions);
+            paths.forEach((path) => attentionSessions.delete(path));
             updateState({
                 openedFolders: state.openedFolders.filter((folder) => !removed.has(folder)),
+                attentionSessions,
             });
         };
 
@@ -792,10 +836,12 @@ export const VirApp = defineElement()({
             });
         };
 
+        const attentionFolders = new Set(state.attentionSessions.keys());
+
         return html`
             <${VirSidebar.assign({
                 activeFolder,
-                attentionFolders: state.attentionFolders,
+                attentionFolders,
             })}
                 ${listen(VirSidebar.events.folderActivated, (event) =>
                     handleFolderActivated(event.detail),
@@ -833,7 +879,7 @@ export const VirApp = defineElement()({
                         }),
                     )}
                 ></${ViraButton}>
-                ${state.openedFolders.length === 0
+                ${renderedFolders.length === 0
                     ? html`
                           <div class="stage-empty">
                               <span class="stage-empty-mark">
@@ -849,7 +895,7 @@ export const VirApp = defineElement()({
                       `
                     : ''}
                 ${repeat(
-                    state.openedFolders,
+                    renderedFolders,
                     /**
                      * Key the pane slots by absolute folder path so lit-html identifies elements by
                      * folder rather than by array index. Without this, removing a folder from
@@ -874,23 +920,64 @@ export const VirApp = defineElement()({
                                     screenSize: state.screenSize,
                                     aiRestartKey:
                                         state.paneRestartKeys[`${folder}:${PaneKind.Ai}`] || 0,
+                                    aiSessionIndex: sessionIndexFromRoute(state.route, PaneKind.Ai),
+                                    shellSessionIndex: sessionIndexFromRoute(
+                                        state.route,
+                                        PaneKind.Shell,
+                                    ),
+                                    resetAiSessionCmd: info?.resetAiSessionCmd || '',
+                                    prUrl: info?.prUrl || '',
                                 })}
+                                    ${listen(VirPaneGroup.events.sessionRequested, (event) => {
+                                        /**
+                                         * Session selection lives in the URL alongside `tab`, so a
+                                         * reload or a shared link lands on the same session. Index
+                                         * 1 is omitted for the same reason the default tab is: it's
+                                         * what the fallback resolves to anyway.
+                                         */
+                                        const paramName =
+                                            sessionSearchParamByKind[event.detail.kind];
+                                        const existingSearch = state.route.search ?? {};
+                                        router.setRoute({
+                                            paths: state.route.paths,
+                                            /**
+                                             * Index 1 drops the param rather than setting it to
+                                             * `undefined`: the search type marks these optional, so
+                                             * an explicit `undefined` isn't assignable.
+                                             */
+                                            search:
+                                                event.detail.index > 1
+                                                    ? {
+                                                          ...existingSearch,
+                                                          [paramName]: [
+                                                              String(event.detail.index),
+                                                          ],
+                                                      }
+                                                    : omitObjectKeys(existingSearch, [paramName]),
+                                        });
+                                    })}
                                     ${listen(VirPaneGroup.events.tabRequested, (event) => {
                                         const requestedTab = event.detail;
-                                        if (requestedTab === 'ai' && activeFolder) {
-                                            clearFolderAttention(activeFolder);
-                                        }
+                                        const existingSearch = state.route.search ?? {};
+                                        rememberTabForFolder({
+                                            folder,
+                                            tab: requestedTab,
+                                        });
                                         router.setRoute({
                                             paths: state.route.paths,
                                             /**
                                              * Omit `?tab` from the URL when the requested tab is
                                              * the default — keeps URLs short and matches what
-                                             * `tabFromRoute` falls back to anyway.
+                                             * `tabFromRoute` falls back to anyway. Either branch
+                                             * carries the session params through: switching between
+                                             * Switching primary tabs shouldn't reset which session
+                                             * each pane is showing.
                                              */
                                             search:
                                                 requestedTab === defaultFrontendTab
-                                                    ? undefined
+                                                    ? omitObjectKeys(existingSearch, ['tab'])
                                                     : {
+                                                          ...existingSearch,
                                                           tab: [requestedTab],
                                                       },
                                         });
@@ -898,6 +985,17 @@ export const VirApp = defineElement()({
                                     ${listen(VirPaneGroup.events.attentionRequested, (event) =>
                                         handleAttentionRequested(event.detail),
                                     )}
+                                    ${listen(VirPaneGroup.events.attentionCleared, (event) => {
+                                        if (
+                                            event.detail.kind === PaneKind.Ai &&
+                                            event.detail.folder === activeFolder
+                                        ) {
+                                            clearSessionAttention({
+                                                folderPath: event.detail.folder,
+                                                sessionId: event.detail.sessionId,
+                                            });
+                                        }
+                                    })}
                                 ></${VirPaneGroup}>
                             </div>
                         `;
@@ -928,7 +1026,7 @@ export const VirApp = defineElement()({
                 <div class="mobile-sidebar-modal-content">
                     <${VirSidebar.assign({
                         activeFolder,
-                        attentionFolders: state.attentionFolders,
+                        attentionFolders,
                         hideBorder: true,
                         mobileModal: true,
                     })}

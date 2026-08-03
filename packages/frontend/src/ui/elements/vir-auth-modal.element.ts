@@ -1,3 +1,5 @@
+// cspell:word Hyperlegible
+
 import {css, defineElement, html, listen} from 'element-vir';
 import {
     ViraButton,
