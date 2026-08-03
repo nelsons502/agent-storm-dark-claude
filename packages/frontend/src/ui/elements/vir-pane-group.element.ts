@@ -4,6 +4,7 @@ import {PaneKind} from '@agent-storm/common';
 import {css, defineElement, defineElementEvent, html, listen, repeat} from 'element-vir';
 import {viraThemeByKeys} from 'vira';
 import {ensureVscode, killVscode} from '../../util/api-client.js';
+import {moveTabGroup, type PaneAttentionRequest} from '../../util/interaction-state.js';
 import {localStorageClient, paneSplit} from '../../util/local-storage-client.js';
 import {type FrontendTab} from '../../util/router.js';
 import {ScreenSize} from '../../util/screen-size.js';
@@ -47,6 +48,7 @@ export const VirPaneGroup = defineElement<{
          * URL param to the requested value (the actual route paths stay the same).
          */
         tabRequested: defineElementEvent<FrontendTab>(),
+        attentionRequested: defineElementEvent<PaneAttentionRequest>(),
     },
     state() {
         return {
@@ -77,6 +79,11 @@ export const VirPaneGroup = defineElement<{
              * tab via the tab-bar button.
              */
             vscodeUserClosed: false,
+            tabOrder: localStorageClient.tabOrder.read(),
+            draggedTab: undefined as FrontendTab | undefined,
+            dropTargetTab: undefined as FrontendTab | undefined,
+            dropPosition: undefined as 'before' | 'after' | undefined,
+            unsubscribeTabOrder: undefined as (() => void) | undefined,
         };
     },
     styles: css`
@@ -85,6 +92,9 @@ export const VirPaneGroup = defineElement<{
             flex-direction: column;
             width: 100%;
             height: 100%;
+            color: var(--app-text);
+            background: var(--app-bg);
+            font-family: var(--app-font-sans, ui-sans-serif, system-ui, sans-serif);
         }
 
         /*
@@ -102,8 +112,8 @@ export const VirPaneGroup = defineElement<{
             box-sizing: border-box;
             min-height: 44px;
             padding: 0 44px;
-            border-bottom: 1px solid
-                ${viraThemeByKeys.grey['behind-bg'].decoration.background.value};
+            background: var(--app-chrome-bg);
+            border-bottom: 1px solid var(--app-border);
         }
 
         .folder-name-label {
@@ -111,54 +121,102 @@ export const VirPaneGroup = defineElement<{
             overflow: hidden;
             white-space: nowrap;
             text-overflow: ellipsis;
-            font-family: ui-sans-serif, system-ui, sans-serif;
+            font-family: inherit;
             font-size: 13px;
             font-weight: 600;
-            color: ${viraThemeByKeys.grey.foreground.body.foreground.value};
+            color: var(--app-text);
         }
 
         .tab-bar {
             display: flex;
+            align-items: center;
+            gap: 3px;
             flex: 0 0 auto;
-            border-bottom: 1px solid
-                ${viraThemeByKeys.grey['behind-bg'].decoration.background.value};
-            font-family: ui-sans-serif, system-ui, sans-serif;
+            min-height: 48px;
+            box-sizing: border-box;
+            padding: 7px 12px;
+            background: var(--app-chrome-bg);
+            border-bottom: 1px solid var(--app-border);
+            font-family: inherit;
             font-size: 12px;
+        }
+
+        .desktop-folder-name {
+            min-width: 0;
+            max-width: min(34%, 320px);
+            margin-right: 13px;
+            padding-right: 16px;
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+            color: var(--app-muted);
+            border-right: 1px solid var(--app-border);
+            font-size: 12px;
+            font-weight: 550;
         }
 
         .tab {
             appearance: none;
             background: transparent;
-            border: none;
-            border-bottom: 2px solid transparent;
-            padding: 6px 14px;
-            cursor: pointer;
-            color: ${viraThemeByKeys.grey.foreground['non-body'].foreground.value};
+            border: 1px solid transparent;
+            border-radius: var(--app-radius-sm);
+            min-height: 30px;
+            padding: 5px 12px;
+            cursor: grab;
+            color: var(--app-muted);
             font: inherit;
-            letter-spacing: 0.02em;
+            font-weight: 500;
             transition:
-                color 120ms ease,
-                border-bottom-color 120ms ease;
+                color 140ms ease,
+                background-color 140ms ease,
+                border-color 140ms ease;
+        }
+
+        .tab:active {
+            cursor: grabbing;
+        }
+
+        .tab[data-dragging] {
+            opacity: 0.45;
+        }
+
+        .tab[data-drop-before] {
+            box-shadow: -3px 0 0 var(--app-accent);
+        }
+
+        .tab[data-drop-after] {
+            box-shadow: 3px 0 0 var(--app-accent);
         }
 
         .tab:hover {
-            color: ${viraThemeByKeys.grey.foreground.body.foreground.value};
+            color: var(--app-text);
+            background: var(--app-hover);
         }
 
         .tab[data-selected] {
-            color: ${viraThemeByKeys.blue.foreground.body.foreground.value};
-            border-bottom-color: ${viraThemeByKeys.blue.foreground.body.foreground.value};
+            color: var(--app-text);
+            background: var(--app-active);
+            border-color: var(--app-border);
+            box-shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
+        }
+
+        .tab:focus-visible,
+        .close-vscode:focus-visible {
+            outline: 2px solid var(--app-accent);
+            outline-offset: 2px;
         }
 
         .close-vscode {
             appearance: none;
             background: transparent;
             border: none;
+            min-width: 28px;
+            min-height: 28px;
             padding: 4px 6px;
-            margin: 2px 2px 2px 0;
-            border-radius: 3px;
+            margin-left: 1px;
+            border-radius: var(--app-radius-sm);
             cursor: pointer;
-            color: ${viraThemeByKeys.grey.foreground['non-body'].foreground.value};
+            color: var(--app-muted);
             font: inherit;
             line-height: 1;
             display: inline-flex;
@@ -168,7 +226,7 @@ export const VirPaneGroup = defineElement<{
 
         .close-vscode:hover {
             color: ${viraThemeByKeys.red.foreground.body.foreground.value};
-            background-color: ${viraThemeByKeys.grey['behind-fg']['small-body'].background.value};
+            background-color: var(--app-hover);
         }
 
         .body {
@@ -178,6 +236,7 @@ export const VirPaneGroup = defineElement<{
             min-height: 0;
             width: 100%;
             position: relative;
+            background: var(--app-bg);
         }
 
         .code-pane,
@@ -192,6 +251,11 @@ export const VirPaneGroup = defineElement<{
              * offset itself.
              */
             overflow: hidden;
+            box-sizing: border-box;
+        }
+
+        .code-pane {
+            padding: 8px;
         }
 
         .code-pane[data-hidden],
@@ -217,10 +281,12 @@ export const VirPaneGroup = defineElement<{
             width: 100%;
             height: calc(100% + var(--vscode-titlebar-offset));
             margin-top: calc(-1 * var(--vscode-titlebar-offset));
-            border: none;
+            border: 1px solid var(--app-border);
+            border-radius: var(--app-radius-md);
+            box-shadow: var(--app-pane-shadow);
             /* Wrapper shown behind the VS Code iframe while it loads; track the theme default so it
                doesn't flash white in dark mode (VS Code applies its own theme once loaded). */
-            background: var(--vira-default-bg, #ffffff);
+            background: var(--app-surface, var(--vira-default-bg, #ffffff));
         }
 
         .vscode-status {
@@ -228,9 +294,9 @@ export const VirPaneGroup = defineElement<{
             display: flex;
             align-items: center;
             justify-content: center;
-            font-family: ui-sans-serif, system-ui, sans-serif;
+            font-family: inherit;
             font-size: 13px;
-            color: ${viraThemeByKeys.grey.foreground.body.foreground.value};
+            color: var(--app-muted);
         }
 
         .vscode-error {
@@ -242,7 +308,14 @@ export const VirPaneGroup = defineElement<{
             min-width: 0;
             min-height: 0;
             overflow: hidden;
-            transition: filter 120ms ease;
+            background: var(--app-surface);
+            border: 1px solid var(--app-border);
+            border-radius: var(--app-radius-md);
+            box-shadow: var(--app-pane-shadow);
+            transition:
+                border-color 160ms ease,
+                box-shadow 160ms ease,
+                filter 160ms ease;
         }
 
         .ai-pane {
@@ -251,7 +324,6 @@ export const VirPaneGroup = defineElement<{
 
         .shell-pane {
             flex-grow: var(--shell-grow, 0.5);
-            border-left: 1px solid ${viraThemeByKeys.grey.foreground.body.foreground.value};
         }
 
         /* Dim whichever pane isn't the last-focused one so it's obvious which one keystrokes
@@ -260,7 +332,14 @@ export const VirPaneGroup = defineElement<{
            textarea blurs on window blur and doesn't reliably refocus on return, which would
            otherwise drop the indicator. */
         .pane[data-pane-focused='false'] {
-            filter: brightness(0.75) saturate(0.9);
+            filter: brightness(0.91) saturate(0.92);
+        }
+
+        .pane[data-pane-focused='true'] {
+            border-color: var(--app-border-strong);
+            box-shadow:
+                0 0 0 1px var(--app-accent-soft),
+                var(--app-pane-shadow);
         }
 
         .pane-body {
@@ -268,30 +347,34 @@ export const VirPaneGroup = defineElement<{
         }
 
         .divider {
-            flex: 0 0 4px;
+            flex: 0 0 9px;
             position: relative;
             cursor: col-resize;
-            background: ${viraThemeByKeys.grey['behind-bg'].decoration.background.value};
-            transition: background 120ms ease;
+            background: transparent;
             /* Sit above the panes so the hit-area extension below catches the pointer
                instead of being eaten by terminal mousedown handlers. */
             z-index: 1;
             touch-action: none;
         }
 
-        /* Visible bar stays a thin 4px, but the user gets ~14px of grabbable surface. */
-        .divider::before {
+        .divider::after {
             content: '';
             position: absolute;
             top: 0;
             bottom: 0;
-            left: -5px;
-            right: -5px;
+            left: 4px;
+            width: 1px;
+            background: var(--app-border);
+            transition: background 140ms ease;
         }
 
-        .divider:hover,
-        .divider.dragging {
-            background: ${viraThemeByKeys.grey.foreground.body.foreground.value};
+        .divider:hover::after,
+        .divider.dragging::after {
+            background: var(--app-accent);
+        }
+
+        .cli-panes {
+            padding: 8px;
         }
 
         /*
@@ -307,7 +390,38 @@ export const VirPaneGroup = defineElement<{
         .cli-panes[data-mobile] .pane:not([data-hidden]) {
             flex-grow: 1;
         }
+
+        .cli-panes[data-mobile] {
+            padding: 0;
+        }
+
+        .cli-panes[data-mobile] .pane {
+            border: none;
+            border-radius: 0;
+            box-shadow: none;
+        }
+
+        .tab-bar[data-mobile] {
+            min-height: 44px;
+            padding: 6px 8px;
+        }
+
+        .tab-bar[data-mobile] .tab {
+            flex: 1 1 0;
+        }
     `,
+    init({updateState}) {
+        updateState({
+            unsubscribeTabOrder: localStorageClient.tabOrder.subscribe((tabOrder) => {
+                updateState({
+                    tabOrder,
+                });
+            }),
+        });
+    },
+    cleanup({state}) {
+        state.unsubscribeTabOrder?.();
+    },
     render({inputs, state, updateState, host, dispatch, events}) {
         const split = clampSplit(state.split);
         host.style.setProperty('--ai-grow', String(split));
@@ -466,37 +580,42 @@ export const VirPaneGroup = defineElement<{
          *   collapse them into one button. Clicking CLI sets `tab=ai` as a stable default.
          * - Mobile: 3 tabs (AI, Shell, Code), each mapping directly to the URL param.
          */
-        const tabButtons: ReadonlyArray<{label: string; tab: FrontendTab; isActive: boolean}> =
-            isMobile
-                ? [
-                      {
-                          label: 'AI',
-                          tab: 'ai',
-                          isActive: inputs.activeTab === 'ai',
-                      },
-                      {
-                          label: 'Shell',
-                          tab: 'shell',
-                          isActive: inputs.activeTab === 'shell',
-                      },
-                      {
-                          label: 'Code',
-                          tab: 'code',
-                          isActive: isCodeTab,
-                      },
-                  ]
-                : [
-                      {
-                          label: 'CLI',
-                          tab: 'ai',
-                          isActive: !isCodeTab,
-                      },
-                      {
-                          label: 'Code',
-                          tab: 'code',
-                          isActive: isCodeTab,
-                      },
-                  ];
+        type TabButton = Readonly<{
+            label: string;
+            tab: FrontendTab;
+            tabs: ReadonlyArray<FrontendTab>;
+            isActive: boolean;
+        }>;
+        const tabIndex = (tab: FrontendTab) => state.tabOrder.indexOf(tab);
+        const desktopTabButtons: ReadonlyArray<TabButton> = [
+            {
+                label: 'CLI',
+                tab: 'ai',
+                tabs: [
+                    'ai',
+                    'shell',
+                ],
+                isActive: !isCodeTab,
+            },
+            {
+                label: 'Code',
+                tab: 'code',
+                tabs: ['code'],
+                isActive: isCodeTab,
+            },
+        ];
+        const tabButtons: ReadonlyArray<TabButton> = isMobile
+            ? state.tabOrder.map(
+                  (tab): TabButton => ({
+                      label: tab === 'ai' ? 'AI' : tab === 'shell' ? 'Shell' : 'Code',
+                      tab,
+                      tabs: [tab],
+                      isActive: inputs.activeTab === tab,
+                  }),
+              )
+            : desktopTabButtons.toSorted(
+                  (a, b) => Math.min(...a.tabs.map(tabIndex)) - Math.min(...b.tabs.map(tabIndex)),
+              );
 
         const requestTab = (tab: FrontendTab) => {
             /**
@@ -512,6 +631,22 @@ export const VirPaneGroup = defineElement<{
             dispatch(new events.tabRequested(tab));
         };
 
+        const clearTabDrag = () => {
+            updateState({
+                draggedTab: undefined,
+                dropTargetTab: undefined,
+                dropPosition: undefined,
+            });
+        };
+
+        const tabsForButton = (tab: FrontendTab): ReadonlyArray<FrontendTab> =>
+            !isMobile && tab === 'ai'
+                ? [
+                      'ai',
+                      'shell',
+                  ]
+                : [tab];
+
         return html`
             ${isMobile
                 ? html`
@@ -521,15 +656,80 @@ export const VirPaneGroup = defineElement<{
                   `
                 : ''}
             <div class="tab-bar" role="tablist" ?data-mobile=${isMobile}>
+                ${isMobile
+                    ? ''
+                    : html`
+                          <span class="desktop-folder-name" title=${inputs.folder}>
+                              ${folderName}
+                          </span>
+                      `}
                 ${tabButtons.map(
                     ({label, tab, isActive}) => html`
                         <button
                             type="button"
                             class="tab"
                             role="tab"
+                            draggable="true"
                             ?data-selected=${isActive}
+                            ?data-dragging=${state.draggedTab === tab}
+                            ?data-drop-before=${state.dropTargetTab === tab &&
+                            state.dropPosition === 'before'}
+                            ?data-drop-after=${state.dropTargetTab === tab &&
+                            state.dropPosition === 'after'}
                             aria-selected=${isActive}
+                            aria-grabbed=${state.draggedTab === tab}
+                            title="Drag to reorder"
                             ${listen('click', () => requestTab(tab))}
+                            ${listen('dragstart', (event) => {
+                                event.dataTransfer?.setData('text/plain', tab);
+                                if (event.dataTransfer) {
+                                    event.dataTransfer.effectAllowed = 'move';
+                                }
+                                updateState({
+                                    draggedTab: tab,
+                                });
+                            })}
+                            ${listen('dragover', (event) => {
+                                event.preventDefault();
+                                if (event.dataTransfer) {
+                                    event.dataTransfer.dropEffect = 'move';
+                                }
+                                const target = event.currentTarget;
+                                if (!(target instanceof HTMLElement)) {
+                                    return;
+                                }
+                                const rect = target.getBoundingClientRect();
+                                const dropPosition =
+                                    event.clientX < rect.left + rect.width / 2 ? 'before' : 'after';
+                                if (
+                                    state.dropTargetTab !== tab ||
+                                    state.dropPosition !== dropPosition
+                                ) {
+                                    updateState({
+                                        dropTargetTab: tab,
+                                        dropPosition,
+                                    });
+                                }
+                            })}
+                            ${listen('drop', (event) => {
+                                event.preventDefault();
+                                const draggedTab = (event.dataTransfer?.getData('text/plain') ||
+                                    state.draggedTab) as FrontendTab | undefined;
+                                if (!draggedTab || !state.dropPosition) {
+                                    clearTabDrag();
+                                    return;
+                                }
+                                localStorageClient.tabOrder.write(
+                                    moveTabGroup(
+                                        state.tabOrder,
+                                        tabsForButton(draggedTab),
+                                        tabsForButton(tab),
+                                        state.dropPosition,
+                                    ),
+                                );
+                                clearTabDrag();
+                            })}
+                            ${listen('dragend', clearTabDrag)}
                         >
                             ${label}
                         </button>
@@ -596,7 +796,17 @@ export const VirPaneGroup = defineElement<{
                                                   kind: PaneKind.Ai,
                                                   active: inputs.active,
                                                   showAccessoryKeys: isMobile,
-                                              })}></${VirTerminal}>
+                                              })}
+                                                  ${listen(
+                                                      VirTerminal.events.attentionRequested,
+                                                      (event) =>
+                                                          dispatch(
+                                                              new events.attentionRequested(
+                                                                  event.detail,
+                                                              ),
+                                                          ),
+                                                  )}
+                                              ></${VirTerminal}>
                                           `,
                                       )}
                                   </div>
@@ -626,7 +836,11 @@ export const VirPaneGroup = defineElement<{
                                 kind: PaneKind.Shell,
                                 active: inputs.active,
                                 showAccessoryKeys: isMobile,
-                            })}></${VirTerminal}>
+                            })}
+                                ${listen(VirTerminal.events.attentionRequested, (event) =>
+                                    dispatch(new events.attentionRequested(event.detail)),
+                                )}
+                            ></${VirTerminal}>
                         </div>
                     </div>
                 </div>

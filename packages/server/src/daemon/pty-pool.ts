@@ -62,14 +62,42 @@ type PaneEntry = {
     /** Bounded scrollback used to replay output to a newly attaching client. */
     scrollbackChunks: string[];
     scrollbackBytes: number;
+    scrollbackInOsc: boolean;
+    scrollbackEscapePending: boolean;
 };
 
 /** Bounded replay buffer per pane for newly attached browser terminals. */
 const maxScrollbackBytes = 10_000_000;
 
 function appendScrollback(entry: PaneEntry, data: string): void {
-    entry.scrollbackChunks.push(data);
-    entry.scrollbackBytes += data.length;
+    let replayData = '';
+    for (const character of data) {
+        if (entry.scrollbackInOsc) {
+            replayData += character;
+            if (character === '\x07' || (entry.scrollbackEscapePending && character === '\\')) {
+                entry.scrollbackInOsc = false;
+                entry.scrollbackEscapePending = false;
+            } else {
+                entry.scrollbackEscapePending = character === '\x1b';
+            }
+        } else if (character === '\x07') {
+            // A standalone bell is a live attention event, not terminal history to replay.
+            entry.scrollbackEscapePending = false;
+        } else {
+            replayData += character;
+            if (entry.scrollbackEscapePending && character === ']') {
+                entry.scrollbackInOsc = true;
+                entry.scrollbackEscapePending = false;
+            } else {
+                entry.scrollbackEscapePending = character === '\x1b';
+            }
+        }
+    }
+    if (!replayData) {
+        return;
+    }
+    entry.scrollbackChunks.push(replayData);
+    entry.scrollbackBytes += replayData.length;
     while (entry.scrollbackBytes > maxScrollbackBytes && entry.scrollbackChunks.length > 1) {
         const dropped = entry.scrollbackChunks.shift();
         if (dropped) {
@@ -81,6 +109,8 @@ function appendScrollback(entry: PaneEntry, data: string): void {
 function clearScrollback(entry: PaneEntry): void {
     entry.scrollbackChunks = [];
     entry.scrollbackBytes = 0;
+    entry.scrollbackInOsc = false;
+    entry.scrollbackEscapePending = false;
 }
 
 const panes = new Map<string, PaneEntry>();
@@ -109,6 +139,8 @@ function ensureEntry(folder: string, kind: PaneKind): PaneEntry {
         subscribers: new Set(),
         scrollbackChunks: [],
         scrollbackBytes: 0,
+        scrollbackInOsc: false,
+        scrollbackEscapePending: false,
     };
     panes.set(key, entry);
     return entry;

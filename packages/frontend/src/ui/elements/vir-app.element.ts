@@ -6,11 +6,12 @@ import {
     ViraButton,
     ViraColorVariant,
     ViraEmphasis,
+    ViraIcon,
     ViraModal,
     ViraSize,
-    viraThemeByKeys,
 } from 'vira';
 import {getConfig, getFolders, touchRepo} from '../../util/api-client.js';
+import {shouldSurfaceAttention, type PaneAttentionRequest} from '../../util/interaction-state.js';
 import {localStorageClient, sidebarWidth} from '../../util/local-storage-client.js';
 import {
     defaultFrontendTab,
@@ -22,6 +23,7 @@ import {
 import {determineScreenSize, ScreenSize} from '../../util/screen-size.js';
 import '../../util/service-origin.js';
 import {applyTheme} from '../../util/theme.js';
+import {AgentStormMarkIcon} from '../icons/agent-storm-mark.icon.js';
 import {VirAuthModal} from './vir-auth-modal.element.js';
 import {VirBook} from './vir-book.element.js';
 import {VirPaneGroup} from './vir-pane-group.element.js';
@@ -128,6 +130,7 @@ function pathsForFolder(
 const folderInfoPollMs = 2000;
 
 const hamburgerIcon = createSizedIcon(lucideIcons.Menu, 16);
+const emptyStateIcon = createSizedIcon(AgentStormMarkIcon, 36);
 
 function clampSidebarWidth(value: number): number {
     if (!Number.isFinite(value)) {
@@ -176,6 +179,7 @@ type AppState = {
      */
     mobileSidebarOpen: boolean;
     paneRestartKeys: Record<string, number | undefined>;
+    attentionFolders: ReadonlySet<string>;
 };
 
 type AppUpdate = (newState: Partial<AppState>) => void;
@@ -203,6 +207,7 @@ export const VirApp = defineElement()({
             disposeTheme: undefined,
             mobileSidebarOpen: false,
             paneRestartKeys: {},
+            attentionFolders: new Set(),
         };
     },
     styles: css`
@@ -221,7 +226,7 @@ export const VirApp = defineElement()({
              * pre-measure window on first paint, and browsers without the API entirely.
              */
             height: var(--app-viewport-height, 100dvh);
-            font-family: sans-serif;
+            font-family: var(--app-font-sans, sans-serif);
             /*
              * Bind the whole app surface to vira's page-default color pair. vira only paints this
              * default on its own components, so transparent app surfaces (sidebar, tab strip) used
@@ -230,8 +235,8 @@ export const VirApp = defineElement()({
              * these declarations become invalid-at-computed-value (transparent background, inherited
              * color) — i.e. exactly the original upstream :host with no background/color at all.
              */
-            background: var(--vira-default-bg);
-            color: var(--vira-default-fg);
+            background: var(--app-bg, var(--vira-default-bg));
+            color: var(--app-text, var(--vira-default-fg));
             /*
              * Belt-and-braces against the browser's "scroll the focused input into view"
              * behavior: if the layout ever overflows the visible viewport (e.g. during the
@@ -248,30 +253,30 @@ export const VirApp = defineElement()({
         }
 
         .sidebar-divider {
-            flex: 0 0 4px;
+            flex: 0 0 1px;
             position: relative;
             cursor: col-resize;
-            background: ${viraThemeByKeys.grey['behind-bg'].decoration.background.value};
-            transition: background 120ms ease;
+            background: var(--app-border);
+            transition: background 160ms ease;
             /* Sit above the sidebar so the hit-area extension below catches the pointer
                instead of being eaten by sidebar event handlers. */
             z-index: 1;
             touch-action: none;
         }
 
-        /* Visible bar stays a thin 4px, but the user gets ~14px of grabbable surface. */
+        /* Keep the visible separator quiet while retaining a forgiving resize target. */
         .sidebar-divider::before {
             content: '';
             position: absolute;
             top: 0;
             bottom: 0;
-            left: -5px;
-            right: -5px;
+            left: -7px;
+            right: -7px;
         }
 
         .sidebar-divider:hover,
         .sidebar-divider.dragging {
-            background: ${viraThemeByKeys.grey.foreground.body.foreground.value};
+            background: var(--app-accent);
         }
 
         .stage {
@@ -279,15 +284,40 @@ export const VirApp = defineElement()({
             flex-grow: 1;
             min-width: 0;
             min-height: 0;
+            background: var(--app-bg);
         }
 
         .stage-empty {
             display: flex;
+            flex-direction: column;
             align-items: center;
             justify-content: center;
-            color: ${viraThemeByKeys.grey.foreground.placeholder.foreground.value};
-            font-size: 13px;
+            gap: 12px;
+            color: var(--app-muted);
+            font-size: 14px;
             height: 100%;
+            text-align: center;
+        }
+
+        .stage-empty-mark {
+            display: flex;
+            padding: 14px;
+            border: 1px solid var(--app-border);
+            border-radius: var(--app-radius-lg);
+            background: var(--app-surface);
+            box-shadow: var(--app-pane-shadow);
+        }
+
+        .stage-empty-title {
+            color: var(--app-text);
+            font-size: 15px;
+            font-weight: 600;
+        }
+
+        .stage-empty-copy {
+            margin-top: -6px;
+            color: var(--app-subtle);
+            font-size: 13px;
         }
 
         .pane-slot {
@@ -318,9 +348,14 @@ export const VirApp = defineElement()({
         :host([data-mobile]) .mobile-sidebar-trigger {
             display: inline-flex;
             position: absolute;
-            top: 6px;
-            left: 6px;
+            top: 8px;
+            left: 8px;
             z-index: 2;
+            --vira-button-border-radius: var(--app-radius-sm);
+            --vira-button-background-color: var(--app-surface-raised);
+            --vira-button-border-color: var(--app-border);
+            --vira-button-hover-background-color: var(--app-active);
+            --vira-button-hover-border-color: var(--app-border-strong);
         }
 
         /*
@@ -331,8 +366,8 @@ export const VirApp = defineElement()({
          */
         .mobile-sidebar-modal-content {
             width: 100%;
-            height: 70dvh;
-            max-height: 600px;
+            height: 78dvh;
+            max-height: 680px;
             display: flex;
         }
 
@@ -486,6 +521,7 @@ export const VirApp = defineElement()({
          */
         const resolution = resolveRoute(state.route.paths, state.folderInfo);
         const activeFolder = resolution.folder?.path;
+        const activeTab = tabFromRoute(state.route);
         if (resolution.redirectToRoot) {
             void Promise.resolve().then(() =>
                 router.setRoute({
@@ -511,9 +547,11 @@ export const VirApp = defineElement()({
             });
         }
 
+        const attentionCount = state.attentionFolders.size;
+        const titlePrefix = attentionCount ? `(${attentionCount}) ` : '';
         document.title = resolution.folder
-            ? `agent-storm • ${resolution.folder.name}`
-            : 'agent-storm';
+            ? `${titlePrefix}agent-storm • ${resolution.folder.name}`
+            : `${titlePrefix}agent-storm`;
 
         const onDividerPointerDown = (event: PointerEvent) => {
             event.preventDefault();
@@ -586,7 +624,19 @@ export const VirApp = defineElement()({
          * sidebar (mobile) can share them. `folderActivated` also closes the mobile sidebar modal —
          * a no-op on desktop because the modal isn't open there anyway.
          */
+        const clearFolderAttention = (folderPath: string) => {
+            if (!state.attentionFolders.has(folderPath)) {
+                return;
+            }
+            const attentionFolders = new Set(state.attentionFolders);
+            attentionFolders.delete(folderPath);
+            updateState({
+                attentionFolders,
+            });
+        };
+
         const handleFolderActivated = (folderPath: string) => {
+            clearFolderAttention(folderPath);
             /**
              * Synchronous activation path: the folder is already in vir-app's `folderInfo` cache,
              * so we can set the route immediately. Most clicks hit this branch.
@@ -661,6 +711,48 @@ export const VirApp = defineElement()({
             }
         };
 
+        const handleAttentionRequested = ({folder, kind}: PaneAttentionRequest) => {
+            if (kind !== PaneKind.Ai) {
+                return;
+            }
+            const aiPaneVisible =
+                !state.folderInfo.get(folder)?.aiHidden &&
+                (isMobile ? activeTab === 'ai' : activeTab !== 'code');
+            if (
+                !shouldSurfaceAttention({
+                    sameFolder: activeFolder === folder,
+                    aiPaneVisible,
+                    pageVisible: document.visibilityState === 'visible',
+                    pageFocused: document.hasFocus(),
+                })
+            ) {
+                clearFolderAttention(folder);
+                return;
+            }
+
+            const attentionFolders = new Set(state.attentionFolders);
+            attentionFolders.add(folder);
+            updateState({
+                attentionFolders,
+            });
+
+            if (Notification.permission !== 'granted') {
+                return;
+            }
+            const folderInfo = state.folderInfo.get(folder);
+            const folderName = folderInfo?.name || folder.split('/').findLast(Boolean) || folder;
+            const notification = new Notification('Claude needs your input', {
+                body: `${folderName} is waiting for your response.`,
+                icon: '/claude-favicon-96x96.png',
+                tag: `agent-storm-attention:${folder}`,
+            });
+            notification.addEventListener('click', () => {
+                notification.close();
+                window.focus();
+                handleFolderActivated(folder);
+            });
+        };
+
         const handleFoldersRemoved = (paths: ReadonlyArray<string>) => {
             const removed = new Set(paths);
             /**
@@ -703,6 +795,7 @@ export const VirApp = defineElement()({
         return html`
             <${VirSidebar.assign({
                 activeFolder,
+                attentionFolders: state.attentionFolders,
             })}
                 ${listen(VirSidebar.events.folderActivated, (event) =>
                     handleFolderActivated(event.detail),
@@ -742,7 +835,17 @@ export const VirApp = defineElement()({
                 ></${ViraButton}>
                 ${state.openedFolders.length === 0
                     ? html`
-                          <div class="stage-empty">Select a repo to open its panes.</div>
+                          <div class="stage-empty">
+                              <span class="stage-empty-mark">
+                                  <${ViraIcon.assign({
+                                      icon: emptyStateIcon,
+                                  })}></${ViraIcon}>
+                              </span>
+                              <span class="stage-empty-title">Choose a workspace</span>
+                              <span class="stage-empty-copy">
+                                  Select a repository from the sidebar to begin.
+                              </span>
+                          </div>
                       `
                     : ''}
                 ${repeat(
@@ -767,13 +870,16 @@ export const VirApp = defineElement()({
                                     folder,
                                     aiHidden: !!info?.aiHidden,
                                     active,
-                                    activeTab: tabFromRoute(state.route),
+                                    activeTab,
                                     screenSize: state.screenSize,
                                     aiRestartKey:
                                         state.paneRestartKeys[`${folder}:${PaneKind.Ai}`] || 0,
                                 })}
                                     ${listen(VirPaneGroup.events.tabRequested, (event) => {
                                         const requestedTab = event.detail;
+                                        if (requestedTab === 'ai' && activeFolder) {
+                                            clearFolderAttention(activeFolder);
+                                        }
                                         router.setRoute({
                                             paths: state.route.paths,
                                             /**
@@ -789,6 +895,9 @@ export const VirApp = defineElement()({
                                                       },
                                         });
                                     })}
+                                    ${listen(VirPaneGroup.events.attentionRequested, (event) =>
+                                        handleAttentionRequested(event.detail),
+                                    )}
                                 ></${VirPaneGroup}>
                             </div>
                         `;
@@ -819,6 +928,7 @@ export const VirApp = defineElement()({
                 <div class="mobile-sidebar-modal-content">
                     <${VirSidebar.assign({
                         activeFolder,
+                        attentionFolders: state.attentionFolders,
                         hideBorder: true,
                         mobileModal: true,
                     })}

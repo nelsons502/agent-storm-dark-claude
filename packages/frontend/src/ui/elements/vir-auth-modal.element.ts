@@ -25,10 +25,18 @@ export const VirAuthModal = defineElement()({
         };
     },
     styles: css`
+        :host {
+            font-family: var(--app-font-sans, ui-sans-serif, system-ui, sans-serif);
+        }
+
+        ${ViraModal} {
+            border-radius: var(--app-radius-lg);
+        }
+
         .body {
             display: flex;
             flex-direction: column;
-            gap: 12px;
+            gap: 16px;
             width: min(520px, calc(100vw - 48px));
             max-width: 100%;
             box-sizing: border-box;
@@ -36,14 +44,29 @@ export const VirAuthModal = defineElement()({
         }
 
         .description {
-            font-size: 13px;
-            color: ${viraThemeByKeys.grey.foreground['non-body'].foreground.value};
+            font-size: 14px;
+            line-height: 1.55;
+            color: var(
+                --app-muted,
+                ${viraThemeByKeys.grey.foreground['non-body'].foreground.value}
+            );
+        }
+
+        code {
+            padding: 2px 5px;
+            border: 1px solid var(--app-border);
+            border-radius: 5px;
+            color: var(--app-text);
+            background: var(--app-hover);
+            font-family: 'Atkinson Hyperlegible Mono', ui-monospace, monospace;
+            font-size: 0.92em;
         }
 
         .footer {
             display: flex;
             justify-content: flex-end;
             gap: 8px;
+            padding-top: 4px;
         }
 
         ${ViraInput} {

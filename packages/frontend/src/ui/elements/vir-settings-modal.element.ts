@@ -104,23 +104,36 @@ export const VirSettingsModal = defineElement<{
         };
     },
     styles: css`
+        :host {
+            font-family: var(--app-font-sans, ui-sans-serif, system-ui, sans-serif);
+        }
+
+        ${ViraModal} {
+            border-radius: var(--app-radius-lg);
+        }
+
         .body {
             display: flex;
             flex-direction: column;
-            gap: 16px;
-            min-width: 540px;
-            max-width: 720px;
+            gap: 18px;
+            width: min(680px, calc(100dvw - 96px));
+            min-width: min(540px, calc(100dvw - 96px));
+            max-width: 100%;
+            box-sizing: border-box;
         }
 
         .footer {
             display: flex;
+            align-items: center;
             justify-content: flex-end;
             gap: 8px;
+            padding-top: 16px;
+            border-top: 1px solid var(--app-border);
         }
 
         .error {
             padding: 8px 12px;
-            border-radius: 6px;
+            border-radius: var(--app-radius-sm);
             border: 1px solid currentColor;
             color: ${viraThemeByKeys.red.foreground.body.foreground.value};
             background: ${viraThemeByKeys.red['behind-bg'].body.background.value};
@@ -131,6 +144,18 @@ export const VirSettingsModal = defineElement<{
             padding: 24px;
             text-align: center;
             color: ${viraThemeByKeys.grey.foreground.body.foreground.value};
+        }
+
+        @media (max-width: 640px) {
+            .body {
+                width: calc(100dvw - 32px);
+                min-width: 0;
+                gap: 14px;
+            }
+
+            .footer {
+                flex-wrap: wrap;
+            }
         }
     `,
     render({inputs, state, updateState, dispatch, events}) {

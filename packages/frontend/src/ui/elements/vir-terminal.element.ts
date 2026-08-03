@@ -1,13 +1,21 @@
 import {PaneKind, ptyWebSocket, type Theme} from '@agent-storm/common';
-import {colorCss} from '@electrovir/color';
 import {FitAddon} from '@xterm/addon-fit';
 import {WebLinksAddon} from '@xterm/addon-web-links';
 import {WebglAddon} from '@xterm/addon-webgl';
 import {Terminal, type ITheme} from '@xterm/xterm';
-import {css, defineElement, html, listen, onDomCreated, unsafeCSS} from 'element-vir';
+import {
+    css,
+    defineElement,
+    defineElementEvent,
+    html,
+    listen,
+    onDomCreated,
+    unsafeCSS,
+} from 'element-vir';
 import {createSizedIcon, lucideIcons, ViraIcon, viraThemeByKeys} from 'vira';
 import {client, getConfig, uploadFile} from '../../util/api-client.js';
 import {ensureSecret} from '../../util/auth.js';
+import {type PaneAttentionRequest} from '../../util/interaction-state.js';
 import {resolveTheme, terminalThemeBackground} from '../../util/theme.js';
 import {defaultXtermStyles} from './xterm-styles.js';
 
@@ -160,7 +168,7 @@ const lightTerminalTheme: ITheme = {
  * background, warm off-white text, and the Claude clay/coral (`#d97757`) cursor. ANSI colors are
  * softened (not pure/neon) so output reads comfortably on the dark background.
  */
-const darkTerminalTheme: ITheme = {
+const darkClaudeTerminalTheme: ITheme = {
     background: terminalThemeBackground.darkClaude,
     /*
      * Warm off-white body text. Claude Code's bold headers render in this default foreground (bold
@@ -168,7 +176,7 @@ const darkTerminalTheme: ITheme = {
      * heavier off-white, matching Claude Code's own dark mode where bold is bright text and orange
      * is reserved for emphasis/inline tokens (see brightBlue below).
      */
-    foreground: '#edece8',
+    foreground: '#f0eee6',
     cursor: '#d97757',
     cursorAccent: terminalThemeBackground.darkClaude,
     selectionBackground: 'rgba(217, 119, 87, 0.24)',
@@ -196,9 +204,34 @@ const darkTerminalTheme: ITheme = {
     brightWhite: '#f5f0e6',
 };
 
+/** Crisp blue-slate terminal palette for Dark Codex. */
+const darkCodexTerminalTheme: ITheme = {
+    background: terminalThemeBackground.darkCodex,
+    foreground: '#d8e0ea',
+    cursor: '#82aaff',
+    cursorAccent: terminalThemeBackground.darkCodex,
+    selectionBackground: 'rgba(130, 170, 255, 0.26)',
+    black: '#161b22',
+    red: '#ff7b72',
+    green: '#7ee787',
+    yellow: '#d29922',
+    blue: '#79c0ff',
+    magenta: '#d2a8ff',
+    cyan: '#56d4dd',
+    white: '#b1bac4',
+    brightBlack: '#6e7681',
+    brightRed: '#ffa198',
+    brightGreen: '#9be9a8',
+    brightYellow: '#e3b341',
+    brightBlue: '#a5d6ff',
+    brightMagenta: '#e2c5ff',
+    brightCyan: '#76e3ea',
+    brightWhite: '#f0f6fc',
+};
+
 /**
  * Neutral dark xterm palette for electrovir's plain `dark` theme — a cool, standard dark terminal
- * (grey cursor, conventional ANSI), distinct from the warm clay {@link darkTerminalTheme}.
+ * (grey cursor, conventional ANSI), distinct from the branded dark palettes above.
  */
 const darkNeutralTerminalTheme: ITheme = {
     background: terminalThemeBackground.dark,
@@ -233,7 +266,9 @@ const darkNeutralTerminalTheme: ITheme = {
 function resolveTerminalTheme(theme: Theme | undefined): ITheme {
     const resolved = resolveTheme(theme);
     if (resolved === 'dark-claude') {
-        return darkTerminalTheme;
+        return darkClaudeTerminalTheme;
+    } else if (resolved === 'dark-codex') {
+        return darkCodexTerminalTheme;
     } else if (resolved === 'dark') {
         return darkNeutralTerminalTheme;
     }
@@ -348,6 +383,9 @@ export const VirTerminal = defineElement<{
     showAccessoryKeys: boolean;
 }>()({
     tagName: 'vir-terminal',
+    events: {
+        attentionRequested: defineElementEvent<PaneAttentionRequest>(),
+    },
     state() {
         return {
             terminal: undefined as Terminal | undefined,
@@ -384,7 +422,9 @@ export const VirTerminal = defineElement<{
             width: 100%;
             height: 100%;
             box-sizing: border-box;
-            padding: 2px;
+            padding: 7px 6px 6px 9px;
+            border-radius: inherit;
+            overflow: hidden;
             /* Driven by theme.ts's applyResolvedTheme so the padding tracks the active theme; the
                light default covers the brief pre-apply window on first paint. The xterm canvas
                paints its own matching background over the rest of the host. */
@@ -419,19 +459,34 @@ export const VirTerminal = defineElement<{
             cursor: text;
         }
 
+        .xterm .xterm-viewport::-webkit-scrollbar {
+            width: 7px;
+        }
+
+        .xterm .xterm-viewport::-webkit-scrollbar-track {
+            background: transparent;
+        }
+
+        .xterm .xterm-viewport::-webkit-scrollbar-thumb {
+            background: var(--app-border-strong);
+            border: 2px solid transparent;
+            border-radius: 999px;
+            background-clip: padding-box;
+        }
+
         .upload-error {
             position: absolute;
-            top: 8px;
-            right: 8px;
+            top: 10px;
+            right: 10px;
             max-width: 70%;
             padding: 6px 10px;
-            border-radius: 6px;
-            font-family: ui-sans-serif, system-ui, sans-serif;
+            border-radius: var(--app-radius-sm);
+            font-family: var(--app-font-sans, ui-sans-serif, system-ui, sans-serif);
             font-size: 12px;
             color: ${viraThemeByKeys.red.foreground.body.foreground.value};
             background: ${viraThemeByKeys.red['behind-bg'].body.background.value};
             border: 1px solid ${viraThemeByKeys.red.foreground.decoration.foreground.value};
-            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+            box-shadow: var(--app-overlay-shadow);
             pointer-events: none;
             white-space: pre-wrap;
         }
@@ -448,8 +503,8 @@ export const VirTerminal = defineElement<{
             gap: 6px;
             padding: 6px;
             box-sizing: border-box;
-            background: ${viraThemeByKeys.grey['behind-bg'].body.background.value};
-            border-top: 1px solid ${viraThemeByKeys.grey['behind-bg'].decoration.background.value};
+            background: var(--app-chrome-bg);
+            border-top: 1px solid var(--app-border);
             /* Sit inside the iPhone home-indicator safe area when the keyboard is closed. */
             padding-bottom: max(6px, env(safe-area-inset-bottom));
 
@@ -462,23 +517,29 @@ export const VirTerminal = defineElement<{
                 min-width: 0;
                 min-height: 40px;
                 padding: 0 4px;
-                border: 1px solid ${viraThemeByKeys.grey['behind-bg'].decoration.background.value};
-                border-radius: 6px;
-                font-family: ui-sans-serif, system-ui, sans-serif;
+                border: 1px solid var(--app-border);
+                border-radius: var(--app-radius-sm);
+                font-family: var(--app-font-sans, ui-sans-serif, system-ui, sans-serif);
                 font-size: 16px;
-                color: ${viraThemeByKeys.grey.foreground.body.foreground.value};
-                background: ${viraThemeByKeys.grey['behind-fg']['small-body'].background.value};
+                color: var(--app-text);
+                background: var(--app-surface-raised);
                 cursor: pointer;
                 touch-action: manipulation;
                 user-select: none;
+                transition:
+                    background-color 120ms ease,
+                    border-color 120ms ease,
+                    transform 120ms ease;
 
                 &:active {
-                    background: ${viraThemeByKeys.grey['behind-bg'].body.background.value};
+                    background: var(--app-active);
+                    transform: translateY(1px);
                 }
 
                 &[data-armed] {
-                    ${colorCss(viraThemeByKeys.blue.foreground.body)};
-                    border-color: ${viraThemeByKeys.blue.foreground.body.background.value};
+                    color: var(--app-accent);
+                    background: var(--app-accent-soft);
+                    border-color: var(--app-accent);
                 }
             }
         }
@@ -491,7 +552,7 @@ export const VirTerminal = defineElement<{
             clearTimeout(state.uploadErrorTimeout);
         }
     },
-    render({inputs, state, updateState}) {
+    render({inputs, state, updateState, dispatch, events}) {
         /**
          * Fire fit-and-resend on the false→true active transition. A pane that was `display: none`
          * while the user resized the window won't have observed live `ResizeObserver` entries; this
@@ -590,6 +651,14 @@ export const VirTerminal = defineElement<{
                         terminal.loadAddon(new WebLinksAddon());
                     }
                     terminal.open(element);
+                    terminal.onBell(() => {
+                        dispatch(
+                            new events.attentionRequested({
+                                folder: inputs.folder,
+                                kind: inputs.kind,
+                            }),
+                        );
+                    });
 
                     /**
                      * WebGL must be attached after `open()` because it needs the DOM-mounted

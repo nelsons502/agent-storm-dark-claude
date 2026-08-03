@@ -1,3 +1,94 @@
+:root {
+    color-scheme: light;
+    --app-font-sans: 'Atkinson Hyperlegible Next', -apple-system, BlinkMacSystemFont, 'Segoe UI',
+        sans-serif;
+    --app-bg: #ececea;
+    --app-sidebar-bg: #f5f5f3;
+    --app-chrome-bg: rgba(250, 250, 248, 0.96);
+    --app-surface: #ffffff;
+    --app-surface-raised: #ffffff;
+    --app-hover: rgba(24, 24, 22, 0.055);
+    --app-active: rgba(24, 24, 22, 0.09);
+    --app-border: rgba(24, 24, 22, 0.1);
+    --app-border-strong: rgba(24, 24, 22, 0.18);
+    --app-text: #252522;
+    --app-muted: #696964;
+    --app-subtle: #92928c;
+    --app-accent: #2563d9;
+    --app-accent-soft: rgba(37, 99, 217, 0.12);
+    --app-pane-shadow: 0 1px 2px rgba(24, 24, 22, 0.06), 0 4px 14px rgba(24, 24, 22, 0.035);
+    --app-overlay-shadow: 0 18px 50px rgba(24, 24, 22, 0.18);
+    --app-radius-sm: 7px;
+    --app-radius-md: 10px;
+    --app-radius-lg: 14px;
+    --vira-form-radius: 8px;
+    --vira-form-wrapper-radius: 14px;
+    --vira-form-modal-backdrop-color: rgba(16, 16, 15, 0.42);
+}
+
+:root[data-app-theme='dark'] {
+    color-scheme: dark;
+    --app-bg: #151617;
+    --app-sidebar-bg: #1d1e20;
+    --app-chrome-bg: rgba(29, 30, 32, 0.96);
+    --app-surface: #1b1c1e;
+    --app-surface-raised: #242527;
+    --app-hover: rgba(255, 255, 255, 0.055);
+    --app-active: rgba(255, 255, 255, 0.09);
+    --app-border: rgba(255, 255, 255, 0.085);
+    --app-border-strong: rgba(255, 255, 255, 0.17);
+    --app-text: #ececee;
+    --app-muted: #a4a4a8;
+    --app-subtle: #74757a;
+    --app-accent: #7aa2f7;
+    --app-accent-soft: rgba(122, 162, 247, 0.14);
+    --app-pane-shadow: 0 1px 2px rgba(0, 0, 0, 0.25), 0 8px 24px rgba(0, 0, 0, 0.14);
+    --app-overlay-shadow: 0 20px 60px rgba(0, 0, 0, 0.46);
+    --vira-form-modal-backdrop-color: rgba(0, 0, 0, 0.58);
+}
+
+:root[data-app-theme='dark-claude'] {
+    color-scheme: dark;
+    --app-bg: #141413;
+    --app-sidebar-bg: #1d1c1b;
+    --app-chrome-bg: rgba(29, 28, 27, 0.96);
+    --app-surface: #181817;
+    --app-surface-raised: #252422;
+    --app-hover: rgba(240, 238, 230, 0.06);
+    --app-active: rgba(240, 238, 230, 0.1);
+    --app-border: rgba(240, 238, 230, 0.09);
+    --app-border-strong: rgba(240, 238, 230, 0.18);
+    --app-text: #f0eee6;
+    --app-muted: #b0ada5;
+    --app-subtle: #77736c;
+    --app-accent: #d97757;
+    --app-accent-soft: rgba(217, 119, 87, 0.16);
+    --app-pane-shadow: 0 1px 2px rgba(0, 0, 0, 0.28), 0 8px 24px rgba(0, 0, 0, 0.16);
+    --app-overlay-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+    --vira-form-modal-backdrop-color: rgba(10, 9, 8, 0.62);
+}
+
+:root[data-app-theme='dark-codex'] {
+    color-scheme: dark;
+    --app-bg: #0b0f14;
+    --app-sidebar-bg: #121820;
+    --app-chrome-bg: rgba(18, 24, 32, 0.96);
+    --app-surface: #0f141b;
+    --app-surface-raised: #19212b;
+    --app-hover: rgba(174, 203, 255, 0.065);
+    --app-active: rgba(174, 203, 255, 0.11);
+    --app-border: rgba(148, 175, 209, 0.1);
+    --app-border-strong: rgba(148, 175, 209, 0.2);
+    --app-text: #e6edf3;
+    --app-muted: #9ba8b7;
+    --app-subtle: #667586;
+    --app-accent: #82aaff;
+    --app-accent-soft: rgba(130, 170, 255, 0.16);
+    --app-pane-shadow: 0 1px 2px rgba(0, 0, 0, 0.32), 0 10px 28px rgba(0, 0, 0, 0.2);
+    --app-overlay-shadow: 0 20px 60px rgba(0, 0, 0, 0.58);
+    --vira-form-modal-backdrop-color: rgba(5, 7, 10, 0.68);
+}
+
 html,
 body {
     margin: 0;
@@ -16,14 +107,26 @@ body {
        follows the Vira theme client's light/dark CSS variables (set on :root) instead of the
        browser-default white. These are the default-theme vars vir-app's host applies, referenced
        directly here so html/body stay in sync. */
-    background-color: var(--vira-default-bg, white);
-    color: var(--vira-default-fg, black);
+    background-color: var(--app-bg, var(--vira-default-bg, white));
+    color: var(--app-text, var(--vira-default-fg, black));
+    font-family: var(--app-font-sans);
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
     /* Stop iOS from rubber-banding the whole page when a touch gesture inside the app reaches
        the edge of its container. `overscroll-behavior: none` short-circuits the scroll chain; the
        `overflow: hidden` belt-and-braces blocks the document itself from accepting touch scrolls
        at all so the app's own scroll regions (sidebar, terminals) own every gesture. */
     overflow: hidden;
     overscroll-behavior: none;
+}
+
+* {
+    scrollbar-color: var(--app-border-strong) transparent;
+    scrollbar-width: thin;
+}
+
+::selection {
+    background: var(--app-accent-soft);
 }
 
 /* cspell:word André */

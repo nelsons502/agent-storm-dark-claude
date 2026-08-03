@@ -32,7 +32,8 @@ export enum SidebarGrouping {
  * Which color theme the frontend applies. `Light` is the original, upstream look and is left
  * completely untouched by this fork. `Dark` is electrovir's upstream dark mode — vira's built-in
  * dark theme (neutral cool greys). `DarkClaude` applies a dark color theme modeled after the Claude
- * desktop / Claude Code aesthetic (warm near-black surfaces, clay accent). `Auto` follows the OS
+ * desktop / Claude Code aesthetic (warm near-black surfaces, clay accent). `DarkCodex` uses cool
+ * blue-black surfaces and a blue accent modeled after Codex. `Auto` follows the OS
  * `prefers-color-scheme`, applying `Dark` when the system is dark and `Light` otherwise.
  *
  * The first variant is the default (object-shape-tester's `enumShape` picks the first value when
@@ -43,5 +44,6 @@ export enum Theme {
     Light = 'light',
     Dark = 'dark',
     DarkClaude = 'dark-claude',
+    DarkCodex = 'dark-codex',
     Auto = 'auto',
 }

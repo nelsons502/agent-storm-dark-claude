@@ -104,4 +104,18 @@ export const localStorageClient = {
             clamp(Number.parseFloat(raw), paneSplit.min, paneSplit.max, paneSplit.default),
         serialize: (value) => String(value),
     }),
+    tabOrder: defineSetting<ReadonlyArray<FrontendTab>>({
+        key: 'agent-storm:tab-order',
+        defaultValue: defaultTabOrder,
+        parse: (raw) => {
+            try {
+                return sanitizeTabOrder(JSON.parse(raw));
+            } catch {
+                return defaultTabOrder;
+            }
+        },
+        serialize: (value) => JSON.stringify(sanitizeTabOrder(value)),
+    }),
 };
+import {defaultTabOrder, sanitizeTabOrder} from './interaction-state.js';
+import {type FrontendTab} from './router.js';

@@ -35,7 +35,6 @@ import {
     ViraMenuTrigger,
     ViraModal,
     ViraPopUpTrigger,
-    viraShadows,
     ViraSize,
     viraThemeByKeys,
 } from 'vira';
@@ -63,6 +62,7 @@ const loaderIcon = createSizedIcon(LoaderAnimated24Icon, 12);
 const dashIcon = createSizedIcon(lucideIcons.Minus, 12);
 const exitedIcon = createSizedIcon(lucideIcons.X, 12);
 const mergedCheckIcon = createSizedIcon(lucideIcons.Check, 14);
+const attentionIcon = createSizedIcon(lucideIcons.Bell, 13);
 
 const buttonIconSize = 16;
 const searchIcon = createSizedIcon(lucideIcons.Search, buttonIconSize);
@@ -158,6 +158,7 @@ type SidebarState = {
      * the check) keeps the banner hidden. `undefined` while the first poll is still in flight.
      */
     updateStatus: UpdateStatus | undefined;
+    notificationPermission: NotificationPermission;
 };
 
 type SidebarUpdate = (newState: Partial<SidebarState>) => void;
@@ -169,6 +170,7 @@ type PaneRestartedEvent = {
 
 export const VirSidebar = defineElement<{
     activeFolder: string | undefined;
+    attentionFolders: ReadonlySet<string>;
     hideBorder?: boolean | undefined;
     mobileModal?: boolean | undefined;
 }>()({
@@ -225,6 +227,7 @@ export const VirSidebar = defineElement<{
             searchQuery: '',
             repos: [],
             updateStatus: undefined,
+            notificationPermission: Notification.permission,
         };
     },
     styles: css`
@@ -232,9 +235,12 @@ export const VirSidebar = defineElement<{
             display: flex;
             flex-direction: column;
             height: 100%;
-            font-family: ui-sans-serif, system-ui, sans-serif;
+            box-sizing: border-box;
+            font-family: var(--app-font-sans, ui-sans-serif, system-ui, sans-serif);
             font-size: 12px;
-            border-right: 1px solid ${viraThemeByKeys.grey['behind-bg'].decoration.background.value};
+            color: var(--app-text);
+            background: var(--app-sidebar-bg);
+            border-right: 1px solid var(--app-border);
             /* No overflow clipping here on purpose: the header search pop-up grows past the
                sidebar's right edge, and an overflow container at this level would clip it (the
                pop-up manager constrains pop-ups to the nearest overflow ancestor). Scrolling lives
@@ -254,39 +260,48 @@ export const VirSidebar = defineElement<{
             display: flex;
             align-items: center;
             justify-content: space-between;
-            padding: 8px 10px;
-            border-bottom: 1px solid
-                ${viraThemeByKeys.grey['behind-bg'].decoration.background.value};
-            gap: 6px;
+            min-height: 48px;
+            box-sizing: border-box;
+            padding: 8px 10px 8px 12px;
+            border-bottom: 1px solid var(--app-border);
+            gap: 8px;
         }
 
         .title {
             display: inline-flex;
             align-items: center;
-            gap: 6px;
+            gap: 8px;
             font-weight: 600;
-            letter-spacing: 0.02em;
-            color: ${viraThemeByKeys.grey.foreground.header.foreground.value};
+            letter-spacing: -0.01em;
+            color: var(--app-text);
             font-size: 13px;
+            white-space: nowrap;
         }
 
         .header-actions {
             display: flex;
-            gap: 6px;
+            gap: 2px;
             align-items: center;
+        }
+
+        ${ViraButton} {
+            --vira-button-border-radius: var(--app-radius-sm);
         }
 
         /* Card behind the search input so the pop-up reads as a panel, not a bare floating input.
            Mirrors vira's own menu pop-up surface (background/border/radius/shadow). */
         .search-popup {
-            padding: 10px;
-            min-width: 220px;
+            padding: 8px;
+            min-width: 260px;
             box-sizing: border-box;
-            background-color: ${viraFormCssVars['vira-form-background-color'].value};
+            background-color: var(
+                --app-surface-raised,
+                ${viraFormCssVars['vira-form-background-color'].value}
+            );
             color: ${viraFormCssVars['vira-form-foreground-color'].value};
-            border: 1px solid ${viraFormCssVars['vira-form-border-color'].value};
-            border-radius: ${viraFormCssVars['vira-form-radius'].value};
-            ${viraShadows.menuShadow}
+            border: 1px solid var(--app-border-strong);
+            border-radius: var(--app-radius-md);
+            box-shadow: var(--app-overlay-shadow);
         }
 
         .list {
@@ -297,32 +312,43 @@ export const VirSidebar = defineElement<{
             min-height: 0;
             overflow-y: auto;
             overflow-x: hidden;
-            padding: 4px 0 32px;
+            padding: 7px 6px 32px;
             /* Atkinson Hyperlegible Next — proportional sans designed for legibility (especially
                for low-vision readers). The rest of the sidebar (logo title, error banner, etc.)
                keeps the system sans-serif inherited from :host. */
-            font-family: 'Atkinson Hyperlegible Next', ui-sans-serif, system-ui, sans-serif;
+            font-family: var(--app-font-sans, ui-sans-serif, system-ui, sans-serif);
             font-size: 13px;
-            font-weight: 300;
-            letter-spacing: 0.01em;
+            font-weight: 400;
+            letter-spacing: 0;
         }
 
         .repo-header {
-            padding: 6px 10px 2px;
+            min-height: 28px;
+            padding: 9px 6px 2px;
             font-weight: 600;
+            font-size: 11px;
             display: flex;
             justify-content: space-between;
             align-items: center;
             gap: 6px;
+            color: var(--app-muted);
         }
 
         .row {
             display: flex;
             align-items: center;
-            gap: 4px;
-            padding: 0 10px;
+            gap: 5px;
+            min-height: 30px;
+            box-sizing: border-box;
+            padding: 3px 7px;
+            border: 1px solid transparent;
+            border-radius: var(--app-radius-sm);
             cursor: pointer;
             user-select: none;
+            transition:
+                color 140ms ease,
+                background-color 140ms ease,
+                border-color 140ms ease;
         }
 
         .row .chips + .name {
@@ -330,21 +356,22 @@ export const VirSidebar = defineElement<{
         }
 
         .row:hover {
-            background-color: ${viraThemeByKeys.grey['behind-fg']['small-body'].background.value};
+            background-color: var(--app-hover);
         }
 
         .row[data-active] {
-            /* Mirror the Claude desktop app: the selected row is a subtly lighter dark grey, not a
-               colored tint. theme.ts sets --active-row-bg in dark mode; light mode falls back to
-               vira's stock blue tint. */
-            background-color: var(
-                --active-row-bg,
-                ${viraThemeByKeys.blue['behind-fg']['small-body'].background.value}
-            );
+            color: var(--app-text);
+            background-color: var(--app-active-row, var(--app-active));
+            border-color: var(--app-border);
+            box-shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
+        }
+
+        .row[data-active] .name {
+            font-weight: 600;
         }
 
         .row[data-indented] {
-            padding-left: 22px;
+            padding-left: 17px;
         }
 
         .chips {
@@ -363,8 +390,10 @@ export const VirSidebar = defineElement<{
         .name {
             flex-grow: 1;
             min-width: 0;
-            overflow-wrap: anywhere;
-            padding: 2px 0;
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+            padding: 1px 0;
         }
 
         .name[data-pr-open] {
@@ -387,9 +416,29 @@ export const VirSidebar = defineElement<{
             flex-shrink: 0;
         }
 
+        .attention-indicator {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 16px;
+            height: 16px;
+            flex-shrink: 0;
+            color: var(--app-accent);
+            filter: drop-shadow(0 0 5px var(--app-accent-soft));
+            animation: attention-pulse 1.8s ease-in-out infinite;
+        }
+
+        @keyframes attention-pulse {
+            50% {
+                opacity: 0.55;
+                transform: scale(0.9);
+            }
+        }
+
         .actions {
             display: inline-flex;
             gap: 2px;
+            transition: opacity 140ms ease;
         }
 
         /* Groups the always-visible "add worktree" button with the hover-gated actions menu so the
@@ -402,7 +451,7 @@ export const VirSidebar = defineElement<{
         }
 
         .row .actions {
-            opacity: 0.35;
+            opacity: 0;
         }
 
         .repo-header .actions {
@@ -410,31 +459,37 @@ export const VirSidebar = defineElement<{
         }
 
         .row:hover .actions,
+        .row:focus-within .actions,
         .row[data-menu-open] .actions,
         .repo-header:hover .actions,
+        .repo-header:focus-within .actions,
         .repo-header[data-menu-open] .actions {
             opacity: 1;
         }
 
         .error {
-            padding: 8px 10px;
+            margin: 8px;
+            padding: 9px 10px;
+            border-radius: var(--app-radius-sm);
             ${colorCss(viraThemeByKeys.red['behind-bg'].body)};
-            border-bottom: 1px solid ${viraThemeByKeys.red['behind-bg'].decoration.background.value};
+            border: 1px solid ${viraThemeByKeys.red['behind-bg'].decoration.background.value};
             white-space: pre-wrap;
         }
 
         .update-banner {
             flex-shrink: 0;
-            padding: 6px 10px;
+            margin: 0 8px 8px;
+            padding: 7px 10px;
             font-size: 11px;
             text-align: center;
+            border-radius: var(--app-radius-sm);
             /**
              * The vira palette has no "orange" key — yellow is the warning slot and reads as
              * orange-adjacent in both light and dark modes, which matches the user's intent
              * (attention-grabbing but not error-red).
              */
             ${colorCss(viraThemeByKeys.yellow['behind-bg'].body)};
-            border-top: 1px solid ${viraThemeByKeys.yellow['behind-bg'].decoration.background.value};
+            border: 1px solid ${viraThemeByKeys.yellow['behind-bg'].decoration.background.value};
         }
 
         :host([data-mobile-modal]) .update-banner {
@@ -443,9 +498,13 @@ export const VirSidebar = defineElement<{
         }
 
         .empty {
-            padding: 16px 10px;
-            color: ${viraThemeByKeys.grey.foreground.placeholder.foreground.value};
+            margin: 8px;
+            padding: 24px 14px;
+            border: 1px dashed var(--app-border-strong);
+            border-radius: var(--app-radius-md);
+            color: var(--app-muted);
             text-align: center;
+            line-height: 1.45;
         }
 
         .repo-modal-body,
@@ -471,7 +530,8 @@ export const VirSidebar = defineElement<{
         }
 
         :host([data-mobile-modal]) .header {
-            padding: 12px 16px;
+            min-height: 58px;
+            padding: 9px 14px;
         }
 
         /*
@@ -480,7 +540,7 @@ export const VirSidebar = defineElement<{
          * create thumb-spanning mis-taps between adjacent targets.
          */
         :host([data-mobile-modal]) .header-actions {
-            gap: 10px;
+            gap: 6px;
         }
 
         :host([data-mobile-modal]) .title {
@@ -492,17 +552,17 @@ export const VirSidebar = defineElement<{
         }
 
         :host([data-mobile-modal]) .repo-header {
-            padding: 10px 16px 4px;
+            padding: 12px 10px 4px;
         }
 
         :host([data-mobile-modal]) .row {
             gap: 6px;
-            min-height: 34px;
-            padding: 4px 16px;
+            min-height: 42px;
+            padding: 6px 10px;
         }
 
         :host([data-mobile-modal]) .row[data-indented] {
-            padding-left: 30px;
+            padding-left: 24px;
         }
 
         :host([data-mobile-modal]) .name {
@@ -659,6 +719,7 @@ export const VirSidebar = defineElement<{
                     <${ViraIcon.assign({
                         icon: brandMarkIcon,
                     })}></${ViraIcon}>
+                    <span>agent-storm</span>
                 </span>
                 <span class="header-actions">
                     <${ViraPopUpTrigger.assign({
@@ -769,6 +830,27 @@ export const VirSidebar = defineElement<{
                                     dispatch(new events.openSettingsRequested());
                                 },
                             },
+                            state.notificationPermission === 'default'
+                                ? {
+                                      content: 'Enable desktop notifications',
+                                      iconOverride: lucideIcons.Bell,
+                                      onClick: () => {
+                                          void Notification.requestPermission().then(
+                                              (notificationPermission) => {
+                                                  updateState({
+                                                      notificationPermission,
+                                                  });
+                                              },
+                                          );
+                                      },
+                                  }
+                                : {
+                                      content:
+                                          state.notificationPermission === 'granted'
+                                              ? 'Desktop notifications enabled'
+                                              : 'Desktop notifications blocked',
+                                      iconOverride: lucideIcons.Bell,
+                                  },
                         ])}
                     </${ViraMenuTrigger}>
                 </span>
@@ -793,6 +875,7 @@ export const VirSidebar = defineElement<{
                         folder,
                         indented: false,
                         activeFolder: inputs.activeFolder,
+                        needsAttention: inputs.attentionFolders.has(folder.path),
                         openMenuKey: state.openMenuKey,
                         onActivate: emitFolderActivated,
                         removeFolderLocally,
@@ -887,6 +970,7 @@ export const VirSidebar = defineElement<{
                                 folder: child,
                                 indented: true,
                                 activeFolder: inputs.activeFolder,
+                                needsAttention: inputs.attentionFolders.has(child.path),
                                 openMenuKey: state.openMenuKey,
                                 onActivate: emitFolderActivated,
                                 removeFolderLocally,
@@ -1163,6 +1247,7 @@ function renderRow({
     folder,
     indented,
     activeFolder,
+    needsAttention,
     openMenuKey,
     onActivate,
     removeFolderLocally,
@@ -1173,6 +1258,7 @@ function renderRow({
     folder: FolderInfo;
     indented: boolean;
     activeFolder: string | undefined;
+    needsAttention: boolean;
     openMenuKey: string | undefined;
     onActivate: (folder: string) => void;
     removeFolderLocally: (path: string) => void;
@@ -1189,9 +1275,11 @@ function renderRow({
     return html`
         <div
             class="row"
+            title=${folder.path}
             ?data-active=${activeFolder === folder.path}
             ?data-indented=${indented}
             ?data-menu-open=${openMenuKey === rowMenuKey}
+            ?data-needs-attention=${needsAttention}
             ${listen('click', () => onActivate(folder.path))}
         >
             <span class="chips">
@@ -1205,6 +1293,15 @@ function renderRow({
             >
                 ${nameWithMarkers}
             </span>
+            ${needsAttention
+                ? html`
+                      <span class="attention-indicator" title="AI pane needs your input">
+                          <${ViraIcon.assign({
+                              icon: attentionIcon,
+                          })}></${ViraIcon}>
+                      </span>
+                  `
+                : ''}
             ${folder.prMerged
                 ? html`
                       <span class="pr-merged-check" title="PR merged">

@@ -1,4 +1,4 @@
-import {defaultConfig, Theme, type Config} from '@agent-storm/common';
+import {configJsonSchema, defaultConfig, Theme, type Config} from '@agent-storm/common';
 import {assert} from '@augment-vir/assert';
 import {describe, it} from '@augment-vir/test';
 
@@ -10,6 +10,16 @@ import {describe, it} from '@augment-vir/test';
  * to light.
  */
 describe('config theme', () => {
+    it('offers Dark Codex as a persisted theme choice', () => {
+        assert.deepEquals(configJsonSchema.properties.theme.enum.map(String), [
+            'light',
+            'dark',
+            'dark-claude',
+            'dark-codex',
+            'auto',
+        ]);
+    });
+
     it('defaults to light', () => {
         assert.strictEquals(defaultConfig.theme, Theme.Light);
     });

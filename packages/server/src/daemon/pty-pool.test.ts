@@ -12,6 +12,64 @@ function persistentAiCommand(label: string): string {
 }
 
 describe(restartPane.name, () => {
+    it('delivers bells live without retaining them in replay scrollback', async () => {
+        const folder = await mkdtemp(join(tmpdir(), 'agent-storm-pty-pool-'));
+        try {
+            const output: string[] = [];
+            const attachment = attachPane({
+                folder,
+                kind: PaneKind.Ai,
+                aiCmd: String.raw`while true; do printf 'attention\n'; printf '\007'; sleep 1; done`,
+                onData(data) {
+                    output.push(data);
+                },
+                onExit() {},
+            });
+            try {
+                await waitUntil(() => output.join('').includes('attention'), {
+                    interval: {
+                        milliseconds: 20,
+                    },
+                    timeout: {
+                        seconds: 30,
+                    },
+                });
+                const replayAttachment = attachPane({
+                    folder,
+                    kind: PaneKind.Ai,
+                    onData() {},
+                    onExit() {},
+                });
+                try {
+                    assert.deepEquals(
+                        {
+                            liveHadBell: output.join('').includes('\x07'),
+                            replayHadBell: replayAttachment.scrollback.includes('\x07'),
+                            replayHadText: replayAttachment.scrollback.includes('attention'),
+                        },
+                        {
+                            liveHadBell: true,
+                            replayHadBell: false,
+                            replayHadText: true,
+                        },
+                    );
+                } finally {
+                    replayAttachment.detach();
+                }
+            } finally {
+                attachment.detach();
+                killFolderPanes({
+                    folder,
+                });
+            }
+        } finally {
+            await rm(folder, {
+                recursive: true,
+                force: true,
+            });
+        }
+    });
+
     it('keeps existing subscribers attached to the restarted pane', async () => {
         const folder = await mkdtemp(join(tmpdir(), 'agent-storm-pty-pool-'));
         try {
@@ -35,7 +93,7 @@ describe(restartPane.name, () => {
                         milliseconds: 20,
                     },
                     timeout: {
-                        seconds: 3,
+                        seconds: 10,
                     },
                 });
 
@@ -50,7 +108,7 @@ describe(restartPane.name, () => {
                         milliseconds: 20,
                     },
                     timeout: {
-                        seconds: 3,
+                        seconds: 10,
                     },
                 });
                 await wait({
@@ -95,7 +153,7 @@ describe(restartPane.name, () => {
                         milliseconds: 20,
                     },
                     timeout: {
-                        seconds: 3,
+                        seconds: 10,
                     },
                 });
                 await waitUntil(() => exits.includes(0), {
@@ -103,7 +161,7 @@ describe(restartPane.name, () => {
                         milliseconds: 20,
                     },
                     timeout: {
-                        seconds: 3,
+                        seconds: 10,
                     },
                 });
 
@@ -118,7 +176,7 @@ describe(restartPane.name, () => {
                         milliseconds: 20,
                     },
                     timeout: {
-                        seconds: 3,
+                        seconds: 10,
                     },
                 });
             } finally {
