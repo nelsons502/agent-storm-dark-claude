@@ -21,6 +21,7 @@ import {
     resetAiSessionEndpoint,
     restartDaemonEndpoint,
     restartPaneEndpoint,
+    reviewRequestedEndpoint,
     sessionCloseEndpoint,
     sessionCreateEndpoint,
     sessionListEndpoint,
@@ -69,6 +70,7 @@ import {addWorktree, listWorktreeChildren, removeWorktree} from './git.js';
 import {fetchFolderPr} from './github-pr.js';
 import {normalizePath} from './paths.js';
 import {getLivePaneSessionIds} from './pty.js';
+import {fetchReviewRequestedCount} from './review-requested.js';
 import {
     createFolderSession,
     forgetFolderSessions,
@@ -766,6 +768,20 @@ const gitHubPrImplementation = implementor.implementEndpoint(gitHubPrEndpoint, {
     },
 });
 
+const reviewRequestedImplementation = implementor.implementEndpoint(reviewRequestedEndpoint, {
+    async [HttpMethod.Post]({requestData}) {
+        return {
+            [HttpStatus.Ok]: {
+                responseData: {
+                    count: await fetchReviewRequestedCount({
+                        forceRefresh: requestData.forceRefresh,
+                    }),
+                },
+            },
+        };
+    },
+});
+
 const ptyImplementation = implementor.implementWebSocket(ptyWebSocket, {
     async open({webSocket, searchParams}) {
         const folder = searchParams.folder;
@@ -886,6 +902,7 @@ const implementation = implementApi<undefined>()(agentStormService, {
         gitStageHunkImplementation,
         gitDiscardFileImplementation,
         gitHubPrImplementation,
+        reviewRequestedImplementation,
     ],
     webSockets: [ptyImplementation],
 });

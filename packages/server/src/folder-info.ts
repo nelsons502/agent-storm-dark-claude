@@ -235,6 +235,17 @@ function isUserPollingDisabled(): boolean {
     return userPollingState.manuallyDisabled;
 }
 
+/**
+ * Whether GitHub calls are currently suspended by anything this module tracks — the rate-limit /
+ * auth backoff, or the mirrored user switch. Exported so other GitHub callers (the review-requested
+ * count) honor the same backoff instead of keeping their own copy of it; the auto-disable state is
+ * deliberately owned here, where the errors that set it arrive. Does not read the config file, so
+ * `config.disabledGitHubPolling` is still the caller's to check.
+ */
+export function isGitHubPollingSuspended(): boolean {
+    return isUserPollingDisabled() || isAutoDisabled();
+}
+
 function isGitHubPollingDisabled(config: Readonly<Config>): boolean {
     return config.disabledGitHubPolling || isAutoDisabled();
 }

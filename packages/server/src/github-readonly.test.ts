@@ -6,7 +6,10 @@ describe('GitHub API contract', () => {
     it('exposes PR reads without GitHub write endpoints', () => {
         assert.deepEquals(
             Object.keys(agentStormService.endpoints).filter((path) => path.startsWith('/github/')),
-            ['/github/pr'],
+            [
+                '/github/pr',
+                '/github/review-requested',
+            ],
         );
     });
 });

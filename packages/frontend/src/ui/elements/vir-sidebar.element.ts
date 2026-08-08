@@ -49,6 +49,7 @@ import {
     deleteWorktree,
     getConfig,
     getFolders,
+    getReviewRequestedCount,
     getUpdateStatus,
     hideRepo,
     killFolderPanes,
@@ -75,6 +76,11 @@ const ellipsisIcon = createSizedIcon(lucideIcons.Ellipsis, buttonIconSize);
 const addWorktreeIcon = createSizedIcon(lucideIcons.GitBranchPlus, buttonIconSize);
 const filterIcon = createSizedIcon(lucideIcons.ListFilter, buttonIconSize);
 const brandMarkIcon = createSizedIcon(AgentStormMarkIcon, 16);
+const reviewRequestedIcon = createSizedIcon(lucideIcons.Eye, buttonIconSize);
+const reviewRefreshIcon = createSizedIcon(lucideIcons.RefreshCw, buttonIconSize);
+
+/** GitHub's own review queue. Not per-repo, matching what the count is counting. */
+const reviewRequestedUrl = 'https://github.com/pulls/review-requested';
 
 /**
  * Larger icon variants for the mobile sidebar modal's header buttons. Paired with `ViraSize.Large`
@@ -189,6 +195,12 @@ type SidebarState = {
      */
     updateStatus: UpdateStatus | undefined;
     notificationPermission: NotificationPermission;
+    /**
+     * Open PRs GitHub-wide where you are a requested reviewer. `null` means the backend couldn't
+     * find out (no `gh`, polling disabled, rate-limited) and `undefined` means we haven't asked
+     * yet; both hide the CTA, as does a real `0`. Only a positive count renders anything.
+     */
+    reviewRequestedCount: number | null | undefined;
 };
 
 type SidebarUpdate = (newState: Partial<SidebarState>) => void;
@@ -259,6 +271,7 @@ export const VirSidebar = defineElement<{
             repos: [],
             updateStatus: undefined,
             notificationPermission: Notification.permission,
+            reviewRequestedCount: undefined,
         };
     },
     styles: css`
@@ -333,6 +346,22 @@ export const VirSidebar = defineElement<{
             border: 1px solid var(--app-border-strong);
             border-radius: var(--app-radius-md);
             box-shadow: var(--app-overlay-shadow);
+        }
+
+        /* Sits between the header and the scrolling list, so it stays put while the list scrolls.
+           Colors come entirely from ViraColorVariant.Positive, which theme.ts retints per theme. */
+        .review-cta {
+            display: flex;
+            align-items: center;
+            gap: 4px;
+            padding: 8px 8px 0;
+            box-sizing: border-box;
+        }
+
+        /* The label button takes the remaining width; the refresh button stays at its icon size. */
+        .review-cta .review-cta-open {
+            flex-grow: 1;
+            min-width: 0;
         }
 
         .list {
@@ -920,6 +949,11 @@ export const VirSidebar = defineElement<{
                       <div class="error">${state.loadError}</div>
                   `
                 : ''}
+            ${renderReviewRequestedCta({
+                count: state.reviewRequestedCount,
+                mobileModal: !!inputs.mobileModal,
+                updateState,
+            })}
             <div class="list">
                 ${visibleFolders.length === 0 && !state.loadError
                     ? html`
@@ -1295,6 +1329,54 @@ function focusSearchInput(host: HTMLElement): void {
     });
 }
 
+/**
+ * The "someone is waiting on you" call to action. Renders nothing unless the count is a positive
+ * number: `0` is a real answer that needs no prompt, and `null` / `undefined` mean we don't know,
+ * so showing anything would be a claim we can't support.
+ *
+ * The button leaves the app, unlike everything else in the sidebar. That's deliberate — the GitHub
+ * pane is scoped to one folder's branch, and these PRs are somebody else's work in repos this
+ * install may not even have a worktree for.
+ */
+function renderReviewRequestedCta({
+    count,
+    mobileModal,
+    updateState,
+}: Readonly<{
+    count: number | null | undefined;
+    mobileModal: boolean;
+    updateState: SidebarUpdate;
+}>) {
+    if (!count || count < 0) {
+        return '';
+    }
+    return html`
+        <div class="review-cta">
+            <${ViraButton.assign({
+                text: `${count} PR${count === 1 ? '' : 's'} need${count === 1 ? 's' : ''} your review`,
+                icon: reviewRequestedIcon,
+                buttonSize: mobileModal ? ViraSize.Large : ViraSize.Small,
+                color: ViraColorVariant.Positive,
+            })}
+                class="review-cta-open"
+                title="Open your review queue on github.com"
+                ${listen('click', () => {
+                    window.open(reviewRequestedUrl, '_blank', 'noopener');
+                })}
+            ></${ViraButton}>
+            <${ViraButton.assign({
+                icon: reviewRefreshIcon,
+                buttonSize: mobileModal ? ViraSize.Large : ViraSize.Small,
+                buttonEmphasis: ViraEmphasis.Subtle,
+                color: ViraColorVariant.Neutral,
+            })}
+                title="Check GitHub again now"
+                ${listen('click', () => void refreshReviewRequested(updateState))}
+            ></${ViraButton}>
+        </div>
+    `;
+}
+
 function renderPaneChip(label: string, status: PaneStatus) {
     if (status === PaneStatus.None) {
         return html`
@@ -1667,10 +1749,19 @@ async function refresh(updateState: SidebarUpdate): Promise<void> {
             folders,
             config,
             updateStatus,
+            reviewRequestedCount,
         ] = await Promise.all([
             getFolders(),
             getConfig(),
             getUpdateStatus().catch(() => undefined),
+            /**
+             * Same reasoning as update-status: the backend serves this from a 5-minute cache, so
+             * the 2s poll almost never reaches GitHub. A failure here must not blank the folder
+             * list, so it degrades to `null` (CTA hidden) rather than propagating to `loadError`.
+             */
+            getReviewRequestedCount({
+                forceRefresh: false,
+            }).catch(() => null),
         ]);
         updateState({
             folders: pendingWorktreeDeletions.size
@@ -1682,12 +1773,25 @@ async function refresh(updateState: SidebarUpdate): Promise<void> {
             onlyShowRecent: config.onlyShowRecent,
             repos: config.repos,
             updateStatus,
+            reviewRequestedCount,
         });
     } catch (error: unknown) {
         updateState({
             loadError: error instanceof Error ? error.message : String(error),
         });
     }
+}
+
+/**
+ * Skip the backend's 5-minute cache and ask GitHub now. Behind an explicit button because that TTL
+ * is what keeps the poll off the search API's 30-requests-per-minute budget.
+ */
+async function refreshReviewRequested(updateState: SidebarUpdate): Promise<void> {
+    updateState({
+        reviewRequestedCount: await getReviewRequestedCount({
+            forceRefresh: true,
+        }).catch(() => null),
+    });
 }
 
 async function setSidebarGrouping(

@@ -775,6 +775,38 @@ export const gitHubPrEndpoint = defineEndpoint({
 });
 
 /**
+ * Null `count` means "can't be known right now" — `gh` missing or unauthenticated, GitHub polling
+ * disabled, rate-limited, or an unexpected response. Distinct from `0`, which is a real answer;
+ * consumers must hide the CTA on null rather than claim nothing needs review.
+ */
+const reviewRequestedShape = defineShape({
+    count: nullableShape(0),
+});
+
+/** See {@link gitHubPrRequestShape} for the force-refresh convention this mirrors. */
+const reviewRequestedRequestShape = defineShape({
+    forceRefresh: false,
+});
+
+/**
+ * How many open PRs GitHub-wide have you as a requested reviewer. Repo-independent, unlike
+ * {@link gitHubPrEndpoint} — this answers "is anyone waiting on me", which no per-folder query can.
+ */
+export const reviewRequestedEndpoint = defineEndpoint({
+    path: '/github/review-requested',
+    requests: {
+        [HttpMethod.Post]: {
+            requestData: reviewRequestedRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: reviewRequestedShape,
+                },
+            },
+        },
+    },
+});
+
+/**
  * Files above this size skip content loading entirely. A multi-megabyte file would be diffed
  * character-by-character in the browser, which is exactly the mobile stall the Diff pane exists to
  * avoid.
@@ -1105,6 +1137,7 @@ export const agentStormService = defineApi({
         gitStageHunkEndpoint,
         gitDiscardFileEndpoint,
         gitHubPrEndpoint,
+        reviewRequestedEndpoint,
     ],
     webSockets: [ptyWebSocket],
 });

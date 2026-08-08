@@ -19,6 +19,7 @@ import {
     resetAiSessionEndpoint,
     restartDaemonEndpoint,
     restartPaneEndpoint,
+    reviewRequestedEndpoint,
     sessionCloseEndpoint,
     sessionCreateEndpoint,
     sessionListEndpoint,
@@ -307,6 +308,21 @@ export async function getGitHubPr(
         }),
     );
     return data.pr ?? null;
+}
+
+/**
+ * Open PRs GitHub-wide awaiting your review, or null when that can't be determined. Null must hide
+ * the CTA rather than render a zero — see `reviewRequestedShape`.
+ */
+export async function getReviewRequestedCount(
+    params: Readonly<{forceRefresh: boolean}>,
+): Promise<number | null> {
+    const data = await requestApi('POST /github/review-requested', () =>
+        client.fetch(reviewRequestedEndpoint).POST({
+            requestData: params,
+        }),
+    );
+    return data.count ?? null;
 }
 
 export async function uploadFile(
