@@ -20,6 +20,7 @@ import {
     GitHubPollingError,
     isWorktreeRoot,
     listWorktreeChildren,
+    normalizePrInfo,
     type GitHubPollingDisableReason,
     type PrInfo,
     type RepoSlug,
@@ -452,6 +453,17 @@ async function buildFolderInfo({
         },
         prUrl: pr?.url || null,
         prMerged: !!pr?.closed,
+        pr: pr
+            ? {
+                  url: pr.url,
+                  isDraft: pr.isDraft,
+                  merged: pr.merged,
+                  checks: pr.checks,
+                  reviewDecision: pr.reviewDecision,
+                  hasMergeConflicts: pr.hasMergeConflicts,
+              }
+            : null,
+        localCommitHash: git.headCommitHash,
         panes: {
             ai: statusLookup(target.folder, PaneKind.Ai),
             shell: statusLookup(target.folder, PaneKind.Shell),
@@ -571,6 +583,22 @@ function persistCache(): void {
         });
 }
 
+/**
+ * Fill in nullable fields a cache entry from an older build simply doesn't have. `checkValidShape`
+ * does _not_ reject those: a `nullableShape` field is satisfied by `undefined`, so an entry written
+ * before `pr` / `localCommitHash` existed passes validation and would otherwise reach the frontend
+ * with those fields missing rather than null.
+ *
+ * Exported for tests.
+ */
+export function fillNullableFolderInfoFields(info: Readonly<FolderInfo>): FolderInfo {
+    return {
+        ...info,
+        pr: info.pr ?? null,
+        localCommitHash: info.localCommitHash ?? null,
+    };
+}
+
 async function loadPersistedCache(): Promise<void> {
     const contents = await readFile(folderInfoCachePath, 'utf-8').catch(() => undefined);
     if (!contents) {
@@ -598,7 +626,7 @@ async function loadPersistedCache(): Promise<void> {
                     if (!checkValidShape(info, folderInfoShape)) {
                         return;
                     }
-                    cache.set(path, info);
+                    cache.set(path, fillNullableFolderInfoFields(info));
                     /**
                      * Seed the eligibility set from last session's markers. Without this, upgrading
                      * into the eligibility rule would make every repo whose PRs are already known
@@ -624,7 +652,7 @@ type PersistedGithubCache = {
                 prs: ReadonlyArray<
                     readonly [
                         string,
-                        PrInfo,
+                        Readonly<Partial<PrInfo>>,
                     ]
                 >;
             },
@@ -693,7 +721,24 @@ async function loadPersistedGithubCache(): Promise<void> {
                     }
                     repoPrCache.set(key, {
                         fetchedAt: entry.fetchedAt,
-                        prsByBranch: new Map(entry.prs),
+                        /**
+                         * Unlike the folder-info cache, this file has no shape validation to drop
+                         * entries written before a field existed, so normalize instead — losing a
+                         * whole repo's markers over one added boolean would be worse.
+                         */
+                        prsByBranch: new Map(
+                            (entry.prs as PersistedGithubCache['repos'][number][1]['prs'])
+                                .map((pair) => {
+                                    const info = normalizePrInfo(pair[1]);
+                                    return info
+                                        ? ([
+                                              pair[0],
+                                              info,
+                                          ] as const)
+                                        : undefined;
+                                })
+                                .filter(check.isTruthy),
+                        ),
                     });
                 },
             );

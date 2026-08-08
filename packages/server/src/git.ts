@@ -1,9 +1,12 @@
+import {GitHubCheckState, GitHubReviewState} from '@agent-storm/common';
+import {check} from '@augment-vir/assert';
 import {wait} from '@augment-vir/common';
 import {maybeCreateFullDate, toTimestamp, utcTimezone} from 'date-vir';
 import {execFile} from 'node:child_process';
 import {lstat, readdir, rm, stat} from 'node:fs/promises';
 import {dirname, join} from 'node:path';
 import {promisify} from 'node:util';
+import {checkStatesByGraphqlValue, reviewDecisionsByGraphqlValue} from './github-enums.js';
 
 const exec = promisify(execFile);
 
@@ -11,12 +14,18 @@ type GitInfo = {
     branch: string | null;
     dirty: boolean;
     notPushed: boolean;
+    /**
+     * The checked-out commit, used to detect that a folder moved past the commit the user last
+     * marked as self-reviewed. Null when the folder isn't a git checkout.
+     */
+    headCommitHash: string | null;
 };
 
 const cleanGitInfo: GitInfo = {
     branch: null,
     dirty: false,
     notPushed: false,
+    headCommitHash: null,
 };
 
 /**
@@ -60,10 +69,16 @@ export async function getGitInfo(folder: string): Promise<GitInfo> {
           ]).then((output) => !!output && output.length > 0)
         : false;
 
+    const headCommitHash = await runGit(folder, [
+        'rev-parse',
+        'HEAD',
+    ]).then((output) => output?.trim() || null);
+
     return {
         branch,
         dirty,
         notPushed,
+        headCommitHash,
     };
 }
 
@@ -269,7 +284,39 @@ export type PrInfo = {
      * data). False for still-open PRs, including drafts.
      */
     closed: boolean;
+    /** True only for `MERGED`, unlike {@link PrInfo.closed}, which also covers `CLOSED`. */
+    merged: boolean;
+    isDraft: boolean;
+    /** Rollup verdict for the head commit. `None` when the repo runs no checks. */
+    checks: GitHubCheckState;
+    /** Aggregate review verdict. Null when the repo requires no review at all. */
+    reviewDecision: GitHubReviewState | null;
+    hasMergeConflicts: boolean;
 };
+
+/**
+ * Fields the merge-step evaluation needs that older persisted caches (written before these fields
+ * existed) don't carry. The github cache file isn't shape-validated on load the way the folder-info
+ * cache is, so entries are normalized here instead of being trusted verbatim.
+ */
+export function normalizePrInfo(raw: Readonly<Partial<PrInfo>> | undefined): PrInfo | null {
+    if (!raw?.url) {
+        return null;
+    }
+    return {
+        url: raw.url,
+        closed: !!raw.closed,
+        merged: !!raw.merged,
+        isDraft: !!raw.isDraft,
+        checks: check.isEnumValue(raw.checks, GitHubCheckState)
+            ? raw.checks
+            : GitHubCheckState.None,
+        reviewDecision: check.isEnumValue(raw.reviewDecision, GitHubReviewState)
+            ? raw.reviewDecision
+            : null,
+        hasMergeConflicts: !!raw.hasMergeConflicts,
+    };
+}
 
 export type RepoSlug = {
     owner: string;
@@ -397,12 +444,26 @@ const openPrsBatchSize = 100;
 /** Terminal PRs are only used for the 7-day "recently merged" marker, so a short list is plenty. */
 const terminalPrsBatchSize = 20;
 
+/**
+ * `isDraft`, `reviewDecision`, and `mergeable` are scalars on nodes this query already fetches, so
+ * they cost nothing: GitHub's GraphQL cost formula is computed from node count. The one-element
+ * `commits` connection is the only node-count increase, and one node per PR is negligible against
+ * the 100-node divisor.
+ *
+ * Deliberately absent: `reviewThreads`. Unresolved-thread detection would need 30 more nodes per
+ * PR, which across twenty repos on the hot TTL would blow the hourly point budget. The active
+ * folder's tracker enriches with real thread data from the `/github/pr` cache instead.
+ */
 const prNodeFields = [
     '      nodes {',
     '        url',
     '        headRefName',
     '        state',
     '        closedAt',
+    '        isDraft',
+    '        reviewDecision',
+    '        mergeable',
+    '        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }',
     '      }',
 ].join('\n');
 
@@ -424,6 +485,12 @@ export type RawPrNode = {
     headRefName?: string;
     state?: string;
     closedAt?: string | null;
+    isDraft?: boolean;
+    reviewDecision?: string | null;
+    mergeable?: string | null;
+    commits?: {
+        nodes?: ReadonlyArray<{commit?: {statusCheckRollup?: {state?: string} | null}}>;
+    };
 };
 
 export type GhExecResult = {
@@ -545,6 +612,15 @@ export function buildPrsByBranch({
         map.set(node.headRefName, {
             url: node.url,
             closed: isTerminal,
+            merged: node.state === 'MERGED',
+            isDraft: !!node.isDraft,
+            checks:
+                checkStatesByGraphqlValue[
+                    node.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state || ''
+                ] || GitHubCheckState.None,
+            reviewDecision: reviewDecisionsByGraphqlValue[node.reviewDecision || ''] || null,
+            /** `MERGEABLE`, `CONFLICTING`, or `UNKNOWN` while GitHub is still computing it. */
+            hasMergeConflicts: node.mergeable === 'CONFLICTING',
         });
     });
     return map;

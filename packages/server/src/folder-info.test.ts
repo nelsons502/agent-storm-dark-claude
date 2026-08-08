@@ -1,7 +1,16 @@
-import {PaneKind, PaneStatus, type RepoConfig} from '@agent-storm/common';
+import {
+    folderInfoShape,
+    GitHubCheckState,
+    GitHubReviewState,
+    PaneKind,
+    PaneStatus,
+    type FolderInfo,
+    type RepoConfig,
+} from '@agent-storm/common';
 import {assert} from '@augment-vir/assert';
 import {describe, it} from '@augment-vir/test';
-import {computeRepoPrRefreshTtlByRepo} from './folder-info.js';
+import {checkValidShape} from 'object-shape-tester';
+import {computeRepoPrRefreshTtlByRepo, fillNullableFolderInfoFields} from './folder-info.js';
 
 const nowMs = 1_800_000_000_000;
 const minuteMs = 60 * 1000;
@@ -154,5 +163,73 @@ describe(computeRepoPrRefreshTtlByRepo.name, () => {
             nowMs,
         });
         assert.isUndefined(ttlByRepo.get(repoPath));
+    });
+});
+
+/**
+ * `loadPersistedCache` validates every entry against the current shape and drops mismatches, which
+ * is the entire migration story for a `FolderInfo` field addition. These assert that the guard
+ * actually rejects a row written before the `pr` block existed — if `folderInfoShape` ever became
+ * permissive about missing fields, old rows would survive and the sidebar would read `undefined`
+ * where it expects a PR state.
+ */
+describe('persisted folder info migration', () => {
+    const currentEntry: FolderInfo = {
+        path: repoPath,
+        name: 'solo',
+        parentRepoPath: null,
+        createdAtMs: 0,
+        isWorktreeRoot: false,
+        aiHidden: false,
+        aiCmd: '',
+        resetAiSessionCmd: '',
+        branch: 'main',
+        git: {
+            dirty: false,
+            notPushed: false,
+        },
+        prUrl: null,
+        prMerged: false,
+        pr: null,
+        localCommitHash: null,
+        panes: {
+            ai: PaneStatus.None,
+            shell: PaneStatus.None,
+        },
+    };
+
+    it('accepts an entry written by this build', () => {
+        assert.isTrue(checkValidShape(currentEntry, folderInfoShape));
+    });
+
+    it('fills in nullable fields an entry written before the PR block is missing', () => {
+        const {pr, localCommitHash, ...legacyEntry} = currentEntry;
+        /**
+         * A `nullableShape` field is satisfied by `undefined`, so shape validation alone does not
+         * drop this row — which is exactly why the fill step exists.
+         */
+        assert.isTrue(checkValidShape(legacyEntry, folderInfoShape));
+        assert.deepEquals(fillNullableFolderInfoFields(legacyEntry as FolderInfo), currentEntry);
+    });
+
+    it('accepts a fully populated PR block', () => {
+        assert.isTrue(
+            checkValidShape(
+                {
+                    ...currentEntry,
+                    prUrl: 'https://github.com/owner/name/pull/1',
+                    pr: {
+                        url: 'https://github.com/owner/name/pull/1',
+                        isDraft: false,
+                        merged: false,
+                        checks: GitHubCheckState.Pending,
+                        reviewDecision: GitHubReviewState.ChangesRequested,
+                        hasMergeConflicts: false,
+                    },
+                    localCommitHash: 'abc123',
+                },
+                folderInfoShape,
+            ),
+        );
     });
 });

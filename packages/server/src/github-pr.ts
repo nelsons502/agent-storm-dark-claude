@@ -16,6 +16,7 @@ import {
 import {check} from '@augment-vir/assert';
 import {getObjectTypedEntries} from '@augment-vir/common';
 import {getCurrentBranch, getRepoSlug, runGh, type GhExecResult} from './git.js';
+import {checkStatesByGraphqlValue, reviewStatesByGraphqlValue} from './github-enums.js';
 
 type GhRunner = (args: ReadonlyArray<string>) => Promise<GhExecResult>;
 
@@ -141,22 +142,6 @@ const prStatesByGraphqlValue: Readonly<Record<string, GitHubPrState>> = {
     OPEN: GitHubPrState.Open,
     MERGED: GitHubPrState.Merged,
     CLOSED: GitHubPrState.Closed,
-};
-
-const checkStatesByGraphqlValue: Readonly<Record<string, GitHubCheckState>> = {
-    SUCCESS: GitHubCheckState.Success,
-    FAILURE: GitHubCheckState.Failure,
-    ERROR: GitHubCheckState.Failure,
-    PENDING: GitHubCheckState.Pending,
-    EXPECTED: GitHubCheckState.Pending,
-};
-
-const reviewStatesByGraphqlValue: Readonly<Record<string, GitHubReviewState>> = {
-    APPROVED: GitHubReviewState.Approved,
-    CHANGES_REQUESTED: GitHubReviewState.ChangesRequested,
-    COMMENTED: GitHubReviewState.Commented,
-    DISMISSED: GitHubReviewState.Dismissed,
-    PENDING: GitHubReviewState.Pending,
 };
 
 type RawAuthor = {

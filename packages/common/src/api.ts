@@ -322,6 +322,25 @@ export const folderInfoShape = defineShape({
     },
     prUrl: nullableShape(''),
     prMerged: false,
+    /**
+     * Everything the merge-step evaluation needs about this folder's PR, filled in on the sidebar's
+     * background sweep for every worktree — including ones never opened — from the bulk
+     * one-call-per-repo fetch. Null when the folder has no known PR.
+     *
+     * `prUrl` / `prMerged` above are deliberately left in place: today's sidebar markers and the
+     * persisted-cache seeding read them, and duplicating two booleans is cheaper than migrating
+     * every consumer at once.
+     */
+    pr: nullableShape({
+        url: '',
+        isDraft: false,
+        merged: false,
+        checks: enumShape(GitHubCheckState),
+        reviewDecision: nullableShape(enumShape(GitHubReviewState)),
+        hasMergeConflicts: false,
+    }),
+    /** Checked-out commit, used to expire a stale "I self-reviewed this" attestation. */
+    localCommitHash: nullableShape(''),
     panes: {
         ai: enumShape(PaneStatus),
         shell: enumShape(PaneStatus),

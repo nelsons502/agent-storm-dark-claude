@@ -1,5 +1,6 @@
 // cspell:words gitdir
 
+import {GitHubCheckState, GitHubReviewState} from '@agent-storm/common';
 import {assert} from '@augment-vir/assert';
 import {createArray} from '@augment-vir/common';
 import {describe, it} from '@augment-vir/test';
@@ -9,7 +10,7 @@ import {mkdir, mkdtemp, rm, stat, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {promisify} from 'node:util';
-import {buildPrsByBranch, listWorktreeChildren, removeWorktree} from './git.js';
+import {buildPrsByBranch, listWorktreeChildren, normalizePrInfo, removeWorktree} from './git.js';
 
 const exec = promisify(execFile);
 
@@ -43,6 +44,11 @@ describe(buildPrsByBranch.name, () => {
         assert.deepEquals(prs.get('feature'), {
             url: 'https://github.com/owner/name/pull/2',
             closed: false,
+            merged: false,
+            isDraft: false,
+            checks: GitHubCheckState.None,
+            reviewDecision: null,
+            hasMergeConflicts: false,
         });
     });
 
@@ -92,6 +98,168 @@ describe(buildPrsByBranch.name, () => {
             }),
         });
         assert.isDefined(prs.get('stale-but-open'));
+    });
+
+    it('maps the merge-step fields off an open PR node', () => {
+        const prs = buildPrsByBranch({
+            openNodes: [
+                {
+                    url: 'https://github.com/owner/name/pull/5',
+                    headRefName: 'feature',
+                    state: 'OPEN',
+                    isDraft: true,
+                    reviewDecision: 'CHANGES_REQUESTED',
+                    mergeable: 'CONFLICTING',
+                    commits: {
+                        nodes: [
+                            {
+                                commit: {
+                                    statusCheckRollup: {
+                                        state: 'FAILURE',
+                                    },
+                                },
+                            },
+                        ],
+                    },
+                },
+            ],
+            terminalNodes: [],
+        });
+        assert.deepEquals(prs.get('feature'), {
+            url: 'https://github.com/owner/name/pull/5',
+            closed: false,
+            merged: false,
+            isDraft: true,
+            checks: GitHubCheckState.Failure,
+            reviewDecision: GitHubReviewState.ChangesRequested,
+            hasMergeConflicts: true,
+        });
+    });
+
+    it('reads REVIEW_REQUIRED as a pending review rather than an unknown value', () => {
+        const prs = buildPrsByBranch({
+            openNodes: [
+                {
+                    url: 'https://github.com/owner/name/pull/6',
+                    headRefName: 'waiting',
+                    state: 'OPEN',
+                    reviewDecision: 'REVIEW_REQUIRED',
+                },
+            ],
+            terminalNodes: [],
+        });
+        assert.strictEquals(prs.get('waiting')?.reviewDecision, GitHubReviewState.Pending);
+    });
+
+    it('separates merged from merely closed', () => {
+        const prs = buildPrsByBranch({
+            openNodes: [],
+            terminalNodes: [
+                {
+                    url: 'https://github.com/owner/name/pull/7',
+                    headRefName: 'merged',
+                    state: 'MERGED',
+                    closedAt: daysAgoIso(1),
+                },
+                {
+                    url: 'https://github.com/owner/name/pull/8',
+                    headRefName: 'abandoned',
+                    state: 'CLOSED',
+                    closedAt: daysAgoIso(1),
+                },
+            ],
+        });
+        assert.deepEquals(
+            {
+                merged: prs.get('merged')?.merged,
+                abandoned: prs.get('abandoned')?.merged,
+                bothClosed: prs.get('merged')?.closed && prs.get('abandoned')?.closed,
+            },
+            {
+                merged: true,
+                abandoned: false,
+                bothClosed: true,
+            },
+        );
+    });
+
+    it('degrades unknown and missing GraphQL values instead of throwing', () => {
+        const prs = buildPrsByBranch({
+            openNodes: [
+                {
+                    url: 'https://github.com/owner/name/pull/9',
+                    headRefName: 'odd',
+                    state: 'OPEN',
+                    /** A value GitHub could add later that this build doesn't know. */
+                    reviewDecision: 'SOMETHING_NEW',
+                    mergeable: 'UNKNOWN',
+                    commits: {
+                        nodes: [
+                            {
+                                commit: {
+                                    statusCheckRollup: null,
+                                },
+                            },
+                        ],
+                    },
+                },
+            ],
+            terminalNodes: [],
+        });
+        assert.deepEquals(prs.get('odd'), {
+            url: 'https://github.com/owner/name/pull/9',
+            closed: false,
+            merged: false,
+            isDraft: false,
+            checks: GitHubCheckState.None,
+            reviewDecision: null,
+            hasMergeConflicts: false,
+        });
+    });
+});
+
+describe(normalizePrInfo.name, () => {
+    it('fills in fields a cache written before they existed is missing', () => {
+        assert.deepEquals(
+            normalizePrInfo({
+                url: 'https://github.com/owner/name/pull/1',
+                closed: true,
+            }),
+            {
+                url: 'https://github.com/owner/name/pull/1',
+                closed: true,
+                merged: false,
+                isDraft: false,
+                checks: GitHubCheckState.None,
+                reviewDecision: null,
+                hasMergeConflicts: false,
+            },
+        );
+    });
+
+    it('drops an entry with no url and rejects out-of-enum values', () => {
+        assert.isNull(normalizePrInfo(undefined));
+        assert.isNull(
+            normalizePrInfo({
+                closed: false,
+            }),
+        );
+        assert.deepEquals(
+            normalizePrInfo({
+                url: 'https://github.com/owner/name/pull/2',
+                checks: 'not-a-check-state' as GitHubCheckState,
+                reviewDecision: 'not-a-review-state' as GitHubReviewState,
+            }),
+            {
+                url: 'https://github.com/owner/name/pull/2',
+                closed: false,
+                merged: false,
+                isDraft: false,
+                checks: GitHubCheckState.None,
+                reviewDecision: null,
+                hasMergeConflicts: false,
+            },
+        );
     });
 });
 
