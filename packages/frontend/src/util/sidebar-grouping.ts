@@ -1,37 +1,39 @@
-import {type FolderInfo} from '@agent-storm/common';
+import {PaneStatus, type FolderInfo} from '@agent-storm/common';
 import {isAnyMergeStepFailed} from './merge-steps.js';
 
 /**
  * The three sections the sidebar splits folders into under `SidebarGrouping.Status`. Ordered as
- * they render: what you have to deal with, what is running without you, and what you have
- * explicitly set aside.
+ * they render: what is stalled on you, what somebody else has the ball on, and what you set aside.
  */
 export enum StatusBucket {
     NeedsAttention = 'needsAttention',
-    Working = 'working',
+    /** Waiting on the AI or on a reviewer — nothing here is yours to move. */
+    Waiting = 'waiting',
     DoLater = 'doLater',
 }
 
 export const statusBucketOrder: ReadonlyArray<StatusBucket> = [
     StatusBucket.NeedsAttention,
-    StatusBucket.Working,
+    StatusBucket.Waiting,
     StatusBucket.DoLater,
 ];
 
 export const statusBucketLabels: Record<StatusBucket, string> = {
     [StatusBucket.NeedsAttention]: 'Needs attention',
-    [StatusBucket.Working]: 'Working',
+    [StatusBucket.Waiting]: 'Waiting',
     [StatusBucket.DoLater]: 'Do later',
 };
 
 /**
  * Which section one folder belongs in.
  *
- * Precedence matters more than the individual rules: parking is an explicit user decision and so
- * outranks everything the app inferred; an attention flag or a failed merge step means the folder
- * is blocked on the user even if something is also still running; and anything left over that isn't
- * visibly working lands in needs-attention, because "nothing is happening and nobody has looked at
- * it" is exactly the state this view exists to surface.
+ * The dividing question is who holds the ball. Waiting means somebody else does — the AI is
+ * mid-run, or a PR is sitting with a reviewer — and nothing there will move faster for your looking
+ * at it. Everything else is stalled until you act, which includes the cases that are easy to
+ * mistake for progress: a worktree with no PR opened yet, a PR with changes requested, red CI,
+ * merge conflicts, and a merged PR whose worktree still wants cleaning up.
+ *
+ * Parking outranks all of it, since that is your own explicit call rather than something inferred.
  */
 export function bucketFolder({
     folder,
@@ -43,9 +45,19 @@ export function bucketFolder({
     if (folder.isParked) {
         return StatusBucket.DoLater;
     } else if (needsAttention || isAnyMergeStepFailed(folder)) {
+        /**
+         * `isAnyMergeStepFailed` is what covers changes-requested, failing CI and merge conflicts.
+         * It deliberately outranks a busy AI pane: a run in flight cannot clear a reviewer's
+         * verdict, so a folder in that state is still waiting on you.
+         */
         return StatusBucket.NeedsAttention;
+    } else if (folder.panes.ai === PaneStatus.Busy) {
+        return StatusBucket.Waiting;
+    } else if (folder.pr && !folder.pr.merged) {
+        /** A live PR with nothing wrong is with its reviewer, whether or not CI has finished. */
+        return StatusBucket.Waiting;
     } else {
-        return StatusBucket.Working;
+        return StatusBucket.NeedsAttention;
     }
 }
 
@@ -68,7 +80,7 @@ export function bucketFoldersByStatus({
 }>): Record<StatusBucket, FolderInfo[]> {
     const buckets: Record<StatusBucket, FolderInfo[]> = {
         [StatusBucket.NeedsAttention]: [],
-        [StatusBucket.Working]: [],
+        [StatusBucket.Waiting]: [],
         [StatusBucket.DoLater]: [],
     };
     folders.forEach((folder) => {

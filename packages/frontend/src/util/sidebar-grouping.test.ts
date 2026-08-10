@@ -56,6 +56,21 @@ const failingPr: NonNullable<FolderInfo['pr']> = {
 // eslint-disable-next-line @virmator/prefer-params-object
 const nameComparator = (a: FolderInfo, b: FolderInfo): number => a.name.localeCompare(b.name);
 
+/** An open PR with green CI and no verdict yet: the reviewer has the ball. */
+const healthyPr: NonNullable<FolderInfo['pr']> = {
+    url: 'https://github.com/owner/name/pull/1',
+    isDraft: false,
+    merged: false,
+    checks: GitHubCheckState.Success,
+    reviewDecision: GitHubReviewState.Pending,
+    hasMergeConflicts: false,
+};
+
+const busyAi = {
+    ai: PaneStatus.Busy,
+    shell: PaneStatus.None,
+} as const;
+
 describe(bucketFolder.name, () => {
     it('parks a folder regardless of any other signal', () => {
         assert.deepEquals(
@@ -63,10 +78,7 @@ describe(bucketFolder.name, () => {
                 parkedAndBusy: bucketFolder({
                     folder: folder({
                         isParked: true,
-                        panes: {
-                            ai: PaneStatus.Busy,
-                            shell: PaneStatus.None,
-                        },
+                        panes: busyAi,
                     }),
                     needsAttention: true,
                 }),
@@ -85,77 +97,174 @@ describe(bucketFolder.name, () => {
         );
     });
 
-    it('puts an attention-flagged folder in needs-attention even while it is working', () => {
-        assert.strictEquals(
-            bucketFolder({
-                folder: folder({
-                    panes: {
-                        ai: PaneStatus.Busy,
-                        shell: PaneStatus.None,
-                    },
+    describe('waiting on someone else', () => {
+        it('waits while the AI is actively running, even with no PR yet', () => {
+            assert.strictEquals(
+                bucketFolder({
+                    folder: folder({
+                        panes: busyAi,
+                    }),
+                    needsAttention: false,
                 }),
-                needsAttention: true,
-            }),
-            StatusBucket.NeedsAttention,
-        );
+                StatusBucket.Waiting,
+            );
+        });
+
+        it('waits on a healthy open PR even once the AI has gone idle', () => {
+            assert.strictEquals(
+                bucketFolder({
+                    folder: folder({
+                        pr: healthyPr,
+                    }),
+                    needsAttention: false,
+                }),
+                StatusBucket.Waiting,
+            );
+        });
+
+        it('waits while CI is still running', () => {
+            assert.strictEquals(
+                bucketFolder({
+                    folder: folder({
+                        pr: {
+                            ...healthyPr,
+                            checks: GitHubCheckState.Pending,
+                        },
+                    }),
+                    needsAttention: false,
+                }),
+                StatusBucket.Waiting,
+            );
+        });
+
+        it('waits on an approved PR that has not been merged yet', () => {
+            assert.strictEquals(
+                bucketFolder({
+                    folder: folder({
+                        pr: {
+                            ...healthyPr,
+                            reviewDecision: GitHubReviewState.Approved,
+                        },
+                    }),
+                    needsAttention: false,
+                }),
+                StatusBucket.Waiting,
+            );
+        });
+
+        it('waits on a draft PR, since the AI or CI is still shaping it', () => {
+            assert.strictEquals(
+                bucketFolder({
+                    folder: folder({
+                        pr: {
+                            ...healthyPr,
+                            isDraft: true,
+                        },
+                    }),
+                    needsAttention: false,
+                }),
+                StatusBucket.Waiting,
+            );
+        });
     });
 
-    it('puts a folder with a failed merge step in needs-attention', () => {
-        assert.strictEquals(
-            bucketFolder({
-                folder: folder({
-                    pr: failingPr,
+    describe('stalled until you act', () => {
+        it('flags a worktree that has no PR yet and no AI running', () => {
+            assert.strictEquals(
+                bucketFolder({
+                    folder: baseFolder,
+                    needsAttention: false,
                 }),
-                needsAttention: false,
-            }),
-            StatusBucket.NeedsAttention,
-        );
-    });
+                StatusBucket.NeedsAttention,
+            );
+        });
 
-    it('puts a folder with a loading merge step in working', () => {
-        assert.strictEquals(
-            bucketFolder({
-                folder: folder({
-                    panes: {
-                        ai: PaneStatus.Busy,
-                        shell: PaneStatus.None,
-                    },
+        it('flags changes requested', () => {
+            assert.strictEquals(
+                bucketFolder({
+                    folder: folder({
+                        pr: {
+                            ...healthyPr,
+                            reviewDecision: GitHubReviewState.ChangesRequested,
+                        },
+                    }),
+                    needsAttention: false,
                 }),
-                needsAttention: false,
-            }),
-            StatusBucket.Working,
-        );
-    });
+                StatusBucket.NeedsAttention,
+            );
+        });
 
-    /**
-     * The default is deliberately Working, not Needs attention. Needs attention is reserved for the
-     * two things that are actually on the user — an attention flag or a failed step — so a quiet
-     * worktree with nothing wrong never demands to be looked at.
-     */
-    it('falls back to working for a folder with nothing wrong and nothing running', () => {
-        assert.strictEquals(
-            bucketFolder({
-                folder: baseFolder,
-                needsAttention: false,
-            }),
-            StatusBucket.Working,
-        );
-    });
-
-    it('leaves a merged PR in working rather than calling for attention', () => {
-        assert.strictEquals(
-            bucketFolder({
-                folder: folder({
-                    pr: {
-                        ...failingPr,
-                        checks: GitHubCheckState.Success,
-                        merged: true,
-                    },
+        it('flags failing CI, which no reviewer can move past', () => {
+            assert.strictEquals(
+                bucketFolder({
+                    folder: folder({
+                        pr: failingPr,
+                    }),
+                    needsAttention: false,
                 }),
-                needsAttention: false,
-            }),
-            StatusBucket.Working,
-        );
+                StatusBucket.NeedsAttention,
+            );
+        });
+
+        it('flags merge conflicts', () => {
+            assert.strictEquals(
+                bucketFolder({
+                    folder: folder({
+                        pr: {
+                            ...healthyPr,
+                            hasMergeConflicts: true,
+                        },
+                    }),
+                    needsAttention: false,
+                }),
+                StatusBucket.NeedsAttention,
+            );
+        });
+
+        /** Merged means the branch is done; the only remaining move — cleaning it up — is yours. */
+        it('flags a merged PR, whose worktree now needs disposing of', () => {
+            assert.strictEquals(
+                bucketFolder({
+                    folder: folder({
+                        pr: {
+                            ...healthyPr,
+                            merged: true,
+                        },
+                    }),
+                    needsAttention: false,
+                }),
+                StatusBucket.NeedsAttention,
+            );
+        });
+
+        it('flags an attention-flagged folder even while the AI is running', () => {
+            assert.strictEquals(
+                bucketFolder({
+                    folder: folder({
+                        panes: busyAi,
+                    }),
+                    needsAttention: true,
+                }),
+                StatusBucket.NeedsAttention,
+            );
+        });
+
+        /** A blocked PR outranks a busy pane: the AI cannot review its own changes-requested. */
+        it('flags changes requested even while the AI is running', () => {
+            assert.strictEquals(
+                bucketFolder({
+                    folder: folder({
+                        panes: busyAi,
+                        pr: {
+                            ...healthyPr,
+                            reviewDecision: GitHubReviewState.ChangesRequested,
+                        },
+                    }),
+                    needsAttention: false,
+                }),
+                StatusBucket.NeedsAttention,
+            );
+        });
     });
 });
 
@@ -166,10 +275,12 @@ describe(bucketFoldersByStatus.name, () => {
                 folder({
                     path: '/repos/root/zeta',
                     name: 'zeta',
+                    pr: healthyPr,
                 }),
                 folder({
                     path: '/repos/root/alpha',
                     name: 'alpha',
+                    pr: healthyPr,
                 }),
                 folder({
                     path: '/repos/root/parked-z',
@@ -188,11 +299,11 @@ describe(bucketFoldersByStatus.name, () => {
 
         assert.deepEquals(
             {
-                working: buckets[StatusBucket.Working].map((entry) => entry.name),
+                waiting: buckets[StatusBucket.Waiting].map((entry) => entry.name),
                 doLater: buckets[StatusBucket.DoLater].map((entry) => entry.name),
             },
             {
-                working: [
+                waiting: [
                     'alpha',
                     'zeta',
                 ],
@@ -248,12 +359,12 @@ describe(bucketFoldersByStatus.name, () => {
         assert.deepEquals(
             {
                 needsAttention: buckets[StatusBucket.NeedsAttention],
-                working: buckets[StatusBucket.Working],
+                waiting: buckets[StatusBucket.Waiting],
                 doLater: buckets[StatusBucket.DoLater],
             },
             {
                 needsAttention: [],
-                working: [],
+                waiting: [],
                 doLater: [],
             },
         );
