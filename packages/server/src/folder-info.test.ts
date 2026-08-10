@@ -28,6 +28,11 @@ const noLivePanes = () => PaneStatus.None;
 
 const noPrHistory: ReadonlySet<string> = new Set();
 
+const noMergeSteps = {
+    doneSteps: [],
+    lastReviewedSha: null,
+};
+
 function soloRepoTarget() {
     return {
         folder: repoPath,
@@ -37,6 +42,7 @@ function soloRepoTarget() {
         aiHidden: false,
         aiCmd: '',
         resetAiSessionCmd: '',
+        mergeSteps: noMergeSteps,
     };
 }
 
@@ -50,6 +56,7 @@ function worktreeTargets() {
             aiHidden: false,
             aiCmd: '',
             resetAiSessionCmd: '',
+            mergeSteps: noMergeSteps,
         },
         {
             folder: worktreePath,
@@ -59,6 +66,7 @@ function worktreeTargets() {
             aiHidden: false,
             aiCmd: '',
             resetAiSessionCmd: '',
+            mergeSteps: noMergeSteps,
         },
     ];
 }
@@ -192,6 +200,8 @@ describe('persisted folder info migration', () => {
         prMerged: false,
         pr: null,
         localCommitHash: null,
+        mergeStepValues: {},
+        lastReviewedSha: null,
         panes: {
             ai: PaneStatus.None,
             shell: PaneStatus.None,

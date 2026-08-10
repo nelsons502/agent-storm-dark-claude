@@ -11,7 +11,13 @@ import {awaitedForEach, log, wait} from '@augment-vir/common';
 import {mkdir, readFile, stat, writeFile} from 'node:fs/promises';
 import {basename} from 'node:path';
 import {checkValidShape} from 'object-shape-tester';
-import {getFolderAiCmd, getFolderResetAiSessionCmd, loadConfig, saveConfig} from './config.js';
+import {
+    getFolderAiCmd,
+    getFolderMergeSteps,
+    getFolderResetAiSessionCmd,
+    loadConfig,
+    saveConfig,
+} from './config.js';
 import {folderInfoCachePath, githubCachePath, notCommittedDir} from './file-paths.js';
 import {
     fetchRepoPrs,
@@ -333,6 +339,7 @@ type RefreshTarget = {
     aiHidden: boolean;
     aiCmd: string;
     resetAiSessionCmd: string;
+    mergeSteps: ReturnType<typeof getFolderMergeSteps>;
 };
 
 /**
@@ -371,6 +378,10 @@ async function enumerateTargets(config: Readonly<Config>): Promise<RefreshTarget
                             config,
                             folder: repo.path,
                         }),
+                        mergeSteps: getFolderMergeSteps({
+                            config,
+                            folder: repo.path,
+                        }),
                     },
                 ];
             }
@@ -387,6 +398,10 @@ async function enumerateTargets(config: Readonly<Config>): Promise<RefreshTarget
                         folder: repo.path,
                     }),
                     resetAiSessionCmd: getFolderResetAiSessionCmd({
+                        config,
+                        folder: repo.path,
+                    }),
+                    mergeSteps: getFolderMergeSteps({
                         config,
                         folder: repo.path,
                     }),
@@ -408,6 +423,11 @@ async function enumerateTargets(config: Readonly<Config>): Promise<RefreshTarget
                                 config,
                                 folder: child,
                                 fallbackFolders: [repo.path],
+                            }),
+                            /** Attestations are per-worktree; they never inherit from the root. */
+                            mergeSteps: getFolderMergeSteps({
+                                config,
+                                folder: child,
                             }),
                         };
                     }),
@@ -464,6 +484,13 @@ async function buildFolderInfo({
               }
             : null,
         localCommitHash: git.headCommitHash,
+        mergeStepValues: Object.fromEntries(
+            target.mergeSteps.doneSteps.map((step) => [
+                step,
+                true,
+            ]),
+        ),
+        lastReviewedSha: target.mergeSteps.lastReviewedSha,
         panes: {
             ai: statusLookup(target.folder, PaneKind.Ai),
             shell: statusLookup(target.folder, PaneKind.Shell),
@@ -516,6 +543,15 @@ function placeholderFolderInfo(target: RefreshTarget): FolderInfo {
         },
         prUrl: null,
         prMerged: false,
+        pr: null,
+        localCommitHash: null,
+        mergeStepValues: Object.fromEntries(
+            target.mergeSteps.doneSteps.map((step) => [
+                step,
+                true,
+            ]),
+        ),
+        lastReviewedSha: target.mergeSteps.lastReviewedSha,
         panes: {
             ai: PaneStatus.None,
             shell: PaneStatus.None,

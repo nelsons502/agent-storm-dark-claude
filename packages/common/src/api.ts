@@ -1,7 +1,14 @@
 // cspell:words numstat, unstages
 
 import {defineApi, defineEndpoint, defineWebSocket, HttpMethod, HttpStatus} from '@rest-vir/api';
-import {defineShape, enumShape, nullableShape, unionShape} from 'object-shape-tester';
+import {
+    defineShape,
+    enumShape,
+    exactShape,
+    nullableShape,
+    recordShape,
+    unionShape,
+} from 'object-shape-tester';
 import {mapSchemaToShape, type JSONSchema, type SchemaShapeToType} from 'schema-vir';
 import {
     GitDiffSide,
@@ -10,6 +17,7 @@ import {
     GitHubPrState,
     GitHubReaction,
     GitHubReviewState,
+    MergeStepKey,
     PaneKind,
     PaneStatus,
     SidebarGrouping,
@@ -157,6 +165,49 @@ export const configJsonSchema = {
                 ],
             },
         },
+        mergeSteps: {
+            type: 'array',
+            default: [],
+            title: 'Merge step progress',
+            description:
+                'Per-folder record of the manual merge steps you have ticked off. Stored here rather than in browser storage so the same worktree reads the same way from your phone and your desktop.',
+            items: {
+                type: 'object',
+                additionalProperties: false,
+                title: 'Folder merge step progress',
+                properties: {
+                    folder: {
+                        type: 'string',
+                        title: 'Folder',
+                    },
+                    doneSteps: {
+                        type: 'array',
+                        default: [],
+                        title: 'Completed manual steps',
+                        items: {
+                            type: 'string',
+                            enum: [
+                                MergeStepKey.SelfQa,
+                                MergeStepKey.SelfReview,
+                            ],
+                        },
+                    },
+                    /**
+                     * The commit that was checked out when self-review was ticked. Absent for an
+                     * entry recorded before this was tracked, which reads as "expired" — safer than
+                     * treating an unknown commit as reviewed.
+                     */
+                    lastReviewedSha: {
+                        type: 'string',
+                        title: 'Last reviewed commit',
+                    },
+                },
+                required: [
+                    'folder',
+                    'doneSteps',
+                ],
+            },
+        },
         hiddenAiPane: {
             type: 'array',
             default: [],
@@ -284,6 +335,7 @@ export const configJsonSchema = {
         'postWorktreeCmd',
         'repos',
         'folderAiCmds',
+        'mergeSteps',
         'hiddenAiPane',
         'disabledGitHubPolling',
         'githubPollingAutoDisable',
@@ -341,6 +393,19 @@ export const folderInfoShape = defineShape({
     }),
     /** Checked-out commit, used to expire a stale "I self-reviewed this" attestation. */
     localCommitHash: nullableShape(''),
+    /**
+     * The manual attestations (self-QA, self-review) the user has ticked off for this folder,
+     * read-only here and written through `/worktrees/merge-step`. These live server-side rather
+     * than in localStorage because the app is used from more than one device and an attestation
+     * that silently differs per device is worse than none.
+     */
+    mergeStepValues: recordShape({
+        keys: enumShape(MergeStepKey),
+        values: false,
+        partial: true,
+    }),
+    /** Commit the user last marked as self-reviewed. Null when they never have. */
+    lastReviewedSha: nullableShape(''),
     panes: {
         ai: enumShape(PaneStatus),
         shell: enumShape(PaneStatus),
@@ -893,6 +958,34 @@ export const createWorktreeEndpoint = defineEndpoint({
     },
 });
 
+/**
+ * Toggling one manual merge step. `done` is sent explicitly rather than inferred as a flip so a
+ * stale client can't invert a value someone else's device just set.
+ */
+const mergeStepRequestShape = defineShape({
+    folder: '',
+    /**
+     * Only the two manual attestations are writable — the rest are derived from observed state and
+     * would be meaningless to store.
+     */
+    step: unionShape(exactShape(MergeStepKey.SelfQa), exactShape(MergeStepKey.SelfReview)),
+    done: false,
+});
+
+export const mergeStepEndpoint = defineEndpoint({
+    path: '/worktrees/merge-step',
+    requests: {
+        [HttpMethod.Post]: {
+            requestData: mergeStepRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: okResponseShape,
+                },
+            },
+        },
+    },
+});
+
 export const deleteWorktreeEndpoint = defineEndpoint({
     path: '/worktrees/delete',
     requests: {
@@ -1137,6 +1230,7 @@ export const agentStormService = defineApi({
         updateCheckEndpoint,
         createWorktreeEndpoint,
         deleteWorktreeEndpoint,
+        mergeStepEndpoint,
         restartPaneEndpoint,
         killPanesEndpoint,
         sessionListEndpoint,

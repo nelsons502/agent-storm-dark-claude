@@ -1,6 +1,12 @@
 // cspell:words upserts
 
-import {defaultConfig, type Config} from '@agent-storm/common';
+import {
+    defaultConfig,
+    manualMergeStepKeys,
+    MergeStepKey,
+    type Config,
+    type ManualMergeStepKey,
+} from '@agent-storm/common';
 import {log, type ArrayElement} from '@augment-vir/common';
 import {mkdir, readFile, rename, stat, writeFile} from 'node:fs/promises';
 import {dirname} from 'node:path';
@@ -36,7 +42,79 @@ function normalizeConfig(config: Readonly<Config>): Config {
                 };
             }),
         hiddenAiPane: config.hiddenAiPane.map((path) => normalizePath(path)),
+        /** Entries with nothing ticked and no reviewed commit carry no information. */
+        mergeSteps: config.mergeSteps
+            .filter((entry) => entry.doneSteps.length || entry.lastReviewedSha)
+            .map((entry) => {
+                return {
+                    ...entry,
+                    folder: normalizePath(entry.folder),
+                };
+            }),
     };
+}
+
+export function getFolderMergeSteps({
+    config,
+    folder,
+}: Readonly<{
+    config: Config;
+    folder: string;
+}>): {doneSteps: ManualMergeStepKey[]; lastReviewedSha: string | null} {
+    const entry = config.mergeSteps.find((candidate) => candidate.folder === normalizePath(folder));
+    return {
+        doneSteps: (entry?.doneSteps || []).filter((step) => manualMergeStepKeys.includes(step)),
+        lastReviewedSha: entry?.lastReviewedSha || null,
+    };
+}
+
+/**
+ * Tick or untick one manual merge step for a folder. `lastReviewedSha` is recorded alongside a
+ * self-review tick so the attestation can expire when the branch moves on; it is cleared when the
+ * tick is removed, since a recorded commit with no tick would silently re-approve the step if the
+ * user ever re-ticked it from an older client.
+ */
+export function setFolderMergeStep({
+    config,
+    folder,
+    step,
+    done,
+    commitHash,
+}: Readonly<{
+    config: Config;
+    folder: string;
+    step: ManualMergeStepKey;
+    done: boolean;
+    commitHash: string | null;
+}>): Config {
+    const normalizedFolder = normalizePath(folder);
+    const existing = config.mergeSteps.find((entry) => entry.folder === normalizedFolder);
+    const doneSteps = [
+        ...(existing?.doneSteps || []).filter((candidate) => candidate !== step),
+        ...(done ? [step] : []),
+    ];
+    const lastReviewedSha =
+        step === MergeStepKey.SelfReview
+            ? done
+                ? commitHash || ''
+                : ''
+            : existing?.lastReviewedSha || '';
+
+    return normalizeConfig({
+        ...config,
+        mergeSteps: [
+            ...config.mergeSteps.filter((entry) => entry.folder !== normalizedFolder),
+            {
+                folder: normalizedFolder,
+                doneSteps,
+                ...(lastReviewedSha
+                    ? {
+                          lastReviewedSha,
+                      }
+                    : {}),
+            },
+        ],
+    });
 }
 
 export function getFolderAiCmd({

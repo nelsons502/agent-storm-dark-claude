@@ -130,3 +130,42 @@ export enum GitHubReaction {
     Rocket = 'ROCKET',
     Eyes = 'EYES',
 }
+
+/**
+ * One stage of getting a worktree's work merged, in the order the progress tracker renders them.
+ * Values are stable storage keys: the manual-attestation steps persist under these strings in
+ * config, so renaming a value silently discards a user's recorded progress.
+ */
+export enum MergeStepKey {
+    AiGenerating = 'aiGenerating',
+    SelfQa = 'selfQa',
+    SelfReview = 'selfReview',
+    DraftPr = 'draftPr',
+    PrOpened = 'prOpened',
+    CiPassing = 'ciPassing',
+    Approved = 'approved',
+    Merged = 'merged',
+}
+
+/**
+ * The subset of steps the user ticks off by hand, as opposed to the ones derived from observed
+ * state. Only these are persisted, and only these can be toggled through the API.
+ */
+export type ManualMergeStepKey = MergeStepKey.SelfQa | MergeStepKey.SelfReview;
+
+export const manualMergeStepKeys: ReadonlyArray<ManualMergeStepKey> = [
+    MergeStepKey.SelfQa,
+    MergeStepKey.SelfReview,
+];
+
+/**
+ * Rendered state of one merge step. When several could apply at once, done wins over failed, which
+ * wins over loading, which wins over not-yet-started — a merged PR reads as done even if its checks
+ * never went green, because the outcome the step describes has already happened.
+ */
+export enum MergeStepState {
+    Todo = 'todo',
+    Loading = 'loading',
+    Failed = 'failed',
+    Done = 'done',
+}

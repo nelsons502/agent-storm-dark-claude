@@ -16,6 +16,7 @@ import {
     gitStageHunkEndpoint,
     hideRepoEndpoint,
     killPanesEndpoint,
+    mergeStepEndpoint,
     resetAiSessionEndpoint,
     restartDaemonEndpoint,
     restartPaneEndpoint,
@@ -34,6 +35,7 @@ import {
     type GitDiffSide,
     type GitDiffStatus,
     type GitHubPr,
+    type ManualMergeStepKey,
     type PaneKind,
     type UpdateStatus,
 } from '@agent-storm/common';
@@ -134,6 +136,20 @@ export async function createWorktree(
 export async function deleteWorktree(params: Readonly<{worktreePath: string}>): Promise<void> {
     await requestApi('POST /worktrees/delete', () =>
         client.fetch(deleteWorktreeEndpoint).POST({
+            requestData: params,
+        }),
+    );
+}
+
+/**
+ * Tick or untick one manual merge step. The caller updates its own state optimistically; this write
+ * is reconciled by the next folder poll.
+ */
+export async function setMergeStep(
+    params: Readonly<{folder: string; step: ManualMergeStepKey; done: boolean}>,
+): Promise<void> {
+    await requestApi('POST /worktrees/merge-step', () =>
+        client.fetch(mergeStepEndpoint).POST({
             requestData: params,
         }),
     );

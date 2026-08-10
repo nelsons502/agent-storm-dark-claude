@@ -16,6 +16,7 @@ import {
     gitStageHunkEndpoint,
     hideRepoEndpoint,
     killPanesEndpoint,
+    mergeStepEndpoint,
     PaneKind,
     ptyWebSocket,
     resetAiSessionEndpoint,
@@ -46,6 +47,7 @@ import {
     loadConfig,
     saveConfig,
     setFolderAiCmd,
+    setFolderMergeStep,
     setFolderResetAiSessionCmd,
 } from './config.js';
 import {
@@ -66,7 +68,7 @@ import {
     moveHunkAcrossIndex,
     setFileStaged,
 } from './git-diff.js';
-import {addWorktree, listWorktreeChildren, removeWorktree} from './git.js';
+import {addWorktree, getGitInfo, listWorktreeChildren, removeWorktree} from './git.js';
 import {fetchFolderPr} from './github-pr.js';
 import {normalizePath} from './paths.js';
 import {getLivePaneSessionIds} from './pty.js';
@@ -311,6 +313,35 @@ const createWorktreeImplementation = implementor.implementEndpoint(createWorktre
             repoPath: requestData.repoPath,
             worktreePath,
         });
+        return {
+            [HttpStatus.Ok]: {
+                responseData: {
+                    ok: true,
+                },
+            },
+        };
+    },
+});
+
+/**
+ * Ticking or unticking a manual merge step. The reviewed commit is read from git here rather than
+ * taken from the request: the client's idea of HEAD comes from a poll that can be seconds stale,
+ * and recording the wrong commit would either expire a fresh review or bless a stale one.
+ */
+const mergeStepImplementation = implementor.implementEndpoint(mergeStepEndpoint, {
+    async [HttpMethod.Post]({requestData}) {
+        const folder = normalizePath(requestData.folder);
+        const config = await loadConfig();
+        await saveConfig(
+            setFolderMergeStep({
+                config,
+                folder,
+                step: requestData.step,
+                done: requestData.done,
+                commitHash: (await getGitInfo(folder)).headCommitHash,
+            }),
+        );
+        await refreshFolderInfoNow();
         return {
             [HttpStatus.Ok]: {
                 responseData: {
@@ -883,6 +914,7 @@ const implementation = implementApi<undefined>()(agentStormService, {
         updateCheckImplementation,
         createWorktreeImplementation,
         deleteWorktreeImplementation,
+        mergeStepImplementation,
         restartPaneImplementation,
         killPanesImplementation,
         sessionListImplementation,
