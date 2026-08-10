@@ -184,6 +184,12 @@ export const localStorageClient = {
             }),
         serialize: (value) => String(value),
     }),
+    petEnabled: defineSetting<boolean>({
+        key: 'agent-storm:pet-enabled',
+        defaultValue: true,
+        parse: (raw) => raw !== 'false',
+        serialize: (value) => String(value),
+    }),
     tabOrder: defineSetting<ReadonlyArray<FrontendTab>>({
         key: 'agent-storm:tab-order',
         defaultValue: defaultTabOrder,

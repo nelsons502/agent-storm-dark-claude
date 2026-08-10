@@ -89,6 +89,7 @@ export const VirSettingsModal = defineElement<{
              * persisted value and written straight back on every change.
              */
             scrollbackLimit: localStorageClient.scrollbackLimit.read(),
+            petEnabled: localStorageClient.petEnabled.read(),
             pending: undefined as JsonValue | undefined,
             /**
              * Snapshot of the Config we loaded from the backend. Needed at save() time so we can
@@ -313,6 +314,26 @@ export const VirSettingsModal = defineElement<{
                                           scrollbackLimit: clamped,
                                       });
                                       localStorageClient.scrollbackLimit.write(clamped);
+                                  })}
+                              ></${ViraForm}>
+                              <${ViraForm.assign({
+                                  fields: {
+                                      petEnabled: {
+                                          type: ViraFormFieldType.Checkbox,
+                                          label: 'Show the desktop pet',
+                                          value: state.petEnabled,
+                                      },
+                                  },
+                              })}
+                                  ${listen(ViraForm.events.valueChange, (event) => {
+                                      const nextValue = event.detail.value;
+                                      if (typeof nextValue !== 'boolean') {
+                                          return;
+                                      }
+                                      updateState({
+                                          petEnabled: nextValue,
+                                      });
+                                      localStorageClient.petEnabled.write(nextValue);
                                   })}
                               ></${ViraForm}>
                               <hr class="section-divider" />

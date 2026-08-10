@@ -1,6 +1,6 @@
 // cspell:words grabbable
 
-import {PaneKind, type FolderInfo} from '@agent-storm/common';
+import {MergeStepKey, PaneKind, type FolderInfo} from '@agent-storm/common';
 import {omitObjectKeys} from '@augment-vir/common';
 import {attachOnResize, css, defineElement, html, listen, repeat} from 'element-vir';
 import {
@@ -13,9 +13,11 @@ import {
     ViraModal,
     ViraSize,
 } from 'vira';
-import {getConfig, getFolders, touchRepo} from '../../util/api-client.js';
+import {getConfig, getFolders, setMergeStep, touchRepo} from '../../util/api-client.js';
 import {shouldSurfaceAttention, type PaneAttentionRequest} from '../../util/interaction-state.js';
 import {localStorageClient, sidebarWidth} from '../../util/local-storage-client.js';
+import {MergeStepAction} from '../../util/merge-steps.js';
+import {derivePetMood} from '../../util/pet-mood.js';
 import {
     defaultFrontendTab,
     rememberedTabForFolder,
@@ -26,6 +28,7 @@ import {
     tabFromRoute,
     type AppRoute,
     type FrontendPaths,
+    type FrontendTab,
 } from '../../util/router.js';
 import {determineScreenSize, ScreenSize} from '../../util/screen-size.js';
 import '../../util/service-origin.js';
@@ -34,6 +37,8 @@ import {AgentStormMarkIcon} from '../icons/agent-storm-mark.icon.js';
 import {VirAuthModal} from './vir-auth-modal.element.js';
 import {VirBook} from './vir-book.element.js';
 import {VirPaneGroup} from './vir-pane-group.element.js';
+import {VirPet} from './vir-pet.element.js';
+import {VirProgressTracker, type MergeStepActionDetail} from './vir-progress-tracker.element.js';
 import {VirSettingsModal} from './vir-settings-modal.element.js';
 import {VirSidebar} from './vir-sidebar.element.js';
 
@@ -187,6 +192,8 @@ type AppState = {
     mobileSidebarOpen: boolean;
     paneRestartKeys: Record<string, number | undefined>;
     attentionSessions: ReadonlyMap<string, ReadonlySet<string>>;
+    petEnabled: boolean;
+    unsubscribePet: (() => void) | undefined;
 };
 
 type AppUpdate = (newState: Partial<AppState>) => void;
@@ -215,6 +222,8 @@ export const VirApp = defineElement()({
             mobileSidebarOpen: false,
             paneRestartKeys: {},
             attentionSessions: new Map(),
+            petEnabled: localStorageClient.petEnabled.read(),
+            unsubscribePet: undefined,
         };
     },
     styles: css`
@@ -403,6 +412,13 @@ export const VirApp = defineElement()({
             .catch(() => {
                 // Leave the default light theme applied if config can't be fetched.
             });
+        updateState({
+            unsubscribePet: localStorageClient.petEnabled.subscribe((petEnabled) =>
+                updateState({
+                    petEnabled,
+                }),
+            ),
+        });
         void refreshFolderInfo(updateState);
         const pollHandle = setInterval(() => {
             void refreshFolderInfo(updateState);
@@ -494,6 +510,7 @@ export const VirApp = defineElement()({
         state.disconnectScreenSizeObserver?.();
         state.disconnectVisualViewport?.();
         state.disposeTheme?.();
+        state.unsubscribePet?.();
     },
     render({state, updateState, host}) {
         if (state.route.paths[0] === 'book') {
@@ -528,6 +545,7 @@ export const VirApp = defineElement()({
          */
         const resolution = resolveRoute(state.route.paths, state.folderInfo);
         const activeFolder = resolution.folder?.path;
+        const activeFolderInfo = resolution.folder;
         const activeTab = tabFromRoute(state.route);
         if (resolution.redirectToRoot) {
             void Promise.resolve().then(() =>
@@ -746,6 +764,86 @@ export const VirApp = defineElement()({
             }
         };
 
+        /**
+         * Switch the primary tab for a folder. Shared by the pane group's own tab buttons and the
+         * progress tracker's step actions so both keep the URL, the remembered per-folder tab, and
+         * the session params in sync.
+         */
+        const switchTab = ({folder, tab}: Readonly<{folder: string; tab: FrontendTab}>) => {
+            const existingSearch = state.route.search ?? {};
+            rememberTabForFolder({
+                folder,
+                tab,
+            });
+            router.setRoute({
+                paths: state.route.paths,
+                /**
+                 * Omit `?tab` from the URL when the requested tab is the default — keeps URLs short
+                 * and matches what `tabFromRoute` falls back to anyway. Either branch carries the
+                 * session params through: switching primary tabs shouldn't reset which session each
+                 * pane is showing.
+                 */
+                search:
+                    tab === defaultFrontendTab
+                        ? omitObjectKeys(existingSearch, ['tab'])
+                        : {
+                              ...existingSearch,
+                              tab: [tab],
+                          },
+            });
+        };
+
+        /**
+         * Every merge-step side effect. Attestation writes go out optimistically — the tracker
+         * re-renders from `state.folderInfo`, which the next poll reconciles — because a round trip
+         * per click would make a checkmark feel broken on a slow connection.
+         */
+        const handleMergeStepAction = ({folder, step, action}: MergeStepActionDetail) => {
+            if (action === MergeStepAction.OpenDiffTab) {
+                switchTab({
+                    folder,
+                    tab: 'diff',
+                });
+            } else if (action === MergeStepAction.OpenGitHubTab) {
+                switchTab({
+                    folder,
+                    tab: 'github',
+                });
+            } else if (step.storageKey) {
+                const info = state.folderInfo.get(folder);
+                if (!info) {
+                    return;
+                }
+                const storageKey = step.storageKey;
+                const done = !info.mergeStepValues[storageKey];
+                updateState({
+                    folderInfo: new Map(state.folderInfo).set(folder, {
+                        ...info,
+                        mergeStepValues: {
+                            ...info.mergeStepValues,
+                            [storageKey]: done,
+                        },
+                        /**
+                         * Mirror the server's rule locally so the checkmark doesn't flicker off on
+                         * the next poll: a fresh self-review attests to the commit checked out
+                         * now.
+                         */
+                        lastReviewedSha:
+                            storageKey === MergeStepKey.SelfReview
+                                ? done
+                                    ? info.localCommitHash
+                                    : null
+                                : info.lastReviewedSha,
+                    }),
+                });
+                void setMergeStep({
+                    folder,
+                    step: storageKey,
+                    done,
+                });
+            }
+        };
+
         const handleAttentionRequested = ({folder, kind, sessionId}: PaneAttentionRequest) => {
             if (kind !== PaneKind.Ai) {
                 return;
@@ -838,6 +936,20 @@ export const VirApp = defineElement()({
 
         const attentionFolders = new Set(state.attentionSessions.keys());
 
+        const waitingFolder = attentionFolders.values().next().value;
+        const petMood = derivePetMood({
+            attentionCount,
+            paneStatuses: [...state.folderInfo.values()].flatMap((folder) => [
+                folder.panes.ai,
+                folder.panes.shell,
+            ]),
+        });
+        const petDetail = waitingFolder
+            ? state.folderInfo.get(waitingFolder)?.name || ''
+            : activeFolder
+              ? state.folderInfo.get(activeFolder)?.name || ''
+              : '';
+
         return html`
             <${VirSidebar.assign({
                 activeFolder,
@@ -894,6 +1006,24 @@ export const VirApp = defineElement()({
                           </div>
                       `
                     : ''}
+                ${
+                    /**
+                     * Active folder only, and never for a worktree root — a repo root has no PR
+                     * lifecycle, so a tracker there would be permanently stuck at step one.
+                     */
+                    activeFolderInfo && !activeFolderInfo.isWorktreeRoot
+                        ? html`
+                              <${VirProgressTracker.assign({
+                                  folder: activeFolderInfo,
+                                  screenSize: state.screenSize,
+                              })}
+                                  ${listen(VirProgressTracker.events.stepActionRequested, (event) =>
+                                      handleMergeStepAction(event.detail),
+                                  )}
+                              ></${VirProgressTracker}>
+                          `
+                        : ''
+                }
                 ${repeat(
                     renderedFolders,
                     /**
@@ -956,32 +1086,12 @@ export const VirApp = defineElement()({
                                                     : omitObjectKeys(existingSearch, [paramName]),
                                         });
                                     })}
-                                    ${listen(VirPaneGroup.events.tabRequested, (event) => {
-                                        const requestedTab = event.detail;
-                                        const existingSearch = state.route.search ?? {};
-                                        rememberTabForFolder({
+                                    ${listen(VirPaneGroup.events.tabRequested, (event) =>
+                                        switchTab({
                                             folder,
-                                            tab: requestedTab,
-                                        });
-                                        router.setRoute({
-                                            paths: state.route.paths,
-                                            /**
-                                             * Omit `?tab` from the URL when the requested tab is
-                                             * the default — keeps URLs short and matches what
-                                             * `tabFromRoute` falls back to anyway. Either branch
-                                             * carries the session params through: switching between
-                                             * Switching primary tabs shouldn't reset which session
-                                             * each pane is showing.
-                                             */
-                                            search:
-                                                requestedTab === defaultFrontendTab
-                                                    ? omitObjectKeys(existingSearch, ['tab'])
-                                                    : {
-                                                          ...existingSearch,
-                                                          tab: [requestedTab],
-                                                      },
-                                        });
-                                    })}
+                                            tab: event.detail,
+                                        }),
+                                    )}
                                     ${listen(VirPaneGroup.events.attentionRequested, (event) =>
                                         handleAttentionRequested(event.detail),
                                     )}
@@ -1046,6 +1156,21 @@ export const VirApp = defineElement()({
                 </div>
             </${ViraModal}>
             <${VirAuthModal}></${VirAuthModal}>
+            ${state.petEnabled
+                ? html`
+                      <${VirPet.assign({
+                          mood: petMood,
+                          waitingCount: attentionCount,
+                          detail: petDetail,
+                      })}
+                          ${listen(VirPet.events.petPoked, () => {
+                              if (waitingFolder) {
+                                  handleFolderActivated(waitingFolder);
+                              }
+                          })}
+                      ></${VirPet}>
+                  `
+                : ''}
         `;
     },
 });
