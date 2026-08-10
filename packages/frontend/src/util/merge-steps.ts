@@ -233,13 +233,9 @@ export function calculateMergeSteps(folder: Readonly<FolderInfo>): MergeStep[] {
 }
 
 /**
- * Shared with the sidebar's status grouping so the "Working" bucket can never drift from what the
- * progress tracker visibly shows.
+ * Shared with the sidebar's status grouping, which reserves its "Needs attention" section for the
+ * states that are genuinely on the user.
  */
-export function isAnyMergeStepLoading(folder: Readonly<FolderInfo>): boolean {
-    return calculateMergeSteps(folder).some((step) => step.state === MergeStepState.Loading);
-}
-
 export function isAnyMergeStepFailed(folder: Readonly<FolderInfo>): boolean {
     return calculateMergeSteps(folder).some((step) => step.state === MergeStepState.Failed);
 }

@@ -1,5 +1,5 @@
 import {type FolderInfo} from '@agent-storm/common';
-import {isAnyMergeStepFailed, isAnyMergeStepLoading} from './merge-steps.js';
+import {isAnyMergeStepFailed} from './merge-steps.js';
 
 /**
  * The three sections the sidebar splits folders into under `SidebarGrouping.Status`. Ordered as
@@ -44,10 +44,8 @@ export function bucketFolder({
         return StatusBucket.DoLater;
     } else if (needsAttention || isAnyMergeStepFailed(folder)) {
         return StatusBucket.NeedsAttention;
-    } else if (isAnyMergeStepLoading(folder)) {
-        return StatusBucket.Working;
     } else {
-        return StatusBucket.NeedsAttention;
+        return StatusBucket.Working;
     }
 }
 

@@ -127,13 +127,34 @@ describe(bucketFolder.name, () => {
         );
     });
 
-    it('falls back to needs-attention for a folder that is neither working nor parked', () => {
+    /**
+     * The default is deliberately Working, not Needs attention. Needs attention is reserved for the
+     * two things that are actually on the user — an attention flag or a failed step — so a quiet
+     * worktree with nothing wrong never demands to be looked at.
+     */
+    it('falls back to working for a folder with nothing wrong and nothing running', () => {
         assert.strictEquals(
             bucketFolder({
                 folder: baseFolder,
                 needsAttention: false,
             }),
-            StatusBucket.NeedsAttention,
+            StatusBucket.Working,
+        );
+    });
+
+    it('leaves a merged PR in working rather than calling for attention', () => {
+        assert.strictEquals(
+            bucketFolder({
+                folder: folder({
+                    pr: {
+                        ...failingPr,
+                        checks: GitHubCheckState.Success,
+                        merged: true,
+                    },
+                }),
+                needsAttention: false,
+            }),
+            StatusBucket.Working,
         );
     });
 });
@@ -167,11 +188,11 @@ describe(bucketFoldersByStatus.name, () => {
 
         assert.deepEquals(
             {
-                needsAttention: buckets[StatusBucket.NeedsAttention].map((entry) => entry.name),
+                working: buckets[StatusBucket.Working].map((entry) => entry.name),
                 doLater: buckets[StatusBucket.DoLater].map((entry) => entry.name),
             },
             {
-                needsAttention: [
+                working: [
                     'alpha',
                     'zeta',
                 ],
@@ -184,19 +205,23 @@ describe(bucketFoldersByStatus.name, () => {
     });
 
     it('floats attention folders above the rest of needs-attention', () => {
+        /** All three land in needs-attention via a failed step, so only the float is under test. */
         const buckets = bucketFoldersByStatus({
             folders: [
                 folder({
                     path: '/repos/root/alpha',
                     name: 'alpha',
+                    pr: failingPr,
                 }),
                 folder({
                     path: '/repos/root/zeta',
                     name: 'zeta',
+                    pr: failingPr,
                 }),
                 folder({
                     path: '/repos/root/middle',
                     name: 'middle',
+                    pr: failingPr,
                 }),
             ],
             attentionFolders: new Set(['/repos/root/zeta']),

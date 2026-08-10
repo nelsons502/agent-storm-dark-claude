@@ -8,12 +8,7 @@ import {
 } from '@agent-storm/common';
 import {assert} from '@augment-vir/assert';
 import {describe, it} from '@augment-vir/test';
-import {
-    calculateMergeSteps,
-    isAnyMergeStepFailed,
-    isAnyMergeStepLoading,
-    mergeStepDefinitions,
-} from './merge-steps.js';
+import {calculateMergeSteps, isAnyMergeStepFailed, mergeStepDefinitions} from './merge-steps.js';
 
 const baseFolder: FolderInfo = {
     path: '/repos/root/feature',
@@ -310,48 +305,6 @@ describe(calculateMergeSteps.name, () => {
                 },
             );
         });
-    });
-});
-
-describe(isAnyMergeStepLoading.name, () => {
-    it('is true while CI runs and false once everything has landed', () => {
-        assert.deepEquals(
-            {
-                running: isAnyMergeStepLoading(
-                    folder({
-                        pr: {
-                            ...openPr,
-                            checks: GitHubCheckState.Pending,
-                        },
-                    }),
-                ),
-                landed: isAnyMergeStepLoading(
-                    folder({
-                        pr: {
-                            ...openPr,
-                            merged: true,
-                        },
-                    }),
-                ),
-            },
-            {
-                running: true,
-                landed: false,
-            },
-        );
-    });
-
-    it('is true while the AI pane is still generating', () => {
-        assert.isTrue(
-            isAnyMergeStepLoading(
-                folder({
-                    panes: {
-                        ai: PaneStatus.Busy,
-                        shell: PaneStatus.None,
-                    },
-                }),
-            ),
-        );
     });
 });
 
