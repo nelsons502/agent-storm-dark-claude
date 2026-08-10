@@ -18,6 +18,7 @@ import {shouldSurfaceAttention, type PaneAttentionRequest} from '../../util/inte
 import {localStorageClient, sidebarWidth} from '../../util/local-storage-client.js';
 import {MergeStepAction} from '../../util/merge-steps.js';
 import {derivePetMood} from '../../util/pet-mood.js';
+import {PetSpecies, petSpeciesForTheme} from '../../util/pet-species.js';
 import {
     defaultFrontendTab,
     rememberedTabForFolder,
@@ -32,13 +33,13 @@ import {
 } from '../../util/router.js';
 import {determineScreenSize, ScreenSize} from '../../util/screen-size.js';
 import '../../util/service-origin.js';
-import {applyTheme} from '../../util/theme.js';
+import {applyTheme, resolveTheme} from '../../util/theme.js';
 import {AgentStormMarkIcon} from '../icons/agent-storm-mark.icon.js';
 import {VirAuthModal} from './vir-auth-modal.element.js';
 import {VirBook} from './vir-book.element.js';
 import {VirPaneGroup} from './vir-pane-group.element.js';
 import {VirPet} from './vir-pet.element.js';
-import {VirProgressTracker, type MergeStepActionDetail} from './vir-progress-tracker.element.js';
+import {type MergeStepActionDetail} from './vir-progress-tracker.element.js';
 import {VirSettingsModal} from './vir-settings-modal.element.js';
 import {VirSidebar} from './vir-sidebar.element.js';
 
@@ -193,6 +194,12 @@ type AppState = {
     paneRestartKeys: Record<string, number | undefined>;
     attentionSessions: ReadonlyMap<string, ReadonlySet<string>>;
     petEnabled: boolean;
+    /**
+     * Which creature the pet renders as. Resolved once when config loads: a theme change forces a
+     * page reload (see vir-settings-modal), and `Theme.Auto` can only ever resolve to `light` or
+     * `dark`, which map to the same species — so there is nothing here for a listener to catch.
+     */
+    petSpecies: PetSpecies;
     unsubscribePet: (() => void) | undefined;
 };
 
@@ -219,6 +226,7 @@ export const VirApp = defineElement()({
             disconnectScreenSizeObserver: undefined,
             disconnectVisualViewport: undefined,
             disposeTheme: undefined,
+            petSpecies: PetSpecies.Cloaked,
             mobileSidebarOpen: false,
             paneRestartKeys: {},
             attentionSessions: new Map(),
@@ -407,6 +415,7 @@ export const VirApp = defineElement()({
             .then((config) => {
                 updateState({
                     disposeTheme: applyTheme(config.theme),
+                    petSpecies: petSpeciesForTheme(resolveTheme(config.theme)),
                 });
             })
             .catch(() => {
@@ -545,7 +554,6 @@ export const VirApp = defineElement()({
          */
         const resolution = resolveRoute(state.route.paths, state.folderInfo);
         const activeFolder = resolution.folder?.path;
-        const activeFolderInfo = resolution.folder;
         const activeTab = tabFromRoute(state.route);
         if (resolution.redirectToRoot) {
             void Promise.resolve().then(() =>
@@ -1006,24 +1014,6 @@ export const VirApp = defineElement()({
                           </div>
                       `
                     : ''}
-                ${
-                    /**
-                     * Active folder only, and never for a worktree root — a repo root has no PR
-                     * lifecycle, so a tracker there would be permanently stuck at step one.
-                     */
-                    activeFolderInfo && !activeFolderInfo.isWorktreeRoot
-                        ? html`
-                              <${VirProgressTracker.assign({
-                                  folder: activeFolderInfo,
-                                  screenSize: state.screenSize,
-                              })}
-                                  ${listen(VirProgressTracker.events.stepActionRequested, (event) =>
-                                      handleMergeStepAction(event.detail),
-                                  )}
-                              ></${VirProgressTracker}>
-                          `
-                        : ''
-                }
                 ${repeat(
                     renderedFolders,
                     /**
@@ -1057,7 +1047,12 @@ export const VirApp = defineElement()({
                                     ),
                                     resetAiSessionCmd: info?.resetAiSessionCmd || '',
                                     prUrl: info?.prUrl || '',
+                                    folderInfo: info,
                                 })}
+                                    ${listen(
+                                        VirPaneGroup.events.mergeStepActionRequested,
+                                        (event) => handleMergeStepAction(event.detail),
+                                    )}
                                     ${listen(VirPaneGroup.events.sessionRequested, (event) => {
                                         /**
                                          * Session selection lives in the URL alongside `tab`, so a
@@ -1160,6 +1155,7 @@ export const VirApp = defineElement()({
                 ? html`
                       <${VirPet.assign({
                           mood: petMood,
+                          species: state.petSpecies,
                           waitingCount: attentionCount,
                           detail: petDetail,
                       })}

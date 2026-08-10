@@ -1,4 +1,14 @@
+// cspell:words honorspren, spren, Stormlight
+
 import {css, defineElement, defineElementEvent, html, listen, svg} from 'element-vir';
+import {
+    buildClawPath,
+    buildEyestalkPath,
+    crabEyeCenter,
+    crabLegPaths,
+    crabPoses,
+    type CrabSide,
+} from '../../util/crab-figure.js';
 import {
     buildRibbonPath,
     ribbonCount,
@@ -6,7 +16,182 @@ import {
     ribbonOpacity,
 } from '../../util/pet-figure.js';
 import {PetMood} from '../../util/pet-mood.js';
+import {PetSpecies} from '../../util/pet-species.js';
+import {sprenCoilArcs, sprenHeadPoint, sprenPoses} from '../../util/spren-figure.js';
 
+/**
+ * Mood labels and accent colors are species-agnostic on purpose: the pet says the same thing
+ * whichever creature is saying it, and every species takes its color from the active theme's
+ * variables rather than from per-species literals.
+ */
+const moodLabels: Record<PetMood, string> = {
+    [PetMood.NeedsYou]: 'Waiting on you',
+    [PetMood.Working]: 'Working',
+    [PetMood.Resting]: 'Idle',
+    [PetMood.Asleep]: 'Nothing running',
+};
+
+const moodAccentVars: Record<PetMood, string> = {
+    [PetMood.NeedsYou]: '--app-accent',
+    [PetMood.Working]: '--app-accent',
+    [PetMood.Resting]: '--app-muted',
+    [PetMood.Asleep]: '--app-subtle',
+};
+
+const crabSides: ReadonlyArray<CrabSide> = [
+    -1,
+    1,
+];
+
+/** The crab: one shell, two eyestalks, two claws. Mood lives in the claws and the stalks. */
+function renderCrab(mood: PetMood) {
+    const pose = crabPoses[mood];
+    const shellColor = 'var(--app-accent)';
+    const limbColor = 'var(--app-muted)';
+    const eyeColor = `var(${moodAccentVars[mood]})`;
+
+    return svg`
+        <g class="figure" style="animation: ${pose.figureAnimation}">
+            ${crabLegPaths(pose).map(
+                (path) => svg`
+                    <path
+                        d="${path}"
+                        stroke="${limbColor}"
+                        stroke-width="1.5"
+                        stroke-linecap="round"
+                        opacity="0.55"
+                    />
+                `,
+            )}
+            ${crabSides.map(
+                (side) => svg`
+                    <path
+                        class="claw"
+                        d="${buildClawPath({
+                            side,
+                            pose,
+                        })}"
+                        fill="${shellColor}"
+                        opacity="0.8"
+                    />
+                `,
+            )}
+            <ellipse
+                cx="20"
+                cy="${pose.shellCy}"
+                rx="${pose.shellRx}"
+                ry="${pose.shellRy}"
+                fill="${shellColor}"
+            />
+            ${crabSides.map((side) => {
+                const eye = crabEyeCenter({
+                    side,
+                    pose,
+                });
+                return svg`
+                    <path
+                        d="${buildEyestalkPath({
+                            side,
+                            pose,
+                        })}"
+                        stroke="${shellColor}"
+                        stroke-width="1.7"
+                        stroke-linecap="round"
+                        fill="none"
+                    />
+                    <circle cx="${eye.x}" cy="${eye.y}" r="${pose.eyeRadius}" fill="${shellColor}" />
+                    ${
+                        pose.eyesOpen
+                            ? svg`
+                                <circle
+                                    class="eye"
+                                    cx="${eye.x}"
+                                    cy="${eye.y}"
+                                    r="${pose.eyeRadius * 0.45}"
+                                    fill="${eyeColor}"
+                                    color="${eyeColor}"
+                                />
+                            `
+                            : svg`
+                                <path
+                                    d="M${eye.x - pose.eyeRadius * 0.6} ${eye.y}h${pose.eyeRadius * 1.2}"
+                                    stroke="var(--app-bg)"
+                                    stroke-width="0.9"
+                                    stroke-linecap="round"
+                                />
+                            `
+                    }
+                `;
+            })}
+        </g>
+    `;
+}
+
+/**
+ * The honorspren: a ribbon of light falling from a bright head-point, with no body. Asleep coils it
+ * tight and sinks it, which is this species' answer to having no posture to slump.
+ */
+function renderSpren(mood: PetMood) {
+    const pose = sprenPoses[mood];
+    const head = sprenHeadPoint(pose);
+    const {near, far} = sprenCoilArcs(pose);
+    const lightColor = 'var(--app-accent)';
+
+    return svg`
+        <g class="figure" style="animation: ${pose.ribbonAnimation}">
+            ${far.map(
+                (arc) => svg`
+                    <path
+                        d="${arc}"
+                        stroke="${lightColor}"
+                        stroke-width="${pose.coilWidth * 0.55}"
+                        stroke-linecap="round"
+                        fill="none"
+                        opacity="${0.18 + pose.glow * 0.18}"
+                    />
+                `,
+            )}
+            ${near.map(
+                (arc) => svg`
+                    <path
+                        d="${arc}"
+                        stroke="${lightColor}"
+                        stroke-width="${pose.coilWidth * 1.9}"
+                        stroke-linecap="round"
+                        fill="none"
+                        opacity="${pose.glow * 0.22}"
+                    />
+                    <path
+                        d="${arc}"
+                        stroke="${lightColor}"
+                        stroke-width="${pose.coilWidth}"
+                        stroke-linecap="round"
+                        fill="none"
+                        opacity="${0.5 + pose.glow * 0.5}"
+                    />
+                `,
+            )}
+            <circle
+                cx="${head.x}"
+                cy="${head.y}"
+                r="${pose.headRadius * 1.9}"
+                fill="${lightColor}"
+                opacity="${pose.glow * 0.22}"
+            />
+            <circle
+                class="eye"
+                cx="${head.x}"
+                cy="${head.y}"
+                r="${pose.headRadius}"
+                fill="${lightColor}"
+                color="${lightColor}"
+                opacity="${0.5 + pose.glow * 0.5}"
+            />
+        </g>
+    `;
+}
+
+/** Cloaked-figure-only visual values. The crab and the spren own their own pose tables. */
 type PetSpec = Readonly<{
     /** How far the cloak's strips fan away from the body. */
     spread: number;
@@ -18,9 +203,8 @@ type PetSpec = Readonly<{
     poseTransform: string;
     legs: string;
     eyesOpen: boolean;
-    accentVar: string;
+    /** Ground mist, shared by every species so all three sit on the same floor. */
     mistOpacity: number;
-    label: string;
 }>;
 
 const petSpecs: Record<PetMood, PetSpec> = {
@@ -32,9 +216,7 @@ const petSpecs: Record<PetMood, PetSpec> = {
         ribbonDuration: '0.7s',
         figureAnimation: 'pet-alert 0.9s ease-in-out infinite',
         eyesOpen: true,
-        accentVar: '--app-accent',
         mistOpacity: 0.15,
-        label: 'Waiting on you',
     },
     [PetMood.Working]: {
         poseTransform: 'rotate(6 20 42)',
@@ -44,9 +226,7 @@ const petSpecs: Record<PetMood, PetSpec> = {
         ribbonDuration: '1.4s',
         figureAnimation: 'pet-lean 2.6s ease-in-out infinite',
         eyesOpen: true,
-        accentVar: '--app-accent',
         mistOpacity: 0.3,
-        label: 'Working',
     },
     [PetMood.Resting]: {
         poseTransform: 'rotate(-4 20 42)',
@@ -56,9 +236,7 @@ const petSpecs: Record<PetMood, PetSpec> = {
         ribbonDuration: '3.2s',
         figureAnimation: 'pet-breathe 4.5s ease-in-out infinite',
         eyesOpen: true,
-        accentVar: '--app-muted',
         mistOpacity: 0.5,
-        label: 'Idle',
     },
     [PetMood.Asleep]: {
         poseTransform: 'translate(0 5.5)',
@@ -68,9 +246,7 @@ const petSpecs: Record<PetMood, PetSpec> = {
         ribbonDuration: '6s',
         figureAnimation: 'pet-slump 7s ease-in-out infinite',
         eyesOpen: false,
-        accentVar: '--app-subtle',
         mistOpacity: 0.75,
-        label: 'Nothing running',
     },
 };
 
@@ -83,6 +259,8 @@ const ribbonIndexes = Array.from(
 
 export const VirPet = defineElement<{
     mood: PetMood;
+    /** Which creature to draw. A pure function of the active theme; see `pet-species.ts`. */
+    species: PetSpecies;
     waitingCount: number;
     detail: string;
 }>()({
@@ -244,6 +422,89 @@ export const VirPet = defineElement<{
             animation: mist-drift 5s ease-in-out infinite;
         }
 
+        @keyframes crab-alert {
+            0%,
+            100% {
+                transform: translateY(0);
+            }
+            50% {
+                transform: translateY(-3px);
+            }
+        }
+
+        /* Side-to-side rather than up-and-down: a crab's motion is lateral. */
+        @keyframes crab-scuttle {
+            0%,
+            100% {
+                transform: translateX(-2px) rotate(-1.5deg);
+            }
+            50% {
+                transform: translateX(2px) rotate(1.5deg);
+            }
+        }
+
+        @keyframes crab-breathe {
+            0%,
+            100% {
+                transform: scale(1);
+            }
+            50% {
+                transform: scale(1.03);
+            }
+        }
+
+        @keyframes crab-slump {
+            0%,
+            100% {
+                transform: translateY(0);
+            }
+            50% {
+                transform: translateY(1.2px) scaleY(0.985);
+            }
+        }
+
+        @keyframes spren-flare {
+            0%,
+            100% {
+                opacity: 1;
+                transform: translateY(0);
+            }
+            50% {
+                opacity: 0.82;
+                transform: translateY(-2.5px);
+            }
+        }
+
+        @keyframes spren-stream {
+            0%,
+            100% {
+                transform: translateX(-1.5px) scaleY(1);
+            }
+            50% {
+                transform: translateX(1.5px) scaleY(1.02);
+            }
+        }
+
+        @keyframes spren-drift {
+            0%,
+            100% {
+                transform: translateX(-1px);
+            }
+            50% {
+                transform: translateX(1px);
+            }
+        }
+
+        @keyframes spren-settle {
+            0%,
+            100% {
+                opacity: 0.9;
+            }
+            50% {
+                opacity: 0.65;
+            }
+        }
+
         @media (prefers-reduced-motion: reduce) {
             .figure,
             .ribbon,
@@ -254,50 +515,26 @@ export const VirPet = defineElement<{
     `,
     render({inputs, host, dispatch, events}) {
         host.setAttribute('data-mood', inputs.mood);
+        host.setAttribute('data-species', inputs.species);
         const spec = petSpecs[inputs.mood];
-        const summary = inputs.detail ? `${spec.label}: ${inputs.detail}` : spec.label;
-        const eyeColor = `var(${spec.accentVar})`;
-        const figureStyle = `animation: ${spec.figureAnimation}`;
+        const label = moodLabels[inputs.mood];
+        const summary = inputs.detail ? `${label}: ${inputs.detail}` : label;
+
         const ribbonDurationStyle = `--ribbon-duration: ${spec.ribbonDuration}`;
 
-        const ribbons = ribbonIndexes.map((index) => {
-            const ribbonStyle = `animation-delay: ${ribbonDelaySeconds(index)}s`;
-            return svg`
-                <path
-                    class="ribbon"
-                    style="${ribbonStyle}"
-                    d="${buildRibbonPath({
-                        index,
-                        spread: spec.spread,
-                        curl: spec.curl,
-                    })}"
-                    stroke="var(--app-muted)"
-                    stroke-width="1.05"
-                    stroke-linecap="round"
-                    opacity="${ribbonOpacity(index)}"
-                />
-            `;
-        });
-
-        const eyes = spec.eyesOpen
-            ? svg`
-                <circle class="eye" cx="18.5" cy="11.2" r="0.95" fill="${eyeColor}" color="${eyeColor}" />
-                <circle class="eye" cx="21.5" cy="11.2" r="0.95" fill="${eyeColor}" color="${eyeColor}" />
-            `
-            : svg`
-                <path
-                    d="M17.6 11.4h1.8M20.6 11.4h1.8"
-                    stroke="${eyeColor}"
-                    stroke-width="1.1"
-                    stroke-linecap="round"
-                />
-            `;
+        /** Each species owns its whole geometry; only the ground mist and the chrome are shared. */
+        const creature =
+            inputs.species === PetSpecies.Crab
+                ? renderCrab(inputs.mood)
+                : inputs.species === PetSpecies.Spren
+                  ? renderSpren(inputs.mood)
+                  : renderCloaked(inputs.mood);
 
         return html`
             <button
                 type="button"
                 title=${summary}
-                aria-label=${`Agent Storm pet: ${spec.label}`}
+                aria-label=${`Agent Storm pet: ${label}`}
                 ${listen('click', () => dispatch(new events.petPoked()))}
             >
                 ${svg`
@@ -313,8 +550,58 @@ export const VirPet = defineElement<{
                             <ellipse cx="14" cy="42" rx="7" ry="1.1" fill="var(--app-subtle)" opacity="0.3" />
                             <ellipse cx="26" cy="41" rx="6" ry="1" fill="var(--app-subtle)" opacity="0.25" />
                         </g>
+                        ${creature}
+                    </svg>
+                `}
+                <span class="detail">${summary}</span>
+                ${inputs.waitingCount > 1
+                    ? html`
+                          <span class="badge">${inputs.waitingCount}</span>
+                      `
+                    : ''}
+            </button>
+        `;
+    },
+});
+
+/** The original figure, unchanged, for the two themes that have no species of their own. */
+function renderCloaked(mood: PetMood) {
+    const spec = petSpecs[mood];
+    const eyeColor = `var(${moodAccentVars[mood]})`;
+    const ribbons = ribbonIndexes.map((index) => {
+        return svg`
+            <path
+                class="ribbon"
+                style="animation-delay: ${ribbonDelaySeconds(index)}s"
+                d="${buildRibbonPath({
+                    index,
+                    spread: spec.spread,
+                    curl: spec.curl,
+                })}"
+                stroke="var(--app-muted)"
+                stroke-width="1.05"
+                stroke-linecap="round"
+                opacity="${ribbonOpacity(index)}"
+            />
+        `;
+    });
+    const eyes = spec.eyesOpen
+        ? svg`
+            <circle class="eye" cx="18.5" cy="11.2" r="0.95" fill="${eyeColor}" color="${eyeColor}" />
+            <circle class="eye" cx="21.5" cy="11.2" r="0.95" fill="${eyeColor}" color="${eyeColor}" />
+        `
+        : svg`
+            <path
+                d="M17.6 11.4h1.8M20.6 11.4h1.8"
+                stroke="${eyeColor}"
+                stroke-width="1.1"
+                stroke-linecap="round"
+            />
+        `;
+
+    return svg`
                         <g transform="${spec.poseTransform}">
-                            <g class="figure" style="${figureStyle}">
+                            <g class="figure" style="animation: ${spec.figureAnimation}">
                             <path d="${spec.legs}" fill="var(--app-muted)" opacity="0.5" />
                             <path
                                 d="M16.4 19.5h7.2v14h-7.2z"
@@ -342,15 +629,5 @@ export const VirPet = defineElement<{
                             ${eyes}
                             </g>
                         </g>
-                    </svg>
-                `}
-                <span class="detail">${summary}</span>
-                ${inputs.waitingCount > 1
-                    ? html`
-                          <span class="badge">${inputs.waitingCount}</span>
-                      `
-                    : ''}
-            </button>
-        `;
-    },
-});
+    `;
+}

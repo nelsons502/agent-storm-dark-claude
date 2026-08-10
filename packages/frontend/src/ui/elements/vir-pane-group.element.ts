@@ -1,6 +1,11 @@
 // cspell:words titlebar, grabbable
 
-import {PaneKind, type FolderSessions, type SessionMeta} from '@agent-storm/common';
+import {
+    PaneKind,
+    type FolderInfo,
+    type FolderSessions,
+    type SessionMeta,
+} from '@agent-storm/common';
 import {css, defineElement, defineElementEvent, html, listen, repeat} from 'element-vir';
 import {
     HorizontalAnchor,
@@ -27,6 +32,7 @@ import {type FrontendTab} from '../../util/router.js';
 import {ScreenSize} from '../../util/screen-size.js';
 import {VirDiffPane} from './vir-diff-pane.element.js';
 import {VirGithubPane} from './vir-github-pane.element.js';
+import {VirProgressTracker, type MergeStepActionDetail} from './vir-progress-tracker.element.js';
 import {VirTerminal} from './vir-terminal.element.js';
 
 /** Tab label: the user's name when set, otherwise the tab's 1-based position. */
@@ -100,6 +106,11 @@ export const VirPaneGroup = defineElement<{
      * signal the sidebar row menu used.
      */
     resetAiSessionCmd: string;
+    /**
+     * This folder's info, for the merge-step tracker in the tab bar. Undefined while the first
+     * folder-info poll is still in flight, which renders no tracker rather than an empty one.
+     */
+    folderInfo: Readonly<FolderInfo> | undefined;
 }>()({
     tagName: 'vir-pane-group',
     events: {
@@ -115,6 +126,8 @@ export const VirPaneGroup = defineElement<{
          * Carries the 1-based index the URL should now hold for that pane kind.
          */
         sessionRequested: defineElementEvent<{kind: PaneKind; index: number}>(),
+        /** Forwarded straight up from the tab bar's merge-step tracker; the app owns the effects. */
+        mergeStepActionRequested: defineElementEvent<MergeStepActionDetail>(),
     },
     state() {
         return {
@@ -213,6 +226,16 @@ export const VirPaneGroup = defineElement<{
             border-bottom: 1px solid var(--app-border);
             font-family: inherit;
             font-size: 12px;
+        }
+
+        /*
+         * The tracker takes whatever width is left after the tab buttons and scrolls internally, so
+         * a long step list never pushes the buttons around or wraps the bar.
+         */
+        ${VirProgressTracker} {
+            flex: 1 1 auto;
+            min-width: 0;
+            margin-left: 10px;
         }
 
         .desktop-folder-name {
@@ -1157,6 +1180,24 @@ export const VirPaneGroup = defineElement<{
                         </button>
                     `,
                 )}
+                ${
+                    /**
+                     * Never for a worktree root — a repo root has no PR lifecycle, so its tracker
+                     * would sit permanently at step one.
+                     */
+                    inputs.folderInfo && !inputs.folderInfo.isWorktreeRoot
+                        ? html`
+                              <${VirProgressTracker.assign({
+                                  folder: inputs.folderInfo,
+                                  screenSize: inputs.screenSize,
+                              })}
+                                  ${listen(VirProgressTracker.events.stepActionRequested, (event) =>
+                                      dispatch(new events.mergeStepActionRequested(event.detail)),
+                                  )}
+                              ></${VirProgressTracker}>
+                          `
+                        : ''
+                }
             </div>
             <div class="body">
                 ${state.diffMounted

@@ -38,15 +38,26 @@ export const VirProgressTracker = defineElement<{
         stepActionRequested: defineElementEvent<MergeStepActionDetail>(),
     },
     styles: css`
+        /**
+         * Sits inline in the pane group's tab bar, to the right of the CLI/Diff/GitHub buttons, so
+         * it borrows that bar's chrome instead of painting its own. It deliberately claims no
+         * vertical space: an earlier placement as a block above the panes was invisible, because
+         * the pane slots are absolutely positioned over the whole stage and painted on top of it.
+         */
         :host {
             display: block;
-            padding: 6px 12px;
-            border-bottom: 1px solid var(--app-border);
-            background: var(--app-chrome-bg, var(--app-surface));
+            min-width: 0;
+            padding: 0 2px;
             font-family: var(--app-font-sans, ui-sans-serif, system-ui, sans-serif);
             font-size: 12px;
-            /** Long step lists scroll rather than pushing the panes out of the viewport. */
+            /** Long step lists scroll rather than pushing the tab buttons out of the bar. */
             overflow-x: auto;
+            /* Hide the scrollbar itself — a visible track inside a 48px bar reads as breakage. */
+            scrollbar-width: none;
+        }
+
+        :host::-webkit-scrollbar {
+            display: none;
         }
 
         .steps {
