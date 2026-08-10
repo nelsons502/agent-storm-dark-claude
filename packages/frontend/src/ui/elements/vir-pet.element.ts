@@ -1,4 +1,4 @@
-// cspell:words honorspren, spren, Stormlight
+// cspell:words Stormlight, honorspren, mistcloak, spren
 
 import {css, defineElement, defineElementEvent, html, listen, svg} from 'element-vir';
 import {
@@ -17,7 +17,14 @@ import {
 } from '../../util/pet-figure.js';
 import {PetMood} from '../../util/pet-mood.js';
 import {PetSpecies} from '../../util/pet-species.js';
-import {sprenCoilArcs, sprenHeadPoint, sprenPoses} from '../../util/spren-figure.js';
+import {
+    sprenBandPaths,
+    sprenHeadCenter,
+    sprenPoses,
+    sprenShardFacetPath,
+    sprenShardPath,
+    sprenStrandPaths,
+} from '../../util/spren-figure.js';
 
 /**
  * Mood labels and accent colors are species-agnostic on purpose: the pet says the same thing
@@ -133,62 +140,71 @@ function renderCrab(mood: PetMood) {
  */
 function renderSpren(mood: PetMood) {
     const pose = sprenPoses[mood];
-    const head = sprenHeadPoint(pose);
-    const {near, far} = sprenCoilArcs(pose);
+    const head = sprenHeadCenter(pose);
     const lightColor = 'var(--app-accent)';
+    /**
+     * The dark face of the band. It has to be a real color rather than a lowered opacity: the point
+     * is that alternating faces read as a ribbon turning, and opacity alone just looks faded.
+     */
+    const darkFace = 'color-mix(in srgb, var(--app-accent) 42%, var(--app-bg))';
 
     return svg`
-        <g class="figure" style="animation: ${pose.ribbonAnimation}">
-            ${far.map(
-                (arc) => svg`
+        <g class="spren">
+            ${sprenStrandPaths(pose).map(
+                (strand) => svg`
                     <path
-                        d="${arc}"
+                        class="spren-strand"
+                        style="animation-delay: ${strand.delaySeconds}s; animation-duration: ${pose.strandDurationSeconds}s"
+                        d="${strand.path}"
                         stroke="${lightColor}"
-                        stroke-width="${pose.coilWidth * 0.55}"
+                        stroke-width="${strand.strokeWidth}"
                         stroke-linecap="round"
                         fill="none"
-                        opacity="${0.18 + pose.glow * 0.18}"
+                        opacity="${round(strand.opacity * (0.45 + pose.glow * 0.55))}"
                     />
                 `,
             )}
-            ${near.map(
-                (arc) => svg`
+            ${sprenBandPaths(pose).map(
+                (band) => svg`
                     <path
-                        d="${arc}"
-                        stroke="${lightColor}"
-                        stroke-width="${pose.coilWidth * 1.9}"
-                        stroke-linecap="round"
-                        fill="none"
-                        opacity="${pose.glow * 0.22}"
-                    />
-                    <path
-                        d="${arc}"
-                        stroke="${lightColor}"
-                        stroke-width="${pose.coilWidth}"
-                        stroke-linecap="round"
-                        fill="none"
-                        opacity="${0.5 + pose.glow * 0.5}"
+                        class="spren-band"
+                        style="animation-delay: ${band.delaySeconds}s; animation-duration: ${pose.bandDurationSeconds}s"
+                        d="${band.path}"
+                        fill="${band.isLightFace ? lightColor : darkFace}"
+                        opacity="${round((band.isLightFace ? 0.95 : 0.78) * (0.5 + pose.glow * 0.5))}"
                     />
                 `,
             )}
-            <circle
-                cx="${head.x}"
-                cy="${head.y}"
-                r="${pose.headRadius * 1.9}"
-                fill="${lightColor}"
-                opacity="${pose.glow * 0.22}"
-            />
-            <circle
-                class="eye"
-                cx="${head.x}"
-                cy="${head.y}"
-                r="${pose.headRadius}"
-                fill="${lightColor}"
-                color="${lightColor}"
-                opacity="${0.5 + pose.glow * 0.5}"
-            />
+            <g
+                class="spren-head"
+                style="animation-duration: ${pose.headDurationSeconds}s"
+            >
+                <circle
+                    cx="${head.x}"
+                    cy="${head.y}"
+                    r="${round(pose.headWidth * 1.55)}"
+                    fill="${lightColor}"
+                    opacity="${round(pose.glow * 0.22)}"
+                />
+                <path
+                    d="${sprenShardPath(pose)}"
+                    fill="${lightColor}"
+                    opacity="${round(0.55 + pose.glow * 0.45)}"
+                />
+                <path
+                    class="eye"
+                    d="${sprenShardFacetPath(pose)}"
+                    fill="var(--app-text)"
+                    color="${lightColor}"
+                    opacity="${round(pose.glow * 0.5)}"
+                />
+            </g>
         </g>
     `;
+}
+
+function round(value: number): number {
+    return Math.round(value * 100) / 100;
 }
 
 /** Cloaked-figure-only visual values. The crab and the spren own their own pose tables. */
@@ -463,52 +479,68 @@ export const VirPet = defineElement<{
             }
         }
 
-        @keyframes spren-flare {
+        /*
+         * The band's slices squeeze in sequence, which reads as a ribbon turning, and the strands
+         * swing on their own phases underneath. Staggered delays rather than path morphing, matching
+         * how the mistcloak strips already move.
+         */
+        @keyframes spren-band {
             0%,
             100% {
-                opacity: 1;
+                transform: scaleX(1) translateX(0);
+            }
+            50% {
+                transform: scaleX(0.5) translateX(0.5px);
+            }
+        }
+
+        .spren-band {
+            transform-box: fill-box;
+            transform-origin: center;
+            animation: spren-band 1.8s ease-in-out infinite;
+        }
+
+        @keyframes spren-strand {
+            0%,
+            100% {
+                transform: rotate(-5deg) translateX(-0.5px);
+            }
+            50% {
+                transform: rotate(5deg) translateX(0.5px);
+            }
+        }
+
+        .spren-strand {
+            transform-box: fill-box;
+            transform-origin: top center;
+            animation: spren-strand 2.3s ease-in-out infinite;
+        }
+
+        @keyframes spren-head {
+            0%,
+            100% {
                 transform: translateY(0);
+                opacity: 1;
             }
             50% {
-                opacity: 0.82;
-                transform: translateY(-2.5px);
+                transform: translateY(-1.5px);
+                opacity: 0.87;
             }
         }
 
-        @keyframes spren-stream {
-            0%,
-            100% {
-                transform: translateX(-1.5px) scaleY(1);
-            }
-            50% {
-                transform: translateX(1.5px) scaleY(1.02);
-            }
-        }
-
-        @keyframes spren-drift {
-            0%,
-            100% {
-                transform: translateX(-1px);
-            }
-            50% {
-                transform: translateX(1px);
-            }
-        }
-
-        @keyframes spren-settle {
-            0%,
-            100% {
-                opacity: 0.9;
-            }
-            50% {
-                opacity: 0.65;
-            }
+        .spren-head {
+            transform-box: fill-box;
+            transform-origin: center;
+            animation: spren-head 2.8s ease-in-out infinite;
         }
 
         @media (prefers-reduced-motion: reduce) {
             .figure,
             .ribbon,
-            .mist {
+            .mist,
+            .spren-band,
+            .spren-strand,
+            .spren-head {
                 animation: none !important;
             }
         }

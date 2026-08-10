@@ -1,186 +1,278 @@
 // cspell:words honorspren, spren, Stormlight
 
 /**
- * Geometry for the honorspren pet: no body at all, just a ribbon of Stormlight spiralling down from
- * a bright head-point, drawn in the same 40x48 viewBox as the other species.
+ * Geometry for the honorspren pet, drawn in the same 40x48 viewBox as the other species.
  *
- * The ribbon is sampled rather than hand-authored because its shape is a function of the mood — a
- * fixed path could not coil tighter or narrow as the spren settles.
+ * The figure is three parts: a crystalline shard of light for the head, a short two-tone band under
+ * it, and trailing strands that fall the rest of the way. The band's faces alternate light and dark
+ * so it reads as a ribbon turning rather than a stack of bars, and each band and strand carries its
+ * own animation phase so a wave travels down the figure instead of it moving as one rigid sheet.
+ *
+ * Everything here is pose data and path strings — the motion itself is CSS in `vir-pet`, using the
+ * same staggered-delay approach the original mistcloak strips already use. No path morphing, so it
+ * behaves the same in every browser and collapses cleanly under `prefers-reduced-motion`.
  */
 
 import {PetMood} from './pet-mood.js';
 
-const ribbonSampleCount = 30;
+export const petBoxHeight = 48;
 const centerX = 20;
 
 export type SprenPose = Readonly<{
-    /** How many turns the ribbon makes on its way down. */
-    coils: number;
-    /** Half-width of the widest turn. */
-    amplitude: number;
-    /** Where the bright end starts. */
-    headY: number;
-    /** Where the ribbon runs out. */
-    tailY: number;
-    /** Brightness of the head-point and its halo, 0–1. */
+    /** Top point of the shard. Sinking this is how the whole figure settles when asleep. */
+    headTop: number;
+    headHeight: number;
+    /** Half-width of the shard at its widest. */
+    headWidth: number;
+    bandTop: number;
+    bandBottom: number;
+    /** Half-width of the widest band. */
+    bandWidth: number;
+    bandCount: number;
+    /** Length of the longest strand, before each strand's own scaling. */
+    strandLength: number;
+    /** How far the strands wander from the center line. Near zero reads as hanging limp. */
+    strandSway: number;
+    /**
+     * A constant sideways drift applied down the strands, growing toward the tips. Waiting is
+     * symmetric; working leans, which is what distinguishes the two in a still frame.
+     */
+    strandLean: number;
+    /** Brightness of the shard and its halo, 0–1. */
     glow: number;
-    strokeWidth: number;
-    /** Stroke width of the near half-turns; the far ones are drawn thinner. */
-    coilWidth: number;
-    headRadius: number;
-    ribbonAnimation: string;
+    bandDurationSeconds: number;
+    strandDurationSeconds: number;
+    headDurationSeconds: number;
 }>;
 
 export const sprenPoses: Record<PetMood, SprenPose> = {
-    /** Wide, slow turns and full brightness: the spren is holding itself up in front of you. */
+    /** Held high and bright, strands streaming: the spren is in front of you and waiting. */
     [PetMood.NeedsYou]: {
-        coils: 2.6,
-        amplitude: 7,
-        headY: 5,
-        tailY: 41,
+        headTop: 3.4,
+        headHeight: 7.6,
+        headWidth: 4.1,
+        bandTop: 11.5,
+        bandBottom: 18,
+        bandWidth: 5.6,
+        bandCount: 3,
+        strandLength: 25.5,
+        strandSway: 5.2,
+        strandLean: 0,
         glow: 1,
-        coilWidth: 2.2,
-        strokeWidth: 1.5,
-        headRadius: 2.9,
-        ribbonAnimation: 'spren-flare 0.9s ease-in-out infinite',
+        bandDurationSeconds: 1.8,
+        strandDurationSeconds: 2.1,
+        headDurationSeconds: 2.6,
     },
-    /** More turns, slightly narrower: the same light, busier. */
+    /** Same posture, quicker: the band squeezes and the strands whip faster. */
     [PetMood.Working]: {
-        coils: 3.4,
-        amplitude: 5.6,
-        headY: 6.5,
-        tailY: 42,
+        headTop: 3.6,
+        headHeight: 7.4,
+        headWidth: 3.9,
+        bandTop: 11.6,
+        bandBottom: 18,
+        bandWidth: 5.3,
+        bandCount: 3,
+        strandLength: 24.5,
+        strandSway: 4.4,
+        strandLean: 2.2,
         glow: 0.85,
-        coilWidth: 1.9,
-        strokeWidth: 1.35,
-        headRadius: 2.5,
-        ribbonAnimation: 'spren-stream 2.6s ease-in-out infinite',
+        bandDurationSeconds: 1.4,
+        strandDurationSeconds: 2.4,
+        headDurationSeconds: 3,
     },
-    /** Loose, lazy turns — the widest-pitched spiral, and dimmer. */
     [PetMood.Resting]: {
-        coils: 1.8,
-        amplitude: 3.6,
-        headY: 9,
-        tailY: 43,
+        headTop: 5,
+        headHeight: 7,
+        headWidth: 3.6,
+        bandTop: 12.6,
+        bandBottom: 18.4,
+        bandWidth: 4.7,
+        bandCount: 3,
+        strandLength: 22,
+        strandSway: 2.8,
+        strandLean: -0.9,
         glow: 0.6,
-        coilWidth: 1.5,
-        strokeWidth: 1.2,
-        headRadius: 2.2,
-        ribbonAnimation: 'spren-drift 4.5s ease-in-out infinite',
+        bandDurationSeconds: 3.4,
+        strandDurationSeconds: 4.2,
+        headDurationSeconds: 5,
     },
     /**
-     * A ribbon has no posture to slump, which the plan flagged as the open question for this
-     * species. The answer: it coils tight and sinks. Many turns, almost no width, and the head
-     * dropped near the floor reads unmistakably as a light that has settled and gone quiet.
+     * Asleep: the whole figure sinks, the band compresses, the strands pull in and hang almost
+     * straight, and the light goes low. This species has no posture to slump, so settling and going
+     * quiet is what stands in for it.
      */
     [PetMood.Asleep]: {
-        coils: 4.6,
-        amplitude: 1.8,
-        headY: 26,
-        tailY: 44.5,
+        headTop: 12.5,
+        headHeight: 6.2,
+        headWidth: 3.1,
+        bandTop: 19,
+        bandBottom: 23.4,
+        bandWidth: 3.8,
+        bandCount: 3,
+        strandLength: 17,
+        strandSway: 1.1,
+        strandLean: 0.4,
         glow: 0.3,
-        coilWidth: 1.1,
-        strokeWidth: 1.05,
-        headRadius: 1.7,
-        ribbonAnimation: 'spren-settle 7s ease-in-out infinite',
+        bandDurationSeconds: 6,
+        strandDurationSeconds: 7,
+        headDurationSeconds: 8,
     },
 };
 
-export function sprenHeadPoint(pose: Readonly<SprenPose>) {
+export function sprenHeadCenter(pose: Readonly<SprenPose>) {
     return {
         x: centerX,
-        y: round(pose.headY),
+        y: round(pose.headTop + pose.headHeight / 2),
     };
 }
 
+/** The shard: a tall diamond, which is the part that reads as "alive" at 61px. */
+export function sprenShardPath(pose: Readonly<SprenPose>): string {
+    const half = pose.headHeight / 2;
+    return (
+        `M${centerX} ${round(pose.headTop)}` +
+        `l${round(pose.headWidth)} ${round(half)}` +
+        `L${centerX} ${round(pose.headTop + pose.headHeight)}` +
+        `l${round(-pose.headWidth)} ${round(-half)}z`
+    );
+}
+
+/** The lit half of the shard, drawn over the whole so the crystal has a bright facet. */
+export function sprenShardFacetPath(pose: Readonly<SprenPose>): string {
+    const half = pose.headHeight / 2;
+    return (
+        `M${centerX} ${round(pose.headTop)}` +
+        `l${round(pose.headWidth)} ${round(half)}` +
+        `L${centerX} ${round(pose.headTop + pose.headHeight)}z`
+    );
+}
+
+export type SprenBand = Readonly<{
+    path: string;
+    /** Alternating faces are what make the stack read as one ribbon turning. */
+    isLightFace: boolean;
+    delaySeconds: number;
+    topY: number;
+    bottomY: number;
+}>;
+
 /**
- * The ribbon's centerline, top to bottom. The turn width tapers toward both ends — zero at the head
- * so the ribbon leaves the bright point cleanly, and near-zero at the tail so it dissolves rather
- * than stopping mid-swing.
+ * The band, sliced top to bottom. Each slice tapers slightly toward the ends so the stack reads as
+ * a ribbon rather than a barrel, and each is delayed a little more than the one above it so the
+ * squeeze travels downward.
  */
-export function sprenRibbonSamples(pose: Readonly<SprenPose>): Array<{x: number; y: number}> {
+export function sprenBandPaths(pose: Readonly<SprenPose>): SprenBand[] {
+    const span = (pose.bandBottom - pose.bandTop) / pose.bandCount;
     return Array.from(
         {
-            length: ribbonSampleCount,
+            length: pose.bandCount,
         },
         (_unused, index) => {
-            const progress = index / (ribbonSampleCount - 1);
-            const taper = Math.sin(Math.PI * Math.min(1, progress * 1.15));
+            const topY = round(pose.bandTop + index * span);
+            const bottomY = round(pose.bandTop + (index + 1) * span);
+            const taper =
+                1 - (Math.abs(index - (pose.bandCount - 1) / 2) / (pose.bandCount + 0.6)) * 0.5;
+            const width = pose.bandWidth * taper;
+            /** Slightly narrower at the bottom edge, so consecutive slices imply a turn. */
+            const bottomWidth = width * 0.86;
             return {
-                x: round(
-                    centerX +
-                        Math.sin(progress * pose.coils * Math.PI * 2) * pose.amplitude * taper,
-                ),
-                y: round(pose.headY + progress * (pose.tailY - pose.headY)),
+                path:
+                    `M${round(centerX - width)} ${topY}` +
+                    `L${round(centerX + width)} ${topY}` +
+                    `L${round(centerX + bottomWidth)} ${bottomY}` +
+                    `L${round(centerX - bottomWidth)} ${bottomY}z`,
+                isLightFace: index % 2 === 0,
+                delaySeconds: round(index * 0.15),
+                topY,
+                bottomY,
             };
         },
     );
 }
 
 /**
- * The ribbon as a coil, which is the only construction that actually reads as a spiral at this
- * size. A coil seen from the side is a sequence of half-turns alternating between the near side and
- * the far side of the axis; drawing the near ones bright and thick and the far ones dim and thin is
- * what supplies the depth. Offsetting a single wavy line sideways cannot do this — where the line
- * swings fastest, a sideways offset collapses and self-intersects.
+ * Relative shape of each strand. Distinct weights, phases and lengths per strand so the three never
+ * swing together — that synchrony is what made an earlier attempt look like one flapping sheet.
  */
-export function sprenCoilArcs(pose: Readonly<SprenPose>): {
-    near: string[];
-    far: string[];
-} {
-    const halfTurns = Math.max(2, Math.round(pose.coils * 2));
-    const pitch = (pose.tailY - pose.headY) / halfTurns;
-    const near: string[] = [];
-    const far: string[] = [];
+const strandSpecs: ReadonlyArray<
+    Readonly<{
+        /** Multipliers on the pose's sway, at the control points and the tip. */
+        swayControl: number;
+        swayMid: number;
+        swayTip: number;
+        lengthScale: number;
+        strokeWidth: number;
+        opacity: number;
+        delaySeconds: number;
+    }>
+> = [
+    {
+        swayControl: 1,
+        swayMid: 0.5,
+        swayTip: -0.3,
+        lengthScale: 1,
+        strokeWidth: 1.7,
+        opacity: 0.85,
+        delaySeconds: 0,
+    },
+    {
+        swayControl: -0.85,
+        swayMid: -0.4,
+        swayTip: 0.26,
+        lengthScale: 0.92,
+        strokeWidth: 1.15,
+        opacity: 0.5,
+        delaySeconds: 0.3,
+    },
+    {
+        swayControl: 0.5,
+        swayMid: -0.54,
+        swayTip: -0.18,
+        lengthScale: 0.84,
+        strokeWidth: 0.85,
+        opacity: 0.33,
+        delaySeconds: 0.62,
+    },
+];
 
-    for (let index = 0; index < halfTurns; index++) {
-        const startY = pose.headY + index * pitch;
-        const endY = startY + pitch;
-        /**
-         * Turns narrow toward both ends so the coil emerges from the head and dissolves at the
-         * tail.
-         */
-        const startWidth = pose.amplitude * taperAt(index / halfTurns);
-        const endWidth = pose.amplitude * taperAt((index + 1) / halfTurns);
-        const isNear = index % 2 === 0;
-        const startX = centerX + (isNear ? -startWidth : startWidth);
-        const endX = centerX + (isNear ? endWidth : -endWidth);
-        const radiusX = round(Math.max(0.35, (startWidth + endWidth) / 2));
-        const radiusY = round(Math.max(0.35, pitch * 0.62));
-        const arc = `M${round(startX)} ${round(startY)}A${radiusX} ${radiusY} 0 0 ${isNear ? 1 : 0} ${round(endX)} ${round(endY)}`;
-        (isNear ? near : far).push(arc);
-    }
+export type SprenStrand = Readonly<{
+    path: string;
+    strokeWidth: number;
+    opacity: number;
+    delaySeconds: number;
+}>;
 
-    return {
-        near,
-        far,
-    };
-}
-
-/** Zero-ish at both ends, full in the middle. Shared by the coil and the centerline sampling. */
-function taperAt(progress: number): number {
-    return Math.sin(Math.PI * Math.min(1, progress * 1.08)) * 0.88 + 0.12;
+/** The lowest point any strand reaches, so callers can prove the figure fits its box. */
+export function sprenStrandEndY(pose: Readonly<SprenPose>): number {
+    return round(
+        pose.bandBottom +
+            pose.strandLength * Math.max(...strandSpecs.map((spec) => spec.lengthScale)),
+    );
 }
 
 /**
- * The sampled centerline as a smooth path. Midpoint-quadratic smoothing keeps the spiral from
- * reading as a polygon at this sample count, and costs nothing at render time.
+ * The strands, each an S-curve leaving the bottom edge of the band. They start exactly at
+ * `bandBottom` so the figure has no seam between its band and its tail.
  */
-export function buildSprenRibbonPath(pose: Readonly<SprenPose>): string {
-    const samples = sprenRibbonSamples(pose);
-    const [start] = samples;
-    if (!start) {
-        return '';
-    }
-    return samples.slice(1).reduce((path, point, index) => {
-        const previous = samples[index];
-        if (!previous) {
-            return path;
-        }
-        const midX = round((previous.x + point.x) / 2);
-        const midY = round((previous.y + point.y) / 2);
-        return `${path}Q${previous.x} ${previous.y} ${midX} ${midY}`;
-    }, `M${start.x} ${start.y}`);
+export function sprenStrandPaths(pose: Readonly<SprenPose>): SprenStrand[] {
+    return strandSpecs.map((spec) => {
+        const length = pose.strandLength * spec.lengthScale;
+        const midY = round(pose.bandBottom + length * 0.55);
+        const tipY = round(pose.bandBottom + length);
+        /** The lean grows with depth, so the strands bend away rather than shifting bodily. */
+        const leanAt = (progress: number) => pose.strandLean * progress * progress;
+        return {
+            path:
+                `M${centerX} ${round(pose.bandBottom)}` +
+                `Q${round(centerX + pose.strandSway * spec.swayControl + leanAt(0.28))} ${round(pose.bandBottom + length * 0.28)} ` +
+                `${round(centerX + pose.strandSway * spec.swayMid + leanAt(0.55))} ${midY}` +
+                `Q${round(centerX + pose.strandSway * spec.swayTip * 2 + leanAt(0.8))} ${round(pose.bandBottom + length * 0.8)} ` +
+                `${round(centerX + pose.strandSway * spec.swayTip + leanAt(1))} ${tipY}`,
+            strokeWidth: spec.strokeWidth,
+            opacity: spec.opacity,
+            delaySeconds: spec.delaySeconds,
+        };
+    });
 }
 
 function round(value: number): number {
