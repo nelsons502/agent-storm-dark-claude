@@ -1,4 +1,4 @@
-// cspell:words upserts
+// cspell:words unpark, upserts
 
 import {
     defaultConfig,
@@ -42,6 +42,10 @@ function normalizeConfig(config: Readonly<Config>): Config {
                 };
             }),
         hiddenAiPane: config.hiddenAiPane.map((path) => normalizePath(path)),
+        /** De-duplicated so repeated parks of the same folder can't stack up entries. */
+        parkedFolders: Array.from(
+            new Set((config.parkedFolders || []).map((path) => normalizePath(path))),
+        ),
         /** Entries with nothing ticked and no reviewed commit carry no information. */
         mergeSteps: config.mergeSteps
             .filter((entry) => entry.doneSteps.length || entry.lastReviewedSha)
@@ -114,6 +118,41 @@ export function setFolderMergeStep({
                     : {}),
             },
         ],
+    });
+}
+
+export function isFolderParked({
+    config,
+    folder,
+}: Readonly<{
+    config: Config;
+    folder: string;
+}>): boolean {
+    return (config.parkedFolders || []).includes(normalizePath(folder));
+}
+
+/** Park or unpark a folder for the sidebar's "Do later" section. */
+export function setFolderParked({
+    config,
+    folder,
+    parked,
+}: Readonly<{
+    config: Config;
+    folder: string;
+    parked: boolean;
+}>): Config {
+    const normalizedFolder = normalizePath(folder);
+    const withoutFolder = (config.parkedFolders || []).filter(
+        (path) => normalizePath(path) !== normalizedFolder,
+    );
+    return normalizeConfig({
+        ...config,
+        parkedFolders: parked
+            ? [
+                  ...withoutFolder,
+                  normalizedFolder,
+              ]
+            : withoutFolder,
     });
 }
 

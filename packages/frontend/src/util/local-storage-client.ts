@@ -131,6 +131,26 @@ function parseTabByFolder(raw: string): Record<string, string> {
     }
 }
 
+/** Shared parser for the sidebar's collapse maps. Unknown or non-boolean entries are dropped. */
+function parseBooleanRecord(raw: string): Record<string, boolean> {
+    try {
+        const parsed: unknown = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+            return {};
+        }
+        return Object.fromEntries(
+            Object.entries(parsed).filter(
+                ([
+                    ,
+                    value,
+                ]) => typeof value === 'boolean',
+            ),
+        ) as Record<string, boolean>;
+    } catch {
+        return {};
+    }
+}
+
 export const localStorageClient = {
     authSecret: defineSetting<string | undefined>({
         key: 'agent-storm-auth-secret',
@@ -189,6 +209,28 @@ export const localStorageClient = {
         defaultValue: true,
         parse: (raw) => raw !== 'false',
         serialize: (value) => String(value),
+    }),
+    /**
+     * Which status sections the user has collapsed, keyed by `StatusBucket`. Only the collapsible
+     * sections appear here — "Needs attention" is the point of that view. One shared flag per
+     * section rather than one per repo: collapsing "Working" is a statement about how you want to
+     * read the sidebar, not about one repo.
+     */
+    collapsedStatusBuckets: defineSetting<Record<string, boolean>>({
+        key: 'agent-storm:collapsed-status-buckets',
+        defaultValue: {},
+        parse: parseBooleanRecord,
+        serialize: (value) => JSON.stringify(value),
+    }),
+    /**
+     * Which worktree roots the user has collapsed, keyed by absolute repo path. Per-repo rather
+     * than one shared flag, because folding away the repo you are done with is the whole point.
+     */
+    collapsedRepos: defineSetting<Record<string, boolean>>({
+        key: 'agent-storm:collapsed-repos',
+        defaultValue: {},
+        parse: parseBooleanRecord,
+        serialize: (value) => JSON.stringify(value),
     }),
     tabOrder: defineSetting<ReadonlyArray<FrontendTab>>({
         key: 'agent-storm:tab-order',

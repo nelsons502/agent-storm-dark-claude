@@ -1,3 +1,5 @@
+// cspell:words unpark
+
 // cspell:word unstages
 
 import {
@@ -17,6 +19,7 @@ import {
     hideRepoEndpoint,
     killPanesEndpoint,
     mergeStepEndpoint,
+    parkFolderEndpoint,
     resetAiSessionEndpoint,
     restartDaemonEndpoint,
     restartPaneEndpoint,
@@ -150,6 +153,20 @@ export async function setMergeStep(
 ): Promise<void> {
     await requestApi('POST /worktrees/merge-step', () =>
         client.fetch(mergeStepEndpoint).POST({
+            requestData: params,
+        }),
+    );
+}
+
+/**
+ * Park or unpark a folder for the sidebar's "Do later" section. Like the merge-step write, the
+ * caller updates optimistically and the next folder poll reconciles.
+ */
+export async function setFolderParked(
+    params: Readonly<{folder: string; parked: boolean}>,
+): Promise<void> {
+    await requestApi('POST /worktrees/park', () =>
+        client.fetch(parkFolderEndpoint).POST({
             requestData: params,
         }),
     );

@@ -1,4 +1,4 @@
-// cspell:words numstat, unstages
+// cspell:words numstat, unparking, unstages
 
 import {defineApi, defineEndpoint, defineWebSocket, HttpMethod, HttpStatus} from '@rest-vir/api';
 import {
@@ -216,6 +216,22 @@ export const configJsonSchema = {
                 type: 'string',
             },
         },
+        /**
+         * Folders the user has manually parked into the sidebar's "Do later" section under status
+         * grouping. Server-side rather than in browser storage for the same reason the merge-step
+         * attestations are: parking a worktree on the desktop should still read as parked on the
+         * phone. Absent from `required` so older configs load unchanged.
+         */
+        parkedFolders: {
+            type: 'array',
+            default: [],
+            title: 'Parked folders',
+            description:
+                'Folders you have set aside via "Do later". Under status grouping these collect in their own collapsible section instead of competing for attention with active work.',
+            items: {
+                type: 'string',
+            },
+        },
         disabledGitHubPolling: {
             type: 'boolean',
             default: false,
@@ -358,6 +374,11 @@ export const folderInfoShape = defineShape({
      */
     createdAtMs: 0,
     isWorktreeRoot: false,
+    /**
+     * Whether the user has parked this folder into the sidebar's "Do later" section. Read-only here
+     * and written through `/worktrees/park`.
+     */
+    isParked: false,
     aiHidden: false,
     aiCmd: '',
     /**
@@ -986,6 +1007,29 @@ export const mergeStepEndpoint = defineEndpoint({
     },
 });
 
+/**
+ * Parking or unparking one folder. Like the merge-step write, `parked` is explicit rather than a
+ * flip so a stale client can't invert what another device just set.
+ */
+const parkFolderRequestShape = defineShape({
+    folder: '',
+    parked: false,
+});
+
+export const parkFolderEndpoint = defineEndpoint({
+    path: '/worktrees/park',
+    requests: {
+        [HttpMethod.Post]: {
+            requestData: parkFolderRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: okResponseShape,
+                },
+            },
+        },
+    },
+});
+
 export const deleteWorktreeEndpoint = defineEndpoint({
     path: '/worktrees/delete',
     requests: {
@@ -1231,6 +1275,7 @@ export const agentStormService = defineApi({
         createWorktreeEndpoint,
         deleteWorktreeEndpoint,
         mergeStepEndpoint,
+        parkFolderEndpoint,
         restartPaneEndpoint,
         killPanesEndpoint,
         sessionListEndpoint,

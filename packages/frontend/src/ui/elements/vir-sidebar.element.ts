@@ -1,4 +1,4 @@
-// cspell:words Hyperlegible, upserted
+// cspell:words Hyperlegible, unpark, upserted
 
 import {
     type FolderInfo,
@@ -55,8 +55,16 @@ import {
     killFolderPanes,
     putConfig,
     restartPane,
+    setFolderParked,
     touchRepo,
 } from '../../util/api-client.js';
+import {localStorageClient} from '../../util/local-storage-client.js';
+import {
+    bucketFoldersByStatus,
+    StatusBucket,
+    statusBucketLabels,
+    statusBucketOrder,
+} from '../../util/sidebar-grouping.js';
 import {AgentStormMarkIcon} from '../icons/agent-storm-mark.icon.js';
 
 const allowedLinkHostnames = ['github.com'];
@@ -106,6 +114,11 @@ const menuKillPanesIcon = createSizedIcon(lucideIcons.PowerOff, menuIconSize);
 const menuHideRepoIcon = createSizedIcon(lucideIcons.Archive, menuIconSize);
 const menuDeleteWorktreeIcon = createSizedIcon(lucideIcons.Trash2, menuIconSize);
 const menuRemoveRepoIcon = createSizedIcon(lucideIcons.X, menuIconSize);
+const menuParkIcon = createSizedIcon(lucideIcons.Clock, menuIconSize);
+const menuUnparkIcon = createSizedIcon(lucideIcons.Undo2, menuIconSize);
+
+const statusCollapsedIcon = createSizedIcon(lucideIcons.ChevronRight, 14);
+const statusExpandedIcon = createSizedIcon(lucideIcons.ChevronDown, 14);
 
 const sidebarGroupingLabels: Record<SidebarGrouping, string> = {
     [SidebarGrouping.Repo]: 'Group by repo',
@@ -201,6 +214,13 @@ type SidebarState = {
      * yet; both hide the CTA, as does a real `0`. Only a positive count renders anything.
      */
     reviewRequestedCount: number | null | undefined;
+    /**
+     * Which status sections the user has collapsed, mirrored from localStorage so a click
+     * re-renders. Keyed by `StatusBucket`; "Needs attention" never appears here.
+     */
+    collapsedStatusBuckets: Record<string, boolean>;
+    /** Which worktree roots are folded shut, keyed by repo path. Mirrored from localStorage. */
+    collapsedRepos: Record<string, boolean>;
 };
 
 type SidebarUpdate = (newState: Partial<SidebarState>) => void;
@@ -272,6 +292,8 @@ export const VirSidebar = defineElement<{
             updateStatus: undefined,
             notificationPermission: Notification.permission,
             reviewRequestedCount: undefined,
+            collapsedStatusBuckets: localStorageClient.collapsedStatusBuckets.read(),
+            collapsedRepos: localStorageClient.collapsedRepos.read(),
         };
     },
     styles: css`
@@ -383,6 +405,7 @@ export const VirSidebar = defineElement<{
         }
 
         .repo-header {
+            cursor: pointer;
             min-height: 28px;
             padding: 9px 6px 2px;
             font-weight: 600;
@@ -392,6 +415,56 @@ export const VirSidebar = defineElement<{
             align-items: center;
             gap: 6px;
             color: var(--app-muted);
+        }
+
+        /* Status-grouping section header. Deliberately quieter than .repo-header: repos are the
+           spine of the sidebar and sections sit inside them, so they read one level down. */
+        .status-header {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            width: 100%;
+            box-sizing: border-box;
+            min-height: 24px;
+            padding: 7px 6px 2px;
+            border: none;
+            background: none;
+            font: inherit;
+            font-size: 10px;
+            font-weight: 600;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+            color: var(--app-muted);
+            text-align: left;
+        }
+
+        .status-header[data-collapsible] {
+            cursor: pointer;
+        }
+
+        .status-header[data-collapsible]:hover {
+            color: var(--app-text);
+        }
+
+        /* Fixed-width so the label never shifts as counts cross from one digit to two. */
+        .status-count {
+            font-variant-numeric: tabular-nums;
+            opacity: 0.75;
+        }
+
+        .status-chevron {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 14px;
+            height: 14px;
+            flex-shrink: 0;
+        }
+
+        :host([data-mobile-modal]) .status-header {
+            font-size: 12px;
+            min-height: 34px;
+            padding: 10px 10px 4px;
         }
 
         .row {
@@ -504,6 +577,41 @@ export const VirSidebar = defineElement<{
         /* Groups the always-visible "add worktree" button with the hover-gated actions menu so the
            "+" stays visible regardless of hover (it sits outside the actions span, whose opacity
            gating would otherwise dim it along with the ellipsis). */
+        /* Groups the chevron with the repo name so the whole left side reads as one toggle. */
+        .repo-header-left {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            min-width: 0;
+        }
+
+        .repo-header-left .name-text {
+            overflow: hidden;
+            white-space: nowrap;
+            text-overflow: ellipsis;
+        }
+
+        /* Only shown while collapsed, so the row still says how much is hidden behind it. */
+        .repo-collapsed-count {
+            font-variant-numeric: tabular-nums;
+            font-weight: 500;
+            opacity: 0.7;
+        }
+
+        .repo-chevron {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 14px;
+            height: 14px;
+            flex-shrink: 0;
+            color: var(--app-muted);
+        }
+
+        .repo-header:hover .repo-chevron {
+            color: var(--app-text);
+        }
+
         .repo-header-right {
             display: inline-flex;
             align-items: center;
@@ -742,6 +850,9 @@ export const VirSidebar = defineElement<{
             });
             dispatch(new events.folderActivated(path));
         };
+        const onToggleParked = (folder: Readonly<FolderInfo>) => {
+            void toggleFolderParked(folder, state, updateState);
+        };
         const emitPaneRestarted = (detail: PaneRestartedEvent) => {
             dispatch(new events.paneRestarted(detail));
         };
@@ -796,6 +907,84 @@ export const VirSidebar = defineElement<{
                 state,
                 updateState,
                 emitPaneRestarted,
+            });
+        };
+
+        /**
+         * Render one list of folders — either the standalone repos or one worktree-root's children
+         * — honoring the active grouping. Repo grouping renders exactly the flat row list it always
+         * has; status grouping wraps the same rows in up to three sections.
+         */
+        const renderFolders = (folders: ReadonlyArray<FolderInfo>, indented: boolean) => {
+            const renderFolderRow = (folder: FolderInfo) =>
+                renderRow({
+                    folder,
+                    indented,
+                    activeFolder: inputs.activeFolder,
+                    needsAttention: inputs.attentionFolders.has(folder.path),
+                    openMenuKey: state.openMenuKey,
+                    onActivate: emitFolderActivated,
+                    removeFolderLocally,
+                    emitFoldersRemoved,
+                    onToggleParked,
+                    updateState,
+                });
+            if (state.sidebarGrouping !== SidebarGrouping.Status) {
+                return folders.map(renderFolderRow);
+            }
+            const buckets = bucketFoldersByStatus({
+                folders,
+                attentionFolders: inputs.attentionFolders,
+                comparator: folderComparator,
+            });
+            return statusBucketOrder.map((bucket) => {
+                const bucketFolders = buckets[bucket];
+                if (!bucketFolders.length) {
+                    return '';
+                }
+                /**
+                 * "Needs attention" is the reason this view exists, so it can't be collapsed away.
+                 * The other two are noise-reduction and fold shut.
+                 */
+                const collapsible = bucket !== StatusBucket.NeedsAttention;
+                const collapsed = collapsible && !!state.collapsedStatusBuckets[bucket];
+                return html`
+                    <button
+                        class="status-header"
+                        ?data-collapsible=${collapsible}
+                        title=${collapsible
+                            ? collapsed
+                                ? `Expand ${statusBucketLabels[bucket]}`
+                                : `Collapse ${statusBucketLabels[bucket]}`
+                            : statusBucketLabels[bucket]}
+                        ${listen('click', () => {
+                            if (collapsible) {
+                                toggleStatusBucket({
+                                    bucket,
+                                    state,
+                                    updateState,
+                                });
+                            }
+                        })}
+                    >
+                        ${collapsible
+                            ? html`
+                                  <span class="status-chevron">
+                                      <${ViraIcon.assign({
+                                          icon: collapsed
+                                              ? statusCollapsedIcon
+                                              : statusExpandedIcon,
+                                      })}></${ViraIcon}>
+                                  </span>
+                              `
+                            : ''}
+                        <span>${statusBucketLabels[bucket]}</span>
+                        <span class="status-count">
+                            ${String(bucketFolders.length).padStart(2, '0')}
+                        </span>
+                    </button>
+                    ${collapsed ? '' : bucketFolders.map(renderFolderRow)}
+                `;
             });
         };
 
@@ -964,31 +1153,47 @@ export const VirSidebar = defineElement<{
                           </div>
                       `
                     : ''}
-                ${standaloneFolders.map((folder) =>
-                    renderRow({
-                        folder,
-                        indented: false,
-                        activeFolder: inputs.activeFolder,
-                        needsAttention: inputs.attentionFolders.has(folder.path),
-                        openMenuKey: state.openMenuKey,
-                        onActivate: emitFolderActivated,
-                        removeFolderLocally,
-                        emitFoldersRemoved,
-                        updateState,
-                    }),
-                )}
+                ${renderFolders(standaloneFolders, false)}
                 ${worktreeRoots.map((root) => {
                     const children = visibleFolders
                         .filter((folder) => folder.parentRepoPath === root.path)
                         .toSorted(folderComparator);
                     const repoMenuKey = `repo:${root.path}`;
+                    const repoCollapsed = !!state.collapsedRepos[root.path];
                     return html`
                         <div
                             class="repo-header"
                             ?data-menu-open=${state.openMenuKey === repoMenuKey}
+                            title=${repoCollapsed ? `Expand ${root.name}` : `Collapse ${root.name}`}
+                            ${listen('click', () => {
+                                toggleRepoCollapsed({
+                                    repoPath: root.path,
+                                    state,
+                                    updateState,
+                                });
+                            })}
                         >
-                            <span>${root.name}</span>
-                            <span class="repo-header-right">
+                            <span class="repo-header-left">
+                                <span class="repo-chevron">
+                                    <${ViraIcon.assign({
+                                        icon: repoCollapsed
+                                            ? statusCollapsedIcon
+                                            : statusExpandedIcon,
+                                    })}></${ViraIcon}>
+                                </span>
+                                <span class="name-text">${root.name}</span>
+                                ${repoCollapsed
+                                    ? html`
+                                          <span class="repo-collapsed-count">
+                                              ${children.length}
+                                          </span>
+                                      `
+                                    : ''}
+                            </span>
+                            <span
+                                class="repo-header-right"
+                                ${listen('click', (event) => event.stopPropagation())}
+                            >
                                 <${ViraButton.assign({
                                     icon: addWorktreeIcon,
                                     buttonSize: ViraSize.Small,
@@ -1054,19 +1259,7 @@ export const VirSidebar = defineElement<{
                                 </span>
                             </span>
                         </div>
-                        ${children.map((child) =>
-                            renderRow({
-                                folder: child,
-                                indented: true,
-                                activeFolder: inputs.activeFolder,
-                                needsAttention: inputs.attentionFolders.has(child.path),
-                                openMenuKey: state.openMenuKey,
-                                onActivate: emitFolderActivated,
-                                removeFolderLocally,
-                                emitFoldersRemoved,
-                                updateState,
-                            }),
-                        )}
+                        ${repoCollapsed ? '' : renderFolders(children, true)}
                     `;
                 })}
             </div>
@@ -1377,6 +1570,79 @@ function renderReviewRequestedCta({
     `;
 }
 
+/**
+ * Fold one status section open or shut. Persisted to localStorage (a UI preference, unlike the
+ * parked flags, which are real per-folder data and live on the server).
+ */
+function toggleStatusBucket({
+    bucket,
+    state,
+    updateState,
+}: Readonly<{
+    bucket: StatusBucket;
+    state: SidebarState;
+    updateState: SidebarUpdate;
+}>): void {
+    const collapsedStatusBuckets = {
+        ...state.collapsedStatusBuckets,
+        [bucket]: !state.collapsedStatusBuckets[bucket],
+    };
+    localStorageClient.collapsedStatusBuckets.write(collapsedStatusBuckets);
+    updateState({
+        collapsedStatusBuckets,
+    });
+}
+
+/** Fold one worktree root's children open or shut. Persisted per repo path in localStorage. */
+function toggleRepoCollapsed({
+    repoPath,
+    state,
+    updateState,
+}: Readonly<{
+    repoPath: string;
+    state: SidebarState;
+    updateState: SidebarUpdate;
+}>): void {
+    const collapsedRepos = {
+        ...state.collapsedRepos,
+        [repoPath]: !state.collapsedRepos[repoPath],
+    };
+    localStorageClient.collapsedRepos.write(collapsedRepos);
+    updateState({
+        collapsedRepos,
+    });
+}
+
+/**
+ * Park or unpark a folder. Updated optimistically — the sidebar's own folders list is the render
+ * source, and waiting a round trip for a row to move sections would read as a dropped click.
+ */
+async function toggleFolderParked(
+    folder: Readonly<FolderInfo>,
+    state: SidebarState,
+    updateState: SidebarUpdate,
+): Promise<void> {
+    const parked = !folder.isParked;
+    updateState({
+        folders: state.folders.map((entry) =>
+            entry.path === folder.path
+                ? {
+                      ...entry,
+                      isParked: parked,
+                  }
+                : entry,
+        ),
+    });
+    try {
+        await setFolderParked({
+            folder: folder.path,
+            parked,
+        });
+    } catch (error: unknown) {
+        showError(updateState, error);
+    }
+}
+
 function renderPaneChip(label: string, status: PaneStatus) {
     if (status === PaneStatus.None) {
         return html`
@@ -1411,6 +1677,7 @@ function renderRow({
     onActivate,
     removeFolderLocally,
     emitFoldersRemoved,
+    onToggleParked,
     updateState,
 }: Readonly<{
     folder: FolderInfo;
@@ -1421,6 +1688,7 @@ function renderRow({
     onActivate: (folder: string) => void;
     removeFolderLocally: (path: string) => void;
     emitFoldersRemoved: (paths: ReadonlyArray<string>) => void;
+    onToggleParked: (folder: Readonly<FolderInfo>) => void;
     updateState: SidebarUpdate;
 }>) {
     const nameWithMarkers = [
@@ -1493,6 +1761,7 @@ function renderRow({
                             updateState,
                             removeFolderLocally,
                             emitFoldersRemoved,
+                            onToggleParked,
                         }),
                     )}
                 </${ViraMenuTrigger}>
@@ -1606,11 +1875,13 @@ function buildRowMenuEntries({
     updateState,
     removeFolderLocally,
     emitFoldersRemoved,
+    onToggleParked,
 }: Readonly<{
     folder: FolderInfo;
     updateState: SidebarUpdate;
     removeFolderLocally: (path: string) => void;
     emitFoldersRemoved: (paths: ReadonlyArray<string>) => void;
+    onToggleParked: (folder: Readonly<FolderInfo>) => void;
 }>): ReadonlyArray<ViraMenuItemEntry> {
     return [
         folder.prUrl &&
@@ -1633,6 +1904,17 @@ function buildRowMenuEntries({
             iconOverride: folder.aiHidden ? menuShowAiIcon : menuHideAiIcon,
             onClick: () => {
                 void toggleAiHidden(folder.path, updateState);
+            },
+        },
+        /**
+         * Worktree roots render as section headers rather than rows, and the backend never marks
+         * one parked — a repo root has no PR lifecycle to set aside.
+         */
+        !folder.isWorktreeRoot && {
+            content: folder.isParked ? 'Move out of Do later' : 'Do later',
+            iconOverride: folder.isParked ? menuUnparkIcon : menuParkIcon,
+            onClick: () => {
+                onToggleParked(folder);
             },
         },
         {

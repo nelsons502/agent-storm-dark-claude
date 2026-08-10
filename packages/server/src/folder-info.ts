@@ -15,6 +15,7 @@ import {
     getFolderAiCmd,
     getFolderMergeSteps,
     getFolderResetAiSessionCmd,
+    isFolderParked,
     loadConfig,
     saveConfig,
 } from './config.js';
@@ -336,6 +337,7 @@ type RefreshTarget = {
     parentRepoPath: string | null;
     createdAtMs: number;
     isWorktreeRoot: boolean;
+    isParked: boolean;
     aiHidden: boolean;
     aiCmd: string;
     resetAiSessionCmd: string;
@@ -369,6 +371,10 @@ async function enumerateTargets(config: Readonly<Config>): Promise<RefreshTarget
                         parentRepoPath: null,
                         createdAtMs,
                         isWorktreeRoot: false,
+                        isParked: isFolderParked({
+                            config,
+                            folder: repo.path,
+                        }),
                         aiHidden: config.hiddenAiPane.includes(repo.path),
                         aiCmd: getFolderAiCmd({
                             config,
@@ -392,6 +398,8 @@ async function enumerateTargets(config: Readonly<Config>): Promise<RefreshTarget
                     parentRepoPath: null,
                     createdAtMs,
                     isWorktreeRoot: true,
+                    /** A repo root has no PR lifecycle, so parking it would mean nothing. */
+                    isParked: false,
                     aiHidden: false,
                     aiCmd: getFolderAiCmd({
                         config,
@@ -413,6 +421,10 @@ async function enumerateTargets(config: Readonly<Config>): Promise<RefreshTarget
                             parentRepoPath: repo.path,
                             createdAtMs: await getCreatedAtMs(child),
                             isWorktreeRoot: false,
+                            isParked: isFolderParked({
+                                config,
+                                folder: child,
+                            }),
                             aiHidden: config.hiddenAiPane.includes(child),
                             aiCmd: getFolderAiCmd({
                                 config,
@@ -463,6 +475,7 @@ async function buildFolderInfo({
         parentRepoPath: target.parentRepoPath,
         createdAtMs: target.createdAtMs,
         isWorktreeRoot: target.isWorktreeRoot,
+        isParked: target.isParked,
         aiHidden: target.aiHidden,
         aiCmd: target.aiCmd,
         resetAiSessionCmd: target.resetAiSessionCmd,
@@ -533,6 +546,7 @@ function placeholderFolderInfo(target: RefreshTarget): FolderInfo {
         parentRepoPath: target.parentRepoPath,
         createdAtMs: target.createdAtMs,
         isWorktreeRoot: target.isWorktreeRoot,
+        isParked: target.isParked,
         aiHidden: target.aiHidden,
         aiCmd: target.aiCmd,
         resetAiSessionCmd: target.resetAiSessionCmd,

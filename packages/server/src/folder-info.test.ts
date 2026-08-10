@@ -39,6 +39,7 @@ function soloRepoTarget() {
         parentRepoPath: null,
         createdAtMs: 0,
         isWorktreeRoot: false,
+        isParked: false,
         aiHidden: false,
         aiCmd: '',
         resetAiSessionCmd: '',
@@ -53,6 +54,7 @@ function worktreeTargets() {
             parentRepoPath: null,
             createdAtMs: 0,
             isWorktreeRoot: true,
+            isParked: false,
             aiHidden: false,
             aiCmd: '',
             resetAiSessionCmd: '',
@@ -63,6 +65,7 @@ function worktreeTargets() {
             parentRepoPath: rootPath,
             createdAtMs: 0,
             isWorktreeRoot: false,
+            isParked: false,
             aiHidden: false,
             aiCmd: '',
             resetAiSessionCmd: '',
@@ -188,6 +191,7 @@ describe('persisted folder info migration', () => {
         parentRepoPath: null,
         createdAtMs: 0,
         isWorktreeRoot: false,
+        isParked: false,
         aiHidden: false,
         aiCmd: '',
         resetAiSessionCmd: '',
@@ -220,6 +224,17 @@ describe('persisted folder info migration', () => {
          */
         assert.isTrue(checkValidShape(legacyEntry, folderInfoShape));
         assert.deepEquals(fillNullableFolderInfoFields(legacyEntry as FolderInfo), currentEntry);
+    });
+
+    it('drops an entry written before the parked flag existed', () => {
+        const {isParked, ...legacyEntry} = currentEntry;
+        /**
+         * Unlike the nullable PR fields above, `isParked` is a plain boolean, so a row from an
+         * older build fails validation outright and `loadPersistedCache` discards it. That is the
+         * intended migration path: the next sweep refills the row rather than us guessing a parked
+         * state.
+         */
+        assert.isFalse(checkValidShape(legacyEntry, folderInfoShape));
     });
 
     it('accepts a fully populated PR block', () => {

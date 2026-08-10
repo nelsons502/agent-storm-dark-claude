@@ -21,6 +21,7 @@ const baseFolder: FolderInfo = {
     parentRepoPath: '/repos/root',
     createdAtMs: 0,
     isWorktreeRoot: false,
+    isParked: false,
     aiHidden: false,
     aiCmd: '',
     resetAiSessionCmd: '',

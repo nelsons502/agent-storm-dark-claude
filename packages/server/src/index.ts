@@ -1,4 +1,4 @@
-// cspell:words mkdirs
+// cspell:words mkdirs, unparking
 
 import {
     agentStormService,
@@ -18,6 +18,7 @@ import {
     killPanesEndpoint,
     mergeStepEndpoint,
     PaneKind,
+    parkFolderEndpoint,
     ptyWebSocket,
     resetAiSessionEndpoint,
     restartDaemonEndpoint,
@@ -48,6 +49,7 @@ import {
     saveConfig,
     setFolderAiCmd,
     setFolderMergeStep,
+    setFolderParked,
     setFolderResetAiSessionCmd,
 } from './config.js';
 import {
@@ -339,6 +341,31 @@ const mergeStepImplementation = implementor.implementEndpoint(mergeStepEndpoint,
                 step: requestData.step,
                 done: requestData.done,
                 commitHash: (await getGitInfo(folder)).headCommitHash,
+            }),
+        );
+        await refreshFolderInfoNow();
+        return {
+            [HttpStatus.Ok]: {
+                responseData: {
+                    ok: true,
+                },
+            },
+        };
+    },
+});
+
+/**
+ * Parking or unparking a folder for the sidebar's "Do later" section. Refreshes folder info inline
+ * so the next 2s poll already carries the new `isParked` rather than reverting the optimistic UI.
+ */
+const parkFolderImplementation = implementor.implementEndpoint(parkFolderEndpoint, {
+    async [HttpMethod.Post]({requestData}) {
+        const config = await loadConfig();
+        await saveConfig(
+            setFolderParked({
+                config,
+                folder: normalizePath(requestData.folder),
+                parked: requestData.parked,
             }),
         );
         await refreshFolderInfoNow();
@@ -915,6 +942,7 @@ const implementation = implementApi<undefined>()(agentStormService, {
         createWorktreeImplementation,
         deleteWorktreeImplementation,
         mergeStepImplementation,
+        parkFolderImplementation,
         restartPaneImplementation,
         killPanesImplementation,
         sessionListImplementation,
