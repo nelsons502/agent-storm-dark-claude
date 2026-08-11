@@ -1,4 +1,5 @@
 import {type PaneKind} from '@agent-storm/common';
+import {wrapInTry} from '@augment-vir/common';
 import {createConnection, type Socket} from 'node:net';
 import {daemonSocketPath} from '../file-paths.js';
 import {
@@ -32,7 +33,22 @@ async function singleShot<Response extends {ok: true}>(
     const decoder = new FrameDecoder();
     return new Promise<Response>((resolve, reject) => {
         socket.on('data', (chunk) => {
-            const frames = decoder.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            /**
+             * Decoding throws on a desynced stream. Reject rather than let it escape the handler:
+             * an unhandled throw inside a socket callback is an uncaught exception, which would
+             * take the backend process down over one bad daemon connection.
+             */
+            const frames = wrapInTry(
+                () => decoder.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)),
+                {
+                    fallbackValue: undefined,
+                },
+            );
+            if (!frames) {
+                socket.destroy();
+                reject(new Error('daemon frame stream desynced'));
+                return;
+            }
             const controlFrame = frames.find((frame) => frame.type === FrameType.Control);
             if (!controlFrame) {
                 return;
@@ -172,7 +188,25 @@ export async function attachPane({
 
     const handshakeResult = await new Promise<AttachResponse>((resolve, reject) => {
         const handler = (chunk: Buffer | string) => {
-            const frames = decoder.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+            /**
+             * Same guard as `singleShot`, and it matters more here: this handler outlives the
+             * handshake promise, so past resolution there is no promise left to catch a throw at
+             * all.
+             */
+            const frames = wrapInTry(
+                () => decoder.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)),
+                {
+                    fallbackValue: undefined,
+                },
+            );
+            if (!frames) {
+                socket.destroy();
+                if (!handshakeState.resolved) {
+                    handshakeState.resolved = true;
+                    reject(new Error('daemon frame stream desynced'));
+                }
+                return;
+            }
             frames.forEach((frame) => {
                 if (handshakeState.resolved) {
                     routeFrame(frame);

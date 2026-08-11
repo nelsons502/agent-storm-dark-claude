@@ -408,6 +408,22 @@ const prCacheByFolder = new Map<
 >();
 
 /**
+ * Drop cached PR data for folders that are no longer configured.
+ *
+ * Without this the map only ever grew: it is keyed by worktree path, and a cached entry holds a
+ * whole `GitHubPr` — body HTML, up to 20 reviews, 50 review threads of 20 comments each, 50
+ * conversation comments, 50 check runs — so an active PR is easily hundreds of KB retained per dead
+ * worktree. There is no size ceiling on this map, unlike the daemon's scrollback budget.
+ *
+ * @param validFolders Folders that still exist. Anything else is evicted.
+ */
+export function pruneFolderPrCache(validFolders: ReadonlySet<string>): void {
+    Array.from(prCacheByFolder.keys())
+        .filter((folder) => !validFolders.has(folder))
+        .forEach((folder) => prCacheByFolder.delete(folder));
+}
+
+/**
  * Everything the GitHub pane needs for one folder, or null when there's nothing to show: the folder
  * isn't a git checkout, its `origin` isn't on github.com, or the branch has no PR.
  */

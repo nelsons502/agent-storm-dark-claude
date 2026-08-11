@@ -434,3 +434,92 @@ describe(chunkScrollbackForReplay.name, () => {
         assert.strictEquals(chunkScrollbackForReplay('🎉', 1).join(''), '🎉');
     });
 });
+
+describe('dead pane reaping', () => {
+    it('forgets a pane once its process has exited and the last viewer detaches', async () => {
+        const folder = await mkdtemp(join(tmpdir(), 'agent-storm-pty-reap-'));
+        try {
+            const exits: (number | undefined)[] = [];
+            const attachment = attachPane({
+                folder,
+                kind: PaneKind.Ai,
+                /** Exits immediately, which is the case `onExit` used to leave behind forever. */
+                aiCmd: 'exit 0',
+                onData() {},
+                onExit(exitCode) {
+                    exits.push(exitCode);
+                },
+            });
+            await waitUntil(() => exits.length > 0, {
+                interval: {
+                    milliseconds: 20,
+                },
+                timeout: {
+                    seconds: 30,
+                },
+            });
+            /**
+             * Still listed while a viewer is attached: the exit code and final output have to stay
+             * replayable for the pane the user is looking at.
+             */
+            assert.isTrue(
+                listAllPaneStatuses().some((entry) => entry.folder === folder),
+                'an exited pane with a viewer attached should still be listed',
+            );
+            attachment.detach();
+            assert.isFalse(
+                listAllPaneStatuses().some((entry) => entry.folder === folder),
+                'an exited pane should be forgotten once its last viewer detaches',
+            );
+        } finally {
+            await rm(folder, {
+                recursive: true,
+                force: true,
+            });
+        }
+    });
+
+    it('keeps a live pane when a viewer detaches', async () => {
+        const folder = await mkdtemp(join(tmpdir(), 'agent-storm-pty-keep-'));
+        try {
+            const output: string[] = [];
+            const attachment = attachPane({
+                folder,
+                kind: PaneKind.Ai,
+                aiCmd: persistentAiCommand('alive'),
+                onData(data) {
+                    output.push(data);
+                },
+                onExit() {},
+            });
+            try {
+                await waitUntil(() => output.join('').includes('alive'), {
+                    interval: {
+                        milliseconds: 20,
+                    },
+                    timeout: {
+                        seconds: 30,
+                    },
+                });
+                attachment.detach();
+                /**
+                 * Detaching the browser must never reap a running session — that is the whole point
+                 * of the daemon outliving the page.
+                 */
+                assert.isTrue(
+                    listAllPaneStatuses().some((entry) => entry.folder === folder),
+                    'a running pane should survive its viewer detaching',
+                );
+            } finally {
+                killFolderPanes({
+                    folder,
+                });
+            }
+        } finally {
+            await rm(folder, {
+                recursive: true,
+                force: true,
+            });
+        }
+    });
+});

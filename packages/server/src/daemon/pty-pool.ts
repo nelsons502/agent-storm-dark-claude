@@ -347,6 +347,11 @@ function startPty({
                 subscriber.onData(message);
                 subscriber.onExit(exitCode);
             });
+            /**
+             * Covers a pane that exits with nobody attached — a background session whose command
+             * finished. With a viewer attached this is a no-op and the reap happens on detach.
+             */
+            reapIfDead(entry);
         });
         /**
          * If a restart happens while clients are still attached (each carrying their last reported
@@ -426,6 +431,27 @@ export function chunkScrollbackForReplay(
     return chunks;
 }
 
+/**
+ * Forget a pane whose process is gone and which nobody is watching.
+ *
+ * `onExit` only cleared `entry.pty` and left the entry in {@link panes}, so the map only shrank when
+ * something explicitly killed a pane through the app. A PTY whose AI command exited on its own, or
+ * a worktree removed outside the app, left an entry holding its `subscribers` Set and its
+ * scrollback for the life of the daemon — and the daemon deliberately outlives the server, so that
+ * could be weeks.
+ *
+ * The subscriber check is what makes this safe: while any client is attached, the entry stays so
+ * the exit code and final output remain replayable. Only once the last viewer detaches from an
+ * already- exited pane is there nothing left to show.
+ */
+function reapIfDead(entry: PaneEntry): void {
+    if (entry.pty || entry.subscribers.size > 0) {
+        return;
+    }
+    clearScrollback(entry);
+    panes.delete(paneKey(entry.folder, entry.kind, entry.sessionId));
+}
+
 export function attachPane({
     folder,
     kind,
@@ -496,6 +522,7 @@ export function attachPane({
              * to whatever the remaining clients allow.
              */
             applyMinSize(entry);
+            reapIfDead(entry);
         },
     };
 }

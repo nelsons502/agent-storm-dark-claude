@@ -1,5 +1,6 @@
 import {type PaneKind} from '@agent-storm/common';
 import {check} from '@augment-vir/assert';
+import {wrapInTry} from '@augment-vir/common';
 import {existsSync, unlinkSync} from 'node:fs';
 import {createServer, type Socket} from 'node:net';
 import {daemonSocketPath} from '../file-paths.js';
@@ -89,7 +90,24 @@ function handleAttach({
         socket.write(encodeDataFrame(chunk));
     });
     socket.on('data', (chunk) => {
-        decoder.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)).forEach((frame) => {
+        /**
+         * A decode failure means this client's stream is no longer frame-aligned, and nothing sent
+         * over it can be trusted from here on. Drop the connection — the browser reattaches — but
+         * let the daemon and every other pane carry on: an unhandled throw in a socket handler
+         * would take the whole daemon down and kill every session with it.
+         */
+        const frames = wrapInTry(
+            () => decoder.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)),
+            {
+                fallbackValue: undefined,
+            },
+        );
+        if (!frames) {
+            log('dropping attach socket: frame stream desynced');
+            socket.destroy();
+            return;
+        }
+        frames.forEach((frame) => {
             if (frame.type === FrameType.Data) {
                 writeToPane({
                     folder,
@@ -122,7 +140,18 @@ const server = createServer((socket) => {
     });
 
     const handshakeHandler = (chunk: Buffer | string) => {
-        const frames = decoder.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        /** Same reasoning as the attach socket above: kill the connection, never the daemon. */
+        const frames = wrapInTry(
+            () => decoder.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)),
+            {
+                fallbackValue: undefined,
+            },
+        );
+        if (!frames) {
+            log('dropping socket during handshake: frame stream desynced');
+            socket.destroy();
+            return;
+        }
         const controlFrame = frames.find((frame) => frame.type === FrameType.Control);
         if (!controlFrame || handshakeSeen) {
             return;

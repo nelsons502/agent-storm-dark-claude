@@ -32,7 +32,9 @@ import {
     type PrInfo,
     type RepoSlug,
 } from './git.js';
+import {pruneFolderPrCache} from './github-pr.js';
 import {getPaneStatusLookup} from './pty.js';
+import {pruneMissingFolderSessions} from './sessions.js';
 
 type PaneStatusLookup = (folder: string, kind: PaneKind) => PaneStatus;
 
@@ -1068,6 +1070,21 @@ async function runSweep(force = false): Promise<void> {
     Array.from(refreshState.lastGitRefreshAtMs.keys())
         .filter((path) => !validPaths.has(path))
         .forEach((path) => refreshState.lastGitRefreshAtMs.delete(path));
+    /**
+     * Every other module-level map keyed by folder path gets pruned here too. This is the only
+     * choke point that notices a worktree removed _outside_ the app — `git worktree remove` from a
+     * terminal never reaches the delete endpoint — which is exactly how these maps grew without
+     * bound.
+     *
+     * Guarded on a non-empty enumeration: a transient config read failure returning no targets must
+     * not be read as "every folder is gone" and flush live caches.
+     */
+    if (targets.length > 0) {
+        Array.from(repoSlugByFolder.keys())
+            .filter((path) => !validPaths.has(path))
+            .forEach((path) => repoSlugByFolder.delete(path));
+        pruneFolderPrCache(validPaths);
+    }
     if (stale.length > 0) {
         persistCache();
     }
@@ -1128,6 +1145,14 @@ export async function startFolderInfoRefreshLoop(): Promise<void> {
     refreshState.loopStarted = true;
     await loadPersistedCache();
     await loadPersistedGithubCache();
+    /**
+     * Once per process is enough: the store only accrues an entry per folder, so growth is slow and
+     * a boot-time sweep keeps it bounded without paying a `stat` per folder on every refresh.
+     */
+    const forgotten = await pruneMissingFolderSessions().catch(() => 0);
+    if (forgotten > 0) {
+        log.info(`forgot stored sessions for ${forgotten} folders that no longer exist`);
+    }
     const initialConfig = await loadConfig().catch(() => undefined);
     if (initialConfig) {
         loadAutoDisableFromConfig(initialConfig);

@@ -1,7 +1,7 @@
 import {PaneKind, type FolderSessions, type SessionMeta} from '@agent-storm/common';
 import {getObjectTypedKeys, wrapInTry} from '@augment-vir/common';
 import {randomUUID} from 'node:crypto';
-import {mkdir, readFile, rename, writeFile} from 'node:fs/promises';
+import {mkdir, readFile, rename, stat, writeFile} from 'node:fs/promises';
 import {defaultSessionId} from './daemon/protocol.js';
 import {notCommittedDir, sessionStorePath} from './file-paths.js';
 import {normalizePath} from './paths.js';
@@ -266,6 +266,46 @@ export async function forgetFolderSessions(folderPath: string): Promise<void> {
     }, {});
     storeState.loaded = updated;
     persistStore(updated);
+}
+
+/**
+ * Drop stored sessions for folders that no longer exist on disk.
+ *
+ * `forgetFolderSessions` only runs when a worktree is deleted through the app, so anything removed
+ * another way — `git worktree remove` from a terminal, a temp directory from a test run — left its
+ * entry behind forever. Both the file and the in-memory store grew monotonically as a result.
+ *
+ * Keyed on directory existence rather than the configured folder list on purpose: existence cannot
+ * be wrongly emptied by a transient config read failure, and a folder that still exists but is
+ * unconfigured may well be re-added, so its tab names are worth keeping.
+ *
+ * @returns How many folders were forgotten.
+ */
+export async function pruneMissingFolderSessions(): Promise<number> {
+    const store = await loadStore();
+    const folders = getObjectTypedKeys(store);
+    const missing = await Promise.all(
+        folders.map(async (folder) => {
+            const stats = await stat(folder).catch(() => undefined);
+            return stats?.isDirectory() ? undefined : folder;
+        }),
+    );
+    const toForget = new Set(missing.filter((folder) => folder !== undefined));
+    if (!toForget.size) {
+        return 0;
+    }
+    const updated = folders.reduce<SessionStore>((next, key) => {
+        const value = store[key];
+        return toForget.has(key) || !value
+            ? next
+            : {
+                  ...next,
+                  [key]: value,
+              };
+    }, {});
+    storeState.loaded = updated;
+    persistStore(updated);
+    return toForget.size;
 }
 
 /**

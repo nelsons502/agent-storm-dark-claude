@@ -33,6 +33,22 @@ export type ParsedFrame = {
 };
 
 /**
+ * Largest payload a single frame may declare.
+ *
+ * The length prefix is a `UInt32BE`, so a desynced or corrupted stream can announce a frame of up
+ * to 4GB and the decoder would buffer everything that followed while waiting for it — an unbounded
+ * hold with no backstop. Real frames are terminal I/O, JSON control messages, and 64KB scrollback
+ * replay chunks, so anything past a few MB means the stream is no longer frame-aligned and the
+ * right move is to fail loudly rather than accumulate.
+ */
+const maxFramePayloadBytes = 8 * 1024 * 1024;
+
+/** Thrown on a desynced stream. Callers should close the connection rather than retry. */
+export class FrameDecodeError extends Error {
+    public override name = 'FrameDecodeError';
+}
+
+/**
  * Stateful decoder that accumulates byte chunks and emits complete frames as they arrive. Buffers
  * are mutated in place because this sits on a hot socket-read path.
  */
@@ -48,6 +64,16 @@ export class FrameDecoder {
         while (this.buffer.length >= headerSize) {
             const type = this.buffer.readUInt8(0) as FrameType;
             const length = this.buffer.readUInt32BE(1);
+            if (length > maxFramePayloadBytes) {
+                /**
+                 * Drop the buffer before throwing: leaving it in place would retain the bytes we
+                 * just refused to parse, which is the leak this guard exists to prevent.
+                 */
+                this.buffer = Buffer.alloc(0);
+                throw new FrameDecodeError(
+                    `frame declared ${length} bytes, over the ${maxFramePayloadBytes} limit — stream is not frame-aligned`,
+                );
+            }
             if (this.buffer.length < headerSize + length) {
                 break;
             }
