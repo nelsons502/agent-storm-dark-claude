@@ -25,6 +25,16 @@ async function withTempFolder(run: (folder: string) => Promise<void>): Promise<v
     try {
         await run(folder);
     } finally {
+        /**
+         * These functions write to the real store at `sessionStorePath`, which has no test
+         * override, so a run that only removed its temp directory left its entry behind in the
+         * developer's own `pane-sessions.json` forever. That is how a live store reached 252
+         * entries of which 240 pointed at deleted temp directories — the very accumulation
+         * `pruneMissingFolderSessions` exists to clean up.
+         */
+        await forgetFolderSessions(folder).catch(() => {
+            /* best effort: never fail a passing test over store cleanup */
+        });
         await rm(folder, {
             recursive: true,
             force: true,
