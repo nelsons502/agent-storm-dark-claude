@@ -180,6 +180,16 @@ export const VirGithubPane = defineElement<{
             refreshTimer: undefined as ReturnType<typeof setInterval> | undefined,
         };
     },
+    cleanup({state}) {
+        /**
+         * `render` only disarms the timer on an active→inactive transition, which never happens
+         * when the element is unmounted while still active — a folder eviction or a mobile folder
+         * switch. Without this the interval outlives the element and keeps polling GitHub forever.
+         */
+        if (state.refreshTimer) {
+            clearInterval(state.refreshTimer);
+        }
+    },
     styles: css`
         :host {
             display: flex;

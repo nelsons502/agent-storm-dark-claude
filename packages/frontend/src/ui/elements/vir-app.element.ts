@@ -18,6 +18,7 @@ import {getConfig, getFolders, setMergeStep, touchRepo} from '../../util/api-cli
 import {shouldSurfaceAttention, type PaneAttentionRequest} from '../../util/interaction-state.js';
 import {localStorageClient, sidebarWidth} from '../../util/local-storage-client.js';
 import {MergeStepAction} from '../../util/merge-steps.js';
+import {admitMountedFolder} from '../../util/mounted-folders.js';
 import {derivePetMood} from '../../util/pet-mood.js';
 import {PetSpecies, petSpeciesForTheme} from '../../util/pet-species.js';
 import {
@@ -161,9 +162,12 @@ function clampSidebarWidth(value: number): number {
 
 type AppState = {
     /**
-     * Folders the user has clicked into, by absolute path. Kept around so each pane keeps its
-     * terminal scrollback when the user switches folders. The currently-active folder is derived
-     * from the URL + folder info; this list is the "ever opened during this session" superset.
+     * Folders currently mounted, by absolute path, ordered least-recently-used first. Kept around
+     * so each pane keeps its terminal scrollback when the user switches folders.
+     *
+     * Bounded by `maxMountedFolders` — see `admitMountedFolder`. This used to be the "ever opened
+     * during this session" superset, which meant a long-lived tab held terminals for every worktree
+     * the user had ever visited.
      */
     openedFolders: ReadonlyArray<string>;
     folderInfo: Map<string, FolderInfo>;
@@ -597,15 +601,18 @@ export const VirApp = defineElement()({
          * render.
          */
         if (activeFolder && !state.openedFolders.includes(activeFolder)) {
-            const newOpened = [
-                ...state.openedFolders,
+            const newOpened = admitMountedFolder({
+                openedFolders: state.openedFolders,
+                folder: activeFolder,
                 activeFolder,
-            ];
-            void Promise.resolve().then(() => {
-                updateState({
-                    openedFolders: newOpened,
-                });
             });
+            if (newOpened) {
+                void Promise.resolve().then(() => {
+                    updateState({
+                        openedFolders: newOpened,
+                    });
+                });
+            }
         }
 
         const attentionCount = state.attentionSessions.size;
@@ -774,12 +781,19 @@ export const VirApp = defineElement()({
                     }
                 })();
             }
-            if (!state.openedFolders.includes(folderPath)) {
+            /**
+             * Unconditional, unlike the route-resolution path above: activating an already-mounted
+             * folder still needs to mark it most-recently-used, or the eviction order would reflect
+             * when a folder was first opened rather than when it was last used.
+             */
+            const admitted = admitMountedFolder({
+                openedFolders: state.openedFolders,
+                folder: folderPath,
+                activeFolder: folderPath,
+            });
+            if (admitted) {
                 updateState({
-                    openedFolders: [
-                        ...state.openedFolders,
-                        folderPath,
-                    ],
+                    openedFolders: admitted,
                 });
             }
             /**
