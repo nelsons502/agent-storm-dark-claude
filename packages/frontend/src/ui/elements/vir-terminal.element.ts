@@ -19,6 +19,10 @@ import {client, getConfig, uploadFile} from '../../util/api-client.js';
 import {ensureSecret} from '../../util/auth.js';
 import {type PaneAttentionRequest} from '../../util/interaction-state.js';
 import {localStorageClient} from '../../util/local-storage-client.js';
+import {
+    createTerminalWriteBatcher,
+    type TerminalWriteBatcher,
+} from '../../util/terminal-write-batcher.js';
 import {resolveTheme, terminalThemeBackground} from '../../util/theme.js';
 import {defaultXtermStyles} from './xterm-styles.js';
 
@@ -437,6 +441,11 @@ export const VirTerminal = defineElement<{
              * close it. Switching session tabs makes that window routine rather than rare.
              */
             unmounted: false,
+            /**
+             * Coalesces inbound PTY chunks into one xterm write per frame. Held in state so
+             * `cleanup` can dispose it before the terminal it writes into.
+             */
+            writeBatcher: undefined as TerminalWriteBatcher | undefined,
         };
     },
     styles: css`
@@ -575,6 +584,11 @@ export const VirTerminal = defineElement<{
         });
         state.resizeObserver?.disconnect();
         state.disconnect?.();
+        /**
+         * Before disposing the terminal: a queued flush would otherwise fire against a disposed
+         * xterm instance.
+         */
+        state.writeBatcher?.dispose();
         state.terminal?.dispose();
         if (state.uploadErrorTimeout) {
             clearTimeout(state.uploadErrorTimeout);
@@ -673,6 +687,12 @@ export const VirTerminal = defineElement<{
                          * and hashes, while keeping dotted filenames together.
                          */
                         wordSeparator: ' \t\n()[]{}\'",:;/\\<>`=-#*',
+                    });
+                    const writeBatcher = createTerminalWriteBatcher({
+                        write: (data) => terminal.write(data),
+                    });
+                    updateState({
+                        writeBatcher,
                     });
                     const fitAddon = new FitAddon();
                     terminal.loadAddon(fitAddon);
@@ -805,10 +825,10 @@ export const VirTerminal = defineElement<{
                         protocols: [secret],
                         listeners: {
                             message({message}) {
-                                terminal.write(message);
+                                writeBatcher.push(message);
                             },
                             close() {
-                                terminal.write('\r\n[connection closed]\r\n');
+                                writeBatcher.push('\r\n[connection closed]\r\n');
                             },
                         },
                     });
@@ -820,6 +840,12 @@ export const VirTerminal = defineElement<{
                      */
                     if (isUnmounted()) {
                         void socket.close();
+                        /**
+                         * `cleanup` already ran, so it disposed the state-held batcher before this
+                         * one existed. Dispose it here or a queued replay flush lands on a disposed
+                         * terminal.
+                         */
+                        writeBatcher.dispose();
                         terminal.dispose();
                         return;
                     }
@@ -1114,7 +1140,24 @@ export const VirTerminal = defineElement<{
                      */
                     fitAndResend();
 
-                    const resizeObserver = new ResizeObserver(() => fitAndResend());
+                    /**
+                     * Coalesce resize bursts into one fit per frame. `fitAndResend` measures the
+                     * host, reflows xterm, and sends a resize over the socket, and dragging the
+                     * pane divider produces a ResizeObserver callback per pointer move — so an
+                     * undebounced observer did all of that dozens of times a second mid-drag.
+                     */
+                    const pendingFit: {frame: number | undefined} = {
+                        frame: undefined,
+                    };
+                    const resizeObserver = new ResizeObserver(() => {
+                        if (pendingFit.frame !== undefined) {
+                            return;
+                        }
+                        pendingFit.frame = requestAnimationFrame(() => {
+                            pendingFit.frame = undefined;
+                            fitAndResend();
+                        });
+                    });
                     resizeObserver.observe(element);
 
                     /**

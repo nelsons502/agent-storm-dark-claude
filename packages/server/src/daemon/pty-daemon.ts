@@ -21,6 +21,7 @@ import {
 } from './protocol.js';
 import {
     attachPane,
+    chunkScrollbackForReplay,
     killAllPanes,
     killFolderPanes,
     killPaneSession,
@@ -80,9 +81,13 @@ function handleAttach({
         isNew,
     };
     socket.write(encodeControlFrame(response));
-    if (scrollback) {
-        socket.write(encodeDataFrame(scrollback));
-    }
+    /**
+     * Chunked rather than one big frame so the browser can write the replay to xterm in pieces —
+     * see `chunkScrollbackForReplay`. Byte order is unchanged.
+     */
+    chunkScrollbackForReplay(scrollback).forEach((chunk) => {
+        socket.write(encodeDataFrame(chunk));
+    });
     socket.on('data', (chunk) => {
         decoder.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)).forEach((frame) => {
             if (frame.type === FrameType.Data) {

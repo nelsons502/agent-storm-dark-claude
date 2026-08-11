@@ -358,6 +358,56 @@ function limitScrollbackLines(scrollback: string, scrollbackLimit: number | unde
     return lines.slice(-scrollbackLimit).join('\n');
 }
 
+/**
+ * How much replay scrollback goes into a single frame.
+ *
+ * A newly-attaching pane used to receive its whole buffer — up to {@link maxScrollbackBytes} — as
+ * one frame, which the browser then handed to xterm as one `terminal.write` call. xterm has to
+ * parse and render that entire string before the pane is interactive, which is what made switching
+ * session tabs on a long-running Claude session feel like a hang. Splitting the replay lets xterm
+ * interleave parsing with rendering and show earlier content sooner, for the same total bytes.
+ */
+const scrollbackReplayChunkBytes = 64 * 1024;
+
+/** The leading half of a UTF-16 surrogate pair, which must never end a chunk on its own. */
+const highSurrogate = /[\uD800-\uDBFF]/;
+
+/**
+ * Split replay scrollback into frame-sized pieces, never breaking a surrogate pair across a
+ * boundary (half a pair is not a valid code point and would reach the terminal as a replacement
+ * character).
+ *
+ * Pure and exported for tests.
+ */
+export function chunkScrollbackForReplay(
+    scrollback: string,
+    chunkSize: number = scrollbackReplayChunkBytes,
+): string[] {
+    if (!scrollback) {
+        return [];
+    }
+    const chunks: string[] = [];
+    const cursor: {index: number} = {
+        index: 0,
+    };
+    while (cursor.index < scrollback.length) {
+        const tentativeEnd = Math.min(cursor.index + chunkSize, scrollback.length);
+        const endsOnHighSurrogate =
+            tentativeEnd < scrollback.length &&
+            highSurrogate.test(scrollback.charAt(tentativeEnd - 1));
+        /**
+         * Backing up is only safe when it still advances. With a pathologically small chunk size
+         * the retreat could land back on the cursor, so fall back to the split rather than spin
+         * forever.
+         */
+        const backedUp = tentativeEnd - 1;
+        const end = endsOnHighSurrogate && backedUp > cursor.index ? backedUp : tentativeEnd;
+        chunks.push(scrollback.slice(cursor.index, end));
+        cursor.index = end;
+    }
+    return chunks;
+}
+
 export function attachPane({
     folder,
     kind,

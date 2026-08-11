@@ -7,6 +7,7 @@ import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {
     attachPane,
+    chunkScrollbackForReplay,
     killFolderPanes,
     killPaneSession,
     listAllPaneStatuses,
@@ -379,5 +380,57 @@ describe('pane sessions', () => {
                 force: true,
             });
         }
+    });
+});
+
+describe(chunkScrollbackForReplay.name, () => {
+    it('yields nothing for empty scrollback', () => {
+        assert.deepEquals(chunkScrollbackForReplay(''), []);
+    });
+
+    it('keeps scrollback smaller than one chunk whole', () => {
+        assert.deepEquals(chunkScrollbackForReplay('short', 64), ['short']);
+    });
+
+    it('splits into chunks of the requested size', () => {
+        assert.deepEquals(chunkScrollbackForReplay('abcdefg', 3), [
+            'abc',
+            'def',
+            'g',
+        ]);
+    });
+
+    it('preserves the exact byte stream when rejoined', () => {
+        const scrollback = Array.from(
+            {
+                length: 500,
+            },
+            (_unused, index) => `line ${index}\r\n`,
+        ).join('');
+        assert.strictEquals(chunkScrollbackForReplay(scrollback, 97).join(''), scrollback);
+    });
+
+    it('never splits a surrogate pair across a boundary', () => {
+        /**
+         * Emoji are surrogate pairs in UTF-16. A chunk size that lands mid-pair must back up, or
+         * the terminal receives a lone half and renders a replacement character.
+         */
+        const scrollback = '🎉🎉🎉';
+        const chunks = chunkScrollbackForReplay(scrollback, 3);
+        chunks.forEach((chunk) => {
+            assert.isFalse(
+                /[\uD800-\uDBFF]$/.test(chunk),
+                'a chunk ended on an unpaired high surrogate',
+            );
+        });
+        assert.strictEquals(chunks.join(''), scrollback);
+    });
+
+    it('still terminates when the chunk size cannot avoid a split', () => {
+        /**
+         * A chunk size of 1 cannot hold a surrogate pair at all, so the guard has to accept the
+         * split rather than retreat forever.
+         */
+        assert.strictEquals(chunkScrollbackForReplay('🎉', 1).join(''), '🎉');
     });
 });
