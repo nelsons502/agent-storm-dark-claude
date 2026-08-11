@@ -529,9 +529,16 @@ const cache = new Map<string, FolderInfo>();
 const refreshState: {
     targets: ReadonlyArray<RefreshTarget>;
     loopStarted: boolean;
+    /**
+     * When each folder's git state was last re-read, keyed by folder path. Drives the per-folder
+     * cadence in {@link isFolderGitRefreshDue}. Deliberately not persisted: a restarted process
+     * should re-read everything once rather than trust timestamps from a previous run.
+     */
+    lastGitRefreshAtMs: Map<string, number>;
 } = {
     targets: [],
     loopStarted: false,
+    lastGitRefreshAtMs: new Map(),
 };
 
 /**
@@ -802,20 +809,82 @@ async function loadPersistedGithubCache(): Promise<void> {
 }
 
 /**
- * Pause between consecutive folder refreshes within a sweep. Each folder costs roughly 4 git
- * subprocesses (`rev-parse`, `status --porcelain`, upstream check, `log` ahead-count); spreading
- * them out keeps the backend from pegging a core when the user has many configured repos. 100ms
- * gives a ~3s sweep over ~30 folders while keeping CPU usage modest.
+ * Pause between consecutive folder refreshes within a sweep. Each folder costs roughly 5 git
+ * subprocesses (`rev-parse`, `status --porcelain`, upstream check, `log` ahead-count, HEAD hash);
+ * spreading them out keeps the backend from pegging a core when the user has many configured
+ * repos.
  */
 const perFolderDelayMs = 100;
 /**
- * Idle pause after each complete sweep through every folder. Tuned so the full cycle (sweep + idle)
- * lands near ~10s for typical folder counts, so the sidebar's `*` / `+` markers reflect dirty / not
- * pushed state within a poll interval of git activity. PR fetches piggy-back on this sweep but are
- * gated by {@link hotRepoPrTtlMs} / {@link coldRepoPrTtlMs}, so a faster sweep does not mean more
- * GitHub traffic.
+ * How often the loop wakes to look for folders whose git state is stale enough to re-read. Most
+ * wake-ups refresh nothing — the per-folder intervals in {@link gitRefreshIntervalMs} decide who is
+ * actually due — so this only bounds how precisely those intervals are honored.
  */
 const sweepIdleMs = 5000;
+
+/**
+ * How stale a folder's git state may get, by how much attention the folder warrants.
+ *
+ * The previous design re-read every configured folder on a continuous loop. That is affordable when
+ * `git status` is cheap, but on a large monorepo it measured ~665ms of wall time per folder, so ~30
+ * configured folders meant the sweep never actually stopped — and, because a full pass took ~25s
+ * rather than the ~3s the old tuning assumed, the sidebar's dirty/not-pushed markers were staler
+ * than intended anyway. Refreshing on a per-folder schedule instead is both cheaper and fresher
+ * where it counts.
+ */
+const gitRefreshIntervalMs = {
+    /**
+     * A live AI or Shell pane means the user is plausibly working in this folder right now, so its
+     * markers should track git activity closely.
+     */
+    active: 15_000,
+    /** Configured and visible in the sidebar, but nothing running in it. */
+    idle: 60_000,
+    /**
+     * Parked folders are hidden from the sidebar entirely, so nothing renders their git state until
+     * the user unparks them — and unparking goes through `refreshFolderInfoNow`, which forces a
+     * refresh regardless of this interval. This exists only so a long-lived parked folder is not
+     * completely frozen.
+     */
+    parked: 600_000,
+} as const;
+
+/** How long {@link folder} may go without a git re-read. Pure and exported for tests. */
+export function folderGitRefreshIntervalMs(
+    folder: Readonly<{isParked: boolean; hasLivePane: boolean}>,
+): number {
+    if (folder.hasLivePane) {
+        /**
+         * Deliberately ahead of the parked check: a parked folder with a live pane is one the user
+         * is actively driving from the terminal even though it is hidden from the sidebar.
+         */
+        return gitRefreshIntervalMs.active;
+    }
+    if (folder.isParked) {
+        return gitRefreshIntervalMs.parked;
+    }
+    return gitRefreshIntervalMs.idle;
+}
+
+/**
+ * Whether a folder is due for a git re-read. A folder with no recorded refresh is always due, so a
+ * fresh process (or a newly-created worktree) fills in on the next wake-up.
+ *
+ * Pure and exported for tests.
+ */
+export function isFolderGitRefreshDue(
+    folder: Readonly<{
+        isParked: boolean;
+        hasLivePane: boolean;
+        lastRefreshedAtMs: number | undefined;
+        nowMs: number;
+    }>,
+): boolean {
+    if (folder.lastRefreshedAtMs === undefined) {
+        return true;
+    }
+    return folder.nowMs - folder.lastRefreshedAtMs >= folderGitRefreshIntervalMs(folder);
+}
 
 async function refreshOnce({
     target,
@@ -929,7 +998,12 @@ export function computeRepoPrRefreshTtlByRepo({
     );
 }
 
-async function runSweep(): Promise<void> {
+/**
+ * @param force Re-read every folder regardless of its per-folder cadence. Used by
+ *   {@link refreshFolderInfoNow}, where the caller has just changed the worktree layout or a
+ *   folder's parked state and needs the cache to reflect it immediately.
+ */
+async function runSweep(force = false): Promise<void> {
     const config = await loadConfig().catch(() => undefined);
     if (!config) {
         return;
@@ -956,17 +1030,34 @@ async function runSweep(): Promise<void> {
         nowMs: Date.now(),
     });
     /**
+     * Only folders whose git state has gone stale, so a wake-up costs nothing for the (usually
+     * large) majority that nobody is touching. `force` bypasses this for layout changes.
+     */
+    const dueTargets = targets.filter((target) =>
+        force
+            ? true
+            : isFolderGitRefreshDue({
+                  isParked: target.isParked,
+                  hasLivePane:
+                      isLivePaneStatus(statusLookup(target.folder, PaneKind.Ai)) ||
+                      isLivePaneStatus(statusLookup(target.folder, PaneKind.Shell)),
+                  lastRefreshedAtMs: refreshState.lastGitRefreshAtMs.get(target.folder),
+                  nowMs: Date.now(),
+              }),
+    );
+    /**
      * Sequential on purpose: parallel refresh is what created the original 100% CPU problem.
      * `awaitedForEach` awaits each callback before invoking the next, so subprocess pressure stays
      * at one folder at a time.
      */
-    await awaitedForEach(targets, async (target) => {
+    await awaitedForEach(dueTargets, async (target) => {
         await refreshOnce({
             target,
             statusLookup,
             disabledGitHubPolling,
             prRefreshTtlMs: prRefreshTtlByRepo.get(repoActivityKey(target)),
         });
+        refreshState.lastGitRefreshAtMs.set(target.folder, Date.now());
         await wait({
             milliseconds: perFolderDelayMs,
         });
@@ -974,6 +1065,9 @@ async function runSweep(): Promise<void> {
     const validPaths = new Set(targets.map((target) => target.folder));
     const stale = Array.from(cache.keys()).filter((path) => !validPaths.has(path));
     stale.forEach((path) => cache.delete(path));
+    Array.from(refreshState.lastGitRefreshAtMs.keys())
+        .filter((path) => !validPaths.has(path))
+        .forEach((path) => refreshState.lastGitRefreshAtMs.delete(path));
     if (stale.length > 0) {
         persistCache();
     }
@@ -996,7 +1090,12 @@ export async function refreshFolderInfoNow(): Promise<void> {
     }
     refreshState.targets = await enumerateTargets(config);
     persistCache();
-    void runSweep().catch(() => {
+    /**
+     * Forced: this path exists precisely because the caller changed something the cache cannot
+     * predict (worktree created or deleted, folder parked or unparked), so per-folder cadence must
+     * not hold the new state back.
+     */
+    void runSweep(true).catch(() => {
         /* never let an out-of-band sweep crash the process */
     });
 }

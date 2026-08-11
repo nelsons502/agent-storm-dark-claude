@@ -10,7 +10,12 @@ import {
 import {assert} from '@augment-vir/assert';
 import {describe, it} from '@augment-vir/test';
 import {checkValidShape} from 'object-shape-tester';
-import {computeRepoPrRefreshTtlByRepo, fillNullableFolderInfoFields} from './folder-info.js';
+import {
+    computeRepoPrRefreshTtlByRepo,
+    fillNullableFolderInfoFields,
+    folderGitRefreshIntervalMs,
+    isFolderGitRefreshDue,
+} from './folder-info.js';
 
 const nowMs = 1_800_000_000_000;
 const minuteMs = 60 * 1000;
@@ -255,6 +260,114 @@ describe('persisted folder info migration', () => {
                 },
                 folderInfoShape,
             ),
+        );
+    });
+});
+
+describe(folderGitRefreshIntervalMs.name, () => {
+    it('refreshes a folder with a live pane most often', () => {
+        assert.isBelow(
+            folderGitRefreshIntervalMs({
+                isParked: false,
+                hasLivePane: true,
+            }),
+            folderGitRefreshIntervalMs({
+                isParked: false,
+                hasLivePane: false,
+            }),
+        );
+    });
+
+    it('backs off hardest on parked folders', () => {
+        assert.isAbove(
+            folderGitRefreshIntervalMs({
+                isParked: true,
+                hasLivePane: false,
+            }),
+            folderGitRefreshIntervalMs({
+                isParked: false,
+                hasLivePane: false,
+            }),
+        );
+    });
+
+    it('treats a parked folder with a live pane as active', () => {
+        /**
+         * Parking hides a folder from the sidebar, but a live pane means the user is driving it
+         * from the terminal regardless, so its git state still needs to keep up.
+         */
+        assert.strictEquals(
+            folderGitRefreshIntervalMs({
+                isParked: true,
+                hasLivePane: true,
+            }),
+            folderGitRefreshIntervalMs({
+                isParked: false,
+                hasLivePane: true,
+            }),
+        );
+    });
+});
+
+describe(isFolderGitRefreshDue.name, () => {
+    it('is due when never refreshed', () => {
+        assert.isTrue(
+            isFolderGitRefreshDue({
+                isParked: false,
+                hasLivePane: false,
+                lastRefreshedAtMs: undefined,
+                nowMs,
+            }),
+        );
+    });
+
+    it('is not due immediately after a refresh', () => {
+        assert.isFalse(
+            isFolderGitRefreshDue({
+                isParked: false,
+                hasLivePane: false,
+                lastRefreshedAtMs: nowMs,
+                nowMs,
+            }),
+        );
+    });
+
+    it('is due once the folder-specific interval has elapsed', () => {
+        const interval = folderGitRefreshIntervalMs({
+            isParked: false,
+            hasLivePane: false,
+        });
+        assert.isTrue(
+            isFolderGitRefreshDue({
+                isParked: false,
+                hasLivePane: false,
+                lastRefreshedAtMs: nowMs - interval,
+                nowMs,
+            }),
+        );
+    });
+
+    it('holds a parked folder back well past an idle folder deadline', () => {
+        const idleInterval = folderGitRefreshIntervalMs({
+            isParked: false,
+            hasLivePane: false,
+        });
+        const shared = {
+            hasLivePane: false,
+            lastRefreshedAtMs: nowMs - idleInterval,
+            nowMs,
+        } as const;
+        assert.isTrue(
+            isFolderGitRefreshDue({
+                ...shared,
+                isParked: false,
+            }),
+        );
+        assert.isFalse(
+            isFolderGitRefreshDue({
+                ...shared,
+                isParked: true,
+            }),
         );
     });
 });
