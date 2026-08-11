@@ -1,6 +1,7 @@
 // cspell:words grabbable
 
 import {MergeStepKey, PaneKind, type FolderInfo} from '@agent-storm/common';
+import {check} from '@augment-vir/assert';
 import {omitObjectKeys} from '@augment-vir/common';
 import {attachOnResize, css, defineElement, html, listen, repeat} from 'element-vir';
 import {
@@ -34,6 +35,7 @@ import {
 import {determineScreenSize, ScreenSize} from '../../util/screen-size.js';
 import '../../util/service-origin.js';
 import {applyTheme, resolveTheme} from '../../util/theme.js';
+import {startVisibilityAwarePoll} from '../../util/visibility-poll.js';
 import {AgentStormMarkIcon} from '../icons/agent-storm-mark.icon.js';
 import {VirAuthModal} from './vir-auth-modal.element.js';
 /**
@@ -165,7 +167,8 @@ type AppState = {
      */
     openedFolders: ReadonlyArray<string>;
     folderInfo: Map<string, FolderInfo>;
-    pollHandle: ReturnType<typeof setInterval> | undefined;
+    /** Teardown for the visibility-aware `/folders` poll started in `init`. */
+    stopFolderInfoPoll: (() => void) | undefined;
     settingsOpen: boolean;
     route: AppRoute;
     /** Lazily-imported component catalog, populated only when the `/book` route is hit. */
@@ -220,7 +223,7 @@ export const VirApp = defineElement()({
         return {
             openedFolders: [],
             folderInfo: new Map(),
-            pollHandle: undefined,
+            stopFolderInfoPoll: undefined,
             settingsOpen: false,
             route: router.readCurrentRoute(),
             book: undefined,
@@ -439,10 +442,11 @@ export const VirApp = defineElement()({
                 }),
             ),
         });
-        void refreshFolderInfo(updateState);
-        const pollHandle = setInterval(() => {
-            void refreshFolderInfo(updateState);
-        }, folderInfoPollMs);
+        const stopFolderInfoPoll = startVisibilityAwarePoll({
+            intervalMs: folderInfoPollMs,
+            callback: () =>
+                void refreshFolderInfo(updateState, () => host.instanceState.folderInfo),
+        });
         const removeRouteListener = router.listen(true, (route) => {
             updateState({
                 route,
@@ -515,7 +519,7 @@ export const VirApp = defineElement()({
               }
             : undefined;
         updateState({
-            pollHandle,
+            stopFolderInfoPoll,
             removeRouteListener,
             screenSize: trackedScreenSize,
             disconnectScreenSizeObserver: () => resizeObserver.disconnect(),
@@ -523,9 +527,7 @@ export const VirApp = defineElement()({
         });
     },
     cleanup({state}) {
-        if (state.pollHandle) {
-            clearInterval(state.pollHandle);
-        }
+        state.stopFolderInfoPoll?.();
         state.removeRouteListener?.();
         state.disconnectScreenSizeObserver?.();
         state.disconnectVisualViewport?.();
@@ -1197,16 +1199,51 @@ export const VirApp = defineElement()({
     },
 });
 
-async function refreshFolderInfo(updateState: AppUpdate): Promise<void> {
+/**
+ * Fold a fresh `/folders` response into the existing map, preserving the object identity of every
+ * folder whose contents did not change, and skipping the state write entirely when nothing did.
+ *
+ * This matters because lit re-renders on reference change. Building a brand-new `Map` of brand-new
+ * `FolderInfo` objects on every poll invalidated the whole app tree — every mounted pane group and
+ * its merge-step tracker — several times a second even when the backend returned byte-identical
+ * data. Reusing references lets the children skip re-rendering, and the `changed` bail-out lets the
+ * app itself skip it too.
+ */
+function mergeFolderInfo(
+    previous: ReadonlyMap<string, FolderInfo>,
+    folders: ReadonlyArray<FolderInfo>,
+): Map<string, FolderInfo> | undefined {
+    const merged = new Map<string, FolderInfo>();
+    const previousPaths = Array.from(previous.keys());
+    /** Order is meaningful — the backend emits folders in config order and the sidebar renders it. */
+    const orderChanged =
+        folders.length !== previous.size ||
+        folders.some((folder, index) => previousPaths[index] !== folder.path);
+    const contentsChanged = folders.reduce((changedSoFar, folder) => {
+        const prior = previous.get(folder.path);
+        if (prior && check.deepEquals(prior, folder)) {
+            merged.set(folder.path, prior);
+            return changedSoFar;
+        }
+        merged.set(folder.path, folder);
+        return true;
+    }, false);
+
+    return orderChanged || contentsChanged ? merged : undefined;
+}
+
+async function refreshFolderInfo(
+    updateState: AppUpdate,
+    readFolderInfo: () => ReadonlyMap<string, FolderInfo>,
+): Promise<void> {
     try {
         const folders = await getFolders();
-        const folderInfo = new Map<string, FolderInfo>();
-        folders.forEach((folder) => {
-            folderInfo.set(folder.path, folder);
-        });
-        updateState({
-            folderInfo,
-        });
+        const folderInfo = mergeFolderInfo(readFolderInfo(), folders);
+        if (folderInfo) {
+            updateState({
+                folderInfo,
+            });
+        }
     } catch {
         /* sidebar surfaces the load error */
     }

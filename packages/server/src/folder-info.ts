@@ -859,11 +859,11 @@ export function folderGitRefreshIntervalMs(
          * is actively driving from the terminal even though it is hidden from the sidebar.
          */
         return gitRefreshIntervalMs.active;
-    }
-    if (folder.isParked) {
+    } else if (folder.isParked) {
         return gitRefreshIntervalMs.parked;
+    } else {
+        return gitRefreshIntervalMs.idle;
     }
-    return gitRefreshIntervalMs.idle;
 }
 
 /**

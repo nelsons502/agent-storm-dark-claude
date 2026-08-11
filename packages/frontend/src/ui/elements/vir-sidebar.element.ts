@@ -20,7 +20,7 @@ import {
     isDateAfter,
     toTimestamp,
 } from 'date-vir';
-import {css, defineElement, defineElementEvent, html, listen} from 'element-vir';
+import {css, defineElement, defineElementEvent, html, listen, repeat} from 'element-vir';
 import {parseUrl} from 'url-vir';
 import {
     createSizedIcon,
@@ -65,11 +65,23 @@ import {
     statusBucketLabels,
     statusBucketOrder,
 } from '../../util/sidebar-grouping.js';
+import {startVisibilityAwarePoll} from '../../util/visibility-poll.js';
 import {AgentStormMarkIcon} from '../icons/agent-storm-mark.icon.js';
 
 const allowedLinkHostnames = ['github.com'];
 
 const pollIntervalMs = 2000;
+
+/**
+ * Identity for a sidebar row, so lit tracks rows by folder rather than by array position.
+ *
+ * Unkeyed rows are reused positionally, so when the sort order shifts or a folder moves between
+ * status buckets — which happens on its own as panes go busy and idle — the DOM node holding one
+ * folder's hover, focus, or open action-menu state gets handed the next folder's data.
+ */
+function folderRowKey(folder: Readonly<FolderInfo>): string {
+    return folder.path;
+}
 
 const loaderIcon = createSizedIcon(LoaderAnimated24Icon, 12);
 const dashIcon = createSizedIcon(lucideIcons.Minus, 12);
@@ -139,7 +151,8 @@ const paneStatusColor: Record<PaneStatus, string> = {
 
 type SidebarState = {
     folders: ReadonlyArray<FolderInfo>;
-    pollHandle: ReturnType<typeof setInterval> | undefined;
+    /** Teardown for the visibility-aware poll started in `init`. */
+    stopPoll: (() => void) | undefined;
     loadError: string | undefined;
     openMenuKey: string | undefined;
     repoModalOpen: boolean;
@@ -261,7 +274,7 @@ export const VirSidebar = defineElement<{
     state(): SidebarState {
         return {
             folders: [],
-            pollHandle: undefined,
+            stopPoll: undefined,
             loadError: undefined,
             openMenuKey: undefined,
             repoModalOpen: false,
@@ -758,19 +771,17 @@ export const VirSidebar = defineElement<{
             }
         }
     `,
-    init({updateState}) {
-        void refresh(updateState);
-        const pollHandle = setInterval(() => {
-            void refresh(updateState);
-        }, pollIntervalMs);
+    init({updateState, host}) {
+        const stopPoll = startVisibilityAwarePoll({
+            intervalMs: pollIntervalMs,
+            callback: () => void refresh(updateState, () => host.instanceState),
+        });
         updateState({
-            pollHandle,
+            stopPoll,
         });
     },
     cleanup({state}) {
-        if (state.pollHandle) {
-            clearInterval(state.pollHandle);
-        }
+        state.stopPoll?.();
     },
     render({inputs, state, updateState, host, dispatch, events}) {
         if (inputs.hideBorder) {
@@ -930,7 +941,7 @@ export const VirSidebar = defineElement<{
                     updateState,
                 });
             if (state.sidebarGrouping !== SidebarGrouping.Status) {
-                return folders.map(renderFolderRow);
+                return repeat(folders, folderRowKey, renderFolderRow);
             }
             const buckets = bucketFoldersByStatus({
                 folders,
@@ -983,7 +994,7 @@ export const VirSidebar = defineElement<{
                             ${String(bucketFolders.length).padStart(2, '0')}
                         </span>
                     </button>
-                    ${collapsed ? '' : bucketFolders.map(renderFolderRow)}
+                    ${collapsed ? '' : repeat(bucketFolders, folderRowKey, renderFolderRow)}
                 `;
             });
         };
@@ -2018,7 +2029,11 @@ function buildRowMenuEntries({
  */
 const pendingWorktreeDeletions = new Set<string>();
 
-async function refresh(updateState: SidebarUpdate): Promise<void> {
+async function refresh(
+    updateState: SidebarUpdate,
+    /** Omitted by post-mutation callers, which want an unconditional write. See below. */
+    readState?: () => Readonly<SidebarState>,
+): Promise<void> {
     try {
         /**
          * Fetch folders + config + update-status in parallel. Config tells us the current
@@ -2045,7 +2060,7 @@ async function refresh(updateState: SidebarUpdate): Promise<void> {
                 forceRefresh: false,
             }).catch(() => null),
         ]);
-        updateState({
+        const nextState = {
             folders: pendingWorktreeDeletions.size
                 ? folders.filter((folder) => !pendingWorktreeDeletions.has(folder.path))
                 : folders,
@@ -2056,7 +2071,31 @@ async function refresh(updateState: SidebarUpdate): Promise<void> {
             repos: config.repos,
             updateStatus,
             reviewRequestedCount,
-        });
+        } satisfies Partial<SidebarState>;
+        const previous = readState?.();
+        /**
+         * Narrow the write to fields that actually changed. lit re-renders on reference change, so
+         * unconditionally assigning freshly-parsed arrays and objects re-ran the whole sidebar —
+         * filtering, status bucketing, sorting, and every row's bindings — twice a second even when
+         * the backend returned identical data.
+         *
+         * Callers with no state to read (the post-mutation refreshes) skip the comparison and write
+         * everything: they only run after something definitely changed.
+         */
+        const update = previous
+            ? (Object.fromEntries(
+                  Object.entries(nextState).filter(
+                      ([
+                          key,
+                          value,
+                      ]) => !check.deepEquals(previous[key as keyof typeof nextState], value),
+                  ),
+                  /** Provably a subset of `nextState`'s keys, which `satisfies` already constrained. */
+              ) as Partial<SidebarState>)
+            : nextState;
+        if (Object.keys(update).length) {
+            updateState(update);
+        }
     } catch (error: unknown) {
         updateState({
             loadError: error instanceof Error ? error.message : String(error),
