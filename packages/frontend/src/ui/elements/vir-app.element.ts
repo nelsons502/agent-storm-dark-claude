@@ -36,7 +36,12 @@ import '../../util/service-origin.js';
 import {applyTheme, resolveTheme} from '../../util/theme.js';
 import {AgentStormMarkIcon} from '../icons/agent-storm-mark.icon.js';
 import {VirAuthModal} from './vir-auth-modal.element.js';
-import {VirBook} from './vir-book.element.js';
+/**
+ * Type-only: `element-book` is a dev-only component catalog reachable solely via the `/book` route,
+ * so it has no business in the boot bundle. Splitting it out defers ~181KB minified. The class is
+ * loaded on demand in `render` below.
+ */
+import type {VirBook} from './vir-book.element.js';
 import {VirPaneGroup} from './vir-pane-group.element.js';
 import {VirPet} from './vir-pet.element.js';
 import {type MergeStepActionDetail} from './vir-progress-tracker.element.js';
@@ -163,6 +168,10 @@ type AppState = {
     pollHandle: ReturnType<typeof setInterval> | undefined;
     settingsOpen: boolean;
     route: AppRoute;
+    /** Lazily-imported component catalog, populated only when the `/book` route is hit. */
+    book: typeof VirBook | undefined;
+    /** Guards against firing a second dynamic import while the first is still in flight. */
+    bookLoading: boolean;
     removeRouteListener: (() => void) | undefined;
     sidebarWidth: number;
     sidebarDragging: boolean;
@@ -214,6 +223,8 @@ export const VirApp = defineElement()({
             pollHandle: undefined,
             settingsOpen: false,
             route: router.readCurrentRoute(),
+            book: undefined,
+            bookLoading: false,
             removeRouteListener: undefined,
             sidebarWidth: localStorageClient.sidebarWidth.read(),
             sidebarDragging: false,
@@ -523,10 +534,25 @@ export const VirApp = defineElement()({
     },
     render({state, updateState, host}) {
         if (state.route.paths[0] === 'book') {
+            if (!state.book) {
+                if (!state.bookLoading) {
+                    updateState({
+                        bookLoading: true,
+                    });
+                    void import('./vir-book.element.js').then(({VirBook}) => {
+                        updateState({
+                            book: VirBook,
+                            bookLoading: false,
+                        });
+                    });
+                }
+                return html``;
+            }
+
             return html`
-                <${VirBook.assign({
+                <${state.book.assign({
                     subPaths: state.route.paths.slice(1),
-                })}></${VirBook}>
+                })}></${state.book}>
             `;
         }
 

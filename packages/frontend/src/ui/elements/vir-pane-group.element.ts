@@ -30,7 +30,12 @@ import {moveTabGroup, type PaneAttentionRequest} from '../../util/interaction-st
 import {localStorageClient, paneSplit} from '../../util/local-storage-client.js';
 import {type FrontendTab} from '../../util/router.js';
 import {ScreenSize} from '../../util/screen-size.js';
-import {VirDiffPane} from './vir-diff-pane.element.js';
+/**
+ * Type-only: the diff pane pulls in the whole CodeMirror suite, which a static import would parse
+ * on every app boot even for users who never open a Diff tab. Splitting it out defers ~90KB
+ * minified. The class is loaded on demand when the Diff tab is first opened, in `render` below.
+ */
+import type {VirDiffPane} from './vir-diff-pane.element.js';
 import {VirGithubPane} from './vir-github-pane.element.js';
 import {VirProgressTracker, type MergeStepActionDetail} from './vir-progress-tracker.element.js';
 import {VirTerminal} from './vir-terminal.element.js';
@@ -156,18 +161,21 @@ export const VirPaneGroup = defineElement<{
              * that instead. Undefined before the user has clicked into either pane.
              */
             focusedKind: undefined as PaneKind | undefined,
-            /**
-             * Set true the first time the user opens the Diff tab, and never reset. The diff pane
-             * costs nothing while hidden (it holds no socket and no subprocess), so keeping it
-             * mounted preserves its selected file and scroll position across tab switches.
-             */
             tabOrder: localStorageClient.tabOrder.read(),
             draggedTab: undefined as FrontendTab | undefined,
             dropTargetTab: undefined as FrontendTab | undefined,
             dropPosition: undefined as 'before' | 'after' | undefined,
             unsubscribeTabOrder: undefined as (() => void) | undefined,
-            diffMounted: false,
-            /** Same lazy-mount-then-keep pattern as `diffMounted` above, for the GitHub pane. */
+            /**
+             * Holds the lazily-imported diff pane class once the user first opens the Diff tab, and
+             * is never cleared. Doubles as the mount flag it replaced: the diff pane costs nothing
+             * while hidden (it holds no socket and no subprocess), so keeping it mounted preserves
+             * its selected file and scroll position across tab switches.
+             */
+            diffPane: undefined as typeof VirDiffPane | undefined,
+            /** Guards against firing a second dynamic import while the first is still in flight. */
+            diffPaneLoading: false,
+            /** Same lazy-mount-then-keep pattern as `diffPane` above, for the GitHub pane. */
             githubMounted: false,
         };
     },
@@ -1000,9 +1008,15 @@ export const VirPaneGroup = defineElement<{
         const mountAiTerminal = !isMobile || showAiPane;
         const mountShellTerminal = !isMobile || showShellPane;
 
-        if (isDiffTab && !state.diffMounted) {
+        if (isDiffTab && !state.diffPane && !state.diffPaneLoading) {
             updateState({
-                diffMounted: true,
+                diffPaneLoading: true,
+            });
+            void import('./vir-diff-pane.element.js').then(({VirDiffPane}) => {
+                updateState({
+                    diffPane: VirDiffPane,
+                    diffPaneLoading: false,
+                });
             });
         }
 
@@ -1200,14 +1214,14 @@ export const VirPaneGroup = defineElement<{
                 }
             </div>
             <div class="body">
-                ${state.diffMounted
+                ${state.diffPane
                     ? html`
                           <div class="diff-pane" ?data-hidden=${!isDiffTab}>
-                              <${VirDiffPane.assign({
+                              <${state.diffPane.assign({
                                   folder: inputs.folder,
                                   active: isDiffTab && inputs.active,
                                   screenSize: inputs.screenSize,
-                              })}></${VirDiffPane}>
+                              })}></${state.diffPane}>
                           </div>
                       `
                     : ''}

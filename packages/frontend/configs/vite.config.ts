@@ -45,6 +45,17 @@ export default defineConfig(
                  */
                 host: true,
             },
+            optimizeDeps: {
+                ...baseConfig.optimizeDeps,
+                /**
+                 * Virmator's base config forces a full esbuild re-bundle of every dependency on
+                 * each dev-server boot. With CodeMirror, xterm, and element-book in the graph that
+                 * costs ~8s of pure wall time per `npm start`, even when nothing in `node_modules`
+                 * changed. Vite's own lockfile-and-config hash invalidation already rebuilds when
+                 * deps actually change, so the force is redundant here.
+                 */
+                force: false,
+            },
             /**
              * Inline the orchestrator-picked backend port (and anything else the frontend needs at
              * boot) into the bundle as a single `VITE_INJECTED_DATA` global. Read at runtime via
