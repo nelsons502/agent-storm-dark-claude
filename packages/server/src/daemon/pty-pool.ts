@@ -229,15 +229,29 @@ function ensureEntry(folder: string, kind: PaneKind, sessionId: string | undefin
  *   frozen prefix regardless of the shell's current `nvm`-selected node, so `npm -v` never reflects
  *   the install. A real terminal started from the OS has none of these, so neither should ours.
  */
-function spawnEnv(): NodeJS.ProcessEnv {
+/**
+ * @param identity Who the spawned process is, exported so it can reason about itself. Without this
+ *   a session has no way to know which pane it occupies — `process.cwd()` implies the worktree, but
+ *   nothing conveys the session id or kind — which is what blocked a session from asking the daemon
+ *   about its siblings. Deliberately narrow: it says who you are, not how to reach the backend, so
+ *   it grants no new authority on its own.
+ */
+function spawnEnv(
+    identity: Readonly<{folder: string; kind: PaneKind; sessionId: string}>,
+): NodeJS.ProcessEnv {
     const npmInjectedKeys = getObjectTypedKeys(process.env).filter((key) =>
         String(key).toLowerCase().startsWith('npm_'),
     );
-    const base = omitObjectKeys(process.env, [
-        'BACKEND_PORT',
-        'FRONTEND_PORT',
-        ...npmInjectedKeys,
-    ]);
+    const base = {
+        ...omitObjectKeys(process.env, [
+            'BACKEND_PORT',
+            'FRONTEND_PORT',
+            ...npmInjectedKeys,
+        ]),
+        AGENT_STORM_FOLDER: identity.folder,
+        AGENT_STORM_KIND: identity.kind,
+        AGENT_STORM_SESSION_ID: identity.sessionId,
+    };
     /**
      * Drop entries the npm CLI prepends when running a script (every ancestor `<repo>/node_modules/
      * .bin`). Keep everything else so user-customized PATH additions inherited from launchd /
@@ -305,7 +319,11 @@ function startPty({
             cols: 120,
             rows: 32,
             cwd,
-            env: spawnEnv() as Record<string, string>,
+            env: spawnEnv({
+                folder,
+                kind,
+                sessionId: entry.sessionId,
+            }) as Record<string, string>,
         });
         entry.pty = pty;
         entry.exitCode = undefined;
