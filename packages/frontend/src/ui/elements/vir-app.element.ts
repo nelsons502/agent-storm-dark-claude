@@ -1,6 +1,12 @@
 // cspell:words grabbable
 
-import {MergeStepKey, PaneKind, type FolderInfo} from '@agent-storm/common';
+import {
+    defaultConfig,
+    MergeStepKey,
+    PaneKind,
+    type AgentProfile,
+    type FolderInfo,
+} from '@agent-storm/common';
 import {check} from '@augment-vir/assert';
 import {omitObjectKeys} from '@augment-vir/common';
 import {attachOnResize, css, defineElement, html, listen, repeat} from 'element-vir';
@@ -38,6 +44,7 @@ import '../../util/service-origin.js';
 import {applyTheme, resolveTheme} from '../../util/theme.js';
 import {startVisibilityAwarePoll} from '../../util/visibility-poll.js';
 import {AgentStormMarkIcon} from '../icons/agent-storm-mark.icon.js';
+import {VirAgentProfilesModal} from './vir-agent-profiles-modal.element.js';
 import {VirAuthModal} from './vir-auth-modal.element.js';
 /**
  * Type-only: `element-book` is a dev-only component catalog reachable solely via the `/book` route,
@@ -174,6 +181,9 @@ type AppState = {
     /** Teardown for the visibility-aware `/folders` poll started in `init`. */
     stopFolderInfoPoll: (() => void) | undefined;
     settingsOpen: boolean;
+    agentProfilesOpen: boolean;
+    agentProfiles: ReadonlyArray<AgentProfile>;
+    defaultAgentProfileId: string;
     route: AppRoute;
     /** Lazily-imported component catalog, populated only when the `/book` route is hit. */
     book: typeof VirBook | undefined;
@@ -207,7 +217,6 @@ type AppState = {
      * there). Resets to false when the user selects a folder or the modal emits its close event.
      */
     mobileSidebarOpen: boolean;
-    paneRestartKeys: Record<string, number | undefined>;
     attentionSessions: ReadonlyMap<string, ReadonlySet<string>>;
     petEnabled: boolean;
     /**
@@ -229,6 +238,9 @@ export const VirApp = defineElement()({
             folderInfo: new Map(),
             stopFolderInfoPoll: undefined,
             settingsOpen: false,
+            agentProfilesOpen: false,
+            agentProfiles: defaultConfig.agentProfiles,
+            defaultAgentProfileId: defaultConfig.defaultAgentProfileId,
             route: router.readCurrentRoute(),
             book: undefined,
             bookLoading: false,
@@ -246,7 +258,6 @@ export const VirApp = defineElement()({
             disposeTheme: undefined,
             petSpecies: PetSpecies.Cloaked,
             mobileSidebarOpen: false,
-            paneRestartKeys: {},
             attentionSessions: new Map(),
             petEnabled: localStorageClient.petEnabled.read(),
             unsubscribePet: undefined,
@@ -434,6 +445,8 @@ export const VirApp = defineElement()({
                 updateState({
                     disposeTheme: applyTheme(config.theme),
                     petSpecies: petSpeciesForTheme(resolveTheme(config.theme)),
+                    agentProfiles: config.agentProfiles,
+                    defaultAgentProfileId: config.defaultAgentProfileId,
                 });
             })
             .catch(() => {
@@ -968,19 +981,10 @@ export const VirApp = defineElement()({
             });
         };
 
-        const handlePaneRestarted = ({
-            folder,
-            kind,
-        }: Readonly<{
-            folder: string;
-            kind: PaneKind;
-        }>) => {
-            const paneKey = `${folder}:${kind}`;
+        const handleOpenAgentProfilesRequested = () => {
             updateState({
-                paneRestartKeys: {
-                    ...state.paneRestartKeys,
-                    [paneKey]: (state.paneRestartKeys[paneKey] || 0) + 1,
-                },
+                agentProfilesOpen: true,
+                mobileSidebarOpen: false,
             });
         };
 
@@ -1011,11 +1015,11 @@ export const VirApp = defineElement()({
                 ${listen(VirSidebar.events.foldersRemoved, (event) =>
                     handleFoldersRemoved(event.detail),
                 )}
-                ${listen(VirSidebar.events.paneRestarted, (event) =>
-                    handlePaneRestarted(event.detail),
-                )}
                 ${listen(VirSidebar.events.openSettingsRequested, () =>
                     handleOpenSettingsRequested(),
+                )}
+                ${listen(VirSidebar.events.openAgentProfilesRequested, () =>
+                    handleOpenAgentProfilesRequested(),
                 )}
             ></${VirSidebar}>
             <div
@@ -1080,14 +1084,14 @@ export const VirApp = defineElement()({
                                     active,
                                     activeTab,
                                     screenSize: state.screenSize,
-                                    aiRestartKey:
-                                        state.paneRestartKeys[`${folder}:${PaneKind.Ai}`] || 0,
                                     aiSessionIndex: sessionIndexFromRoute(state.route, PaneKind.Ai),
                                     shellSessionIndex: sessionIndexFromRoute(
                                         state.route,
                                         PaneKind.Shell,
                                     ),
-                                    resetAiSessionCmd: info?.resetAiSessionCmd || '',
+                                    agentProfiles: state.agentProfiles,
+                                    folderAgentProfileId:
+                                        info?.agentProfileId || state.defaultAgentProfileId,
                                     prUrl: info?.prUrl || '',
                                     folderInfo: info,
                                 })}
@@ -1158,6 +1162,23 @@ export const VirApp = defineElement()({
                     });
                 })}
             ></${VirSettingsModal}>
+            <${VirAgentProfilesModal.assign({
+                open: state.agentProfilesOpen,
+                profiles: state.agentProfiles,
+                defaultAgentProfileId: state.defaultAgentProfileId,
+            })}
+                ${listen(VirAgentProfilesModal.events.closeRequested, () => {
+                    updateState({
+                        agentProfilesOpen: false,
+                    });
+                })}
+                ${listen(VirAgentProfilesModal.events.configSaved, (event) => {
+                    updateState({
+                        agentProfiles: event.detail.agentProfiles,
+                        defaultAgentProfileId: event.detail.defaultAgentProfileId,
+                    });
+                })}
+            ></${VirAgentProfilesModal}>
             <${ViraModal.assign({
                 open: isMobile && state.mobileSidebarOpen,
                 modalTitle: 'Repos',
@@ -1183,11 +1204,11 @@ export const VirApp = defineElement()({
                         ${listen(VirSidebar.events.foldersRemoved, (event) =>
                             handleFoldersRemoved(event.detail),
                         )}
-                        ${listen(VirSidebar.events.paneRestarted, (event) =>
-                            handlePaneRestarted(event.detail),
-                        )}
                         ${listen(VirSidebar.events.openSettingsRequested, () =>
                             handleOpenSettingsRequested(),
+                        )}
+                        ${listen(VirSidebar.events.openAgentProfilesRequested, () =>
+                            handleOpenAgentProfilesRequested(),
                         )}
                     ></${VirSidebar}>
                 </div>

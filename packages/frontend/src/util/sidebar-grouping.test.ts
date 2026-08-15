@@ -16,8 +16,7 @@ const baseFolder: FolderInfo = {
     isWorktreeRoot: false,
     isParked: false,
     aiHidden: false,
-    aiCmd: '',
-    resetAiSessionCmd: '',
+    agentProfileId: 'profile',
     branch: 'feature',
     git: {
         dirty: false,

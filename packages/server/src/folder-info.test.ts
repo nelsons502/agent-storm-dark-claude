@@ -46,8 +46,7 @@ function soloRepoTarget() {
         isWorktreeRoot: false,
         isParked: false,
         aiHidden: false,
-        aiCmd: '',
-        resetAiSessionCmd: '',
+        agentProfileId: 'profile',
         mergeSteps: noMergeSteps,
     };
 }
@@ -61,8 +60,7 @@ function worktreeTargets() {
             isWorktreeRoot: true,
             isParked: false,
             aiHidden: false,
-            aiCmd: '',
-            resetAiSessionCmd: '',
+            agentProfileId: 'profile',
             mergeSteps: noMergeSteps,
         },
         {
@@ -72,8 +70,7 @@ function worktreeTargets() {
             isWorktreeRoot: false,
             isParked: false,
             aiHidden: false,
-            aiCmd: '',
-            resetAiSessionCmd: '',
+            agentProfileId: 'profile',
             mergeSteps: noMergeSteps,
         },
     ];
@@ -198,8 +195,7 @@ describe('persisted folder info migration', () => {
         isWorktreeRoot: false,
         isParked: false,
         aiHidden: false,
-        aiCmd: '',
-        resetAiSessionCmd: '',
+        agentProfileId: 'global-profile',
         branch: 'main',
         git: {
             dirty: false,
@@ -219,6 +215,26 @@ describe('persisted folder info migration', () => {
 
     it('accepts an entry written by this build', () => {
         assert.isTrue(checkValidShape(currentEntry, folderInfoShape));
+    });
+
+    it('requires the resolved agent profile id in current folder cache entries', () => {
+        const {agentProfileId: _agentProfileId, ...shared} = currentEntry;
+        const commandEntry = {
+            ...shared,
+            aiCmd: 'legacy command',
+            resetAiSessionCmd: 'legacy fresh command',
+        } as unknown as FolderInfo;
+
+        assert.deepEquals(
+            {
+                profileEntry: checkValidShape(currentEntry, folderInfoShape),
+                commandEntry: checkValidShape(commandEntry, folderInfoShape),
+            },
+            {
+                profileEntry: true,
+                commandEntry: false,
+            },
+        );
     });
 
     it('fills in nullable fields an entry written before the PR block is missing', () => {

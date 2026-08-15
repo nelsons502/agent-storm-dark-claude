@@ -154,9 +154,9 @@ export async function attachPane({
     /** Which session tab to attach to. Empty/omitted resolves to the folder+kind's default. */
     sessionId?: string | undefined;
     /**
-     * Current `aiCmd` from agent-storm config — forwarded to the daemon's attach handshake so a
-     * fresh AI PTY honors the user's configured command rather than whatever was in env when the
-     * daemon started.
+     * Resolved launch command for this AI session — forwarded to the daemon's attach handshake so a
+     * fresh PTY honors its configured profile rather than whatever was in env when the daemon
+     * started.
      */
     aiCmd?: string | undefined;
     /**

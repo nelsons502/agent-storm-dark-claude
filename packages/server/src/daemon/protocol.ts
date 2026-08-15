@@ -141,9 +141,9 @@ export type AttachHandshake = {
     sessionId?: string | undefined;
     /**
      * Command to invoke for `PaneKind.Ai` when the daemon spawns the PTY for the first time. Sent
-     * on every attach because the daemon doesn't read agent-storm's config file — the backend does,
-     * and forwards the current value so config edits to `aiCmd` take effect on the next pane spawn
-     * (existing live PTYs keep their old command until restarted).
+     * on every attach because the daemon doesn't read agent-storm's config file — the backend
+     * forwards the session's resolved profile command instead. Existing live PTYs keep their old
+     * command until restarted.
      */
     aiCmd?: string | undefined;
     /**

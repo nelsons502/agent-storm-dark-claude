@@ -28,11 +28,12 @@ import {
     sessionCreateEndpoint,
     sessionListEndpoint,
     sessionRenameEndpoint,
+    sessionSetAgentProfileEndpoint,
     touchRepoEndpoint,
     updateCheckEndpoint,
     uploadEndpoint,
+    type Config,
 } from '@agent-storm/common';
-import {check} from '@augment-vir/assert';
 import {HttpMethod, HttpStatus, log, omitObjectKeys, wait} from '@augment-vir/common';
 import {type OriginRequirement} from '@rest-vir/api';
 import {attachApi, createApiImplementor, implementApi, silentServerLogger} from '@rest-vir/host';
@@ -40,17 +41,15 @@ import fastify from 'fastify';
 import {appendFileSync, writeFileSync} from 'node:fs';
 import {mkdir, stat} from 'node:fs/promises';
 import {parseUrl} from 'url-vir';
+import {resolveAgentProfileCommand} from './agent-profile.js';
 import {initAuth, verifyAuthToken} from './auth.js';
 import {startConfigBackupLoop} from './config-backup.js';
 import {
-    getFolderAiCmd,
-    getFolderResetAiSessionCmd,
     loadConfig,
     saveConfig,
-    setFolderAiCmd,
+    setFolderAgentProfileId,
     setFolderMergeStep,
     setFolderParked,
-    setFolderResetAiSessionCmd,
 } from './config.js';
 import {
     attachPane,
@@ -78,10 +77,13 @@ import {fetchReviewRequestedCount} from './review-requested.js';
 import {
     createFolderSession,
     forgetFolderSessions,
+    getFolderSessions,
     reconcileFolderSessions,
     removeFolderSession,
     renameFolderSession,
     resolveSessionId,
+    setFolderSessionAgentProfile,
+    takePendingNewSession,
 } from './sessions.js';
 import {getUpdateStatus} from './update-check.js';
 import {saveUpload} from './uploads.js';
@@ -209,21 +211,44 @@ async function runPostWorktreeCmd({
     attachment.close();
 }
 
-async function resolveAiCmdForFolder(folder: string): Promise<string | undefined> {
-    const config = await loadConfig().catch(() => undefined);
+async function resolveAgentCommandForSession({
+    folder: folderPath,
+    sessionId,
+    fresh,
+    config: providedConfig,
+}: Readonly<{
+    folder: string;
+    sessionId: string;
+    fresh: boolean;
+    config?: Config | undefined;
+}>): Promise<ReturnType<typeof resolveAgentProfileCommand> | undefined> {
+    const config = providedConfig || (await loadConfig().catch(() => undefined));
     if (!config) {
         return undefined;
     }
-    const parentRepoMatches = await Promise.all(
-        config.repos.map(async (repo) => {
-            const children = await listWorktreeChildren(repo.path);
-            return children.includes(folder) ? repo.path : undefined;
-        }),
-    );
-    return getFolderAiCmd({
+    const folder = normalizePath(folderPath);
+    const cachedFolder = (await getCachedFolders()).find((entry) => entry.path === folder);
+    const parentRepoPath = cachedFolder
+        ? cachedFolder.parentRepoPath || undefined
+        : (
+              await Promise.all(
+                  config.repos.map(async (repo) => {
+                      if (repo.path === folder) {
+                          return undefined;
+                      }
+                      const children = await listWorktreeChildren(repo.path);
+                      return children.includes(folder) ? repo.path : undefined;
+                  }),
+              )
+          ).find((path) => path !== undefined);
+    const sessions = await getFolderSessions(folder);
+    const session = sessions.ai.find((entry) => entry.id === sessionId);
+    return resolveAgentProfileCommand({
         config,
         folder,
-        fallbackFolders: parentRepoMatches.filter(check.isTruthy),
+        parentRepoPath,
+        sessionAgentProfileId: session?.agentProfileId,
+        fresh,
     });
 }
 
@@ -239,7 +264,7 @@ const configImplementation = implementor.implementEndpoint(configEndpoint, {
         };
     },
     async [HttpMethod.Put]({requestData}) {
-        await saveConfig(requestData);
+        const savedConfig = await saveConfig(requestData);
         /**
          * Re-enumerate folder targets now so a freshly-added repo (or removed one) shows up in
          * `/folders` immediately instead of waiting for the next background sweep cycle.
@@ -250,7 +275,7 @@ const configImplementation = implementor.implementEndpoint(configEndpoint, {
         await refreshFolderInfoNow();
         return {
             [HttpStatus.Ok]: {
-                responseData: requestData,
+                responseData: savedConfig,
             },
         };
     },
@@ -280,35 +305,23 @@ const updateCheckImplementation = implementor.implementEndpoint(updateCheckEndpo
 
 const createWorktreeImplementation = implementor.implementEndpoint(createWorktreeEndpoint, {
     async [HttpMethod.Post]({requestData}) {
-        const {worktreePath} = await addWorktree(requestData);
-        const aiCmd = requestData.aiCmd?.trim();
-        const resetCmd = requestData.resetAiSessionCmd?.trim();
-        if (aiCmd || resetCmd) {
-            /**
-             * Best-effort overrides write. `loadConfig` throws on read failure rather than
-             * returning defaults, so `.catch(() => undefined)` here is what prevents a transient
-             * race from kicking us into a "defaults + this override" save that would wipe the
-             * user's other settings. Apply both setters in sequence so the second sees the result
-             * of the first.
-             */
-            const initial = await loadConfig().catch(() => undefined);
-            if (initial) {
-                const withAiCmd = aiCmd
-                    ? setFolderAiCmd({
-                          config: initial,
-                          folder: worktreePath,
-                          aiCmd,
-                      })
-                    : initial;
-                const withReset = resetCmd
-                    ? setFolderResetAiSessionCmd({
-                          config: withAiCmd,
-                          folder: worktreePath,
-                          resetAiSessionCmd: resetCmd,
-                      })
-                    : withAiCmd;
-                await saveConfig(withReset);
+        const agentProfileId = requestData.agentProfileId?.trim() || '';
+        if (agentProfileId) {
+            const config = await loadConfig();
+            if (!config.agentProfiles.some((profile) => profile.id === agentProfileId)) {
+                throw new Error(`Unknown agent profile: ${agentProfileId}`);
             }
+        }
+        const {worktreePath} = await addWorktree(requestData);
+        if (agentProfileId) {
+            const config = await loadConfig();
+            await saveConfig(
+                setFolderAgentProfileId({
+                    config,
+                    folder: worktreePath,
+                    agentProfileId,
+                }),
+            );
         }
         await refreshFolderInfoNow();
         await runPostWorktreeCmd({
@@ -431,11 +444,20 @@ const sessionListImplementation = implementor.implementEndpoint(sessionListEndpo
 
 const sessionCreateImplementation = implementor.implementEndpoint(sessionCreateEndpoint, {
     async [HttpMethod.Post]({requestData}) {
+        const agentProfileId =
+            requestData.kind === PaneKind.Ai ? requestData.agentProfileId?.trim() || '' : '';
+        if (agentProfileId) {
+            const config = await loadConfig();
+            if (!config.agentProfiles.some((profile) => profile.id === agentProfileId)) {
+                throw new Error(`Unknown agent profile: ${agentProfileId}`);
+            }
+        }
         return {
             [HttpStatus.Ok]: {
                 responseData: await createFolderSession({
                     folder: normalizePath(requestData.folder),
                     kind: requestData.kind,
+                    agentProfileId,
                 }),
             },
         };
@@ -489,21 +511,25 @@ const sessionCloseImplementation = implementor.implementEndpoint(sessionCloseEnd
 
 const restartPaneImplementation = implementor.implementEndpoint(restartPaneEndpoint, {
     async [HttpMethod.Post]({requestData}) {
-        /**
-         * Forward the current `aiCmd` so a "Restart AI" picks up any recent config edits to the AI
-         * command (the daemon caches nothing about config — every fresh spawn uses whatever the
-         * backend hands it).
-         */
         const folder = normalizePath(requestData.folder);
+        const sessionId = await resolveSessionId({
+            folder,
+            kind: requestData.kind,
+            sessionId: requestData.sessionId ?? undefined,
+        });
+        const resolved =
+            requestData.kind === PaneKind.Ai
+                ? await resolveAgentCommandForSession({
+                      folder,
+                      sessionId,
+                      fresh: false,
+                  })
+                : undefined;
         await restartPane({
             folder,
             kind: requestData.kind,
-            sessionId: await resolveSessionId({
-                folder,
-                kind: requestData.kind,
-                sessionId: requestData.sessionId ?? undefined,
-            }),
-            aiCmd: await resolveAiCmdForFolder(requestData.folder),
+            sessionId,
+            aiCmd: resolved?.command,
         });
         return {
             [HttpStatus.Ok]: {
@@ -514,6 +540,64 @@ const restartPaneImplementation = implementor.implementEndpoint(restartPaneEndpo
         };
     },
 });
+
+const sessionSetAgentProfileImplementation = implementor.implementEndpoint(
+    sessionSetAgentProfileEndpoint,
+    {
+        async [HttpMethod.Post]({requestData}) {
+            const folder = normalizePath(requestData.folder);
+            const agentProfileId = requestData.agentProfileId.trim();
+            const config = await loadConfig();
+            if (
+                agentProfileId &&
+                !config.agentProfiles.some((profile) => profile.id === agentProfileId)
+            ) {
+                throw new Error(`Unknown agent profile: ${agentProfileId}`);
+            }
+            const sessionId = await resolveSessionId({
+                folder,
+                kind: PaneKind.Ai,
+                sessionId: requestData.sessionId,
+            });
+            const current = await getFolderSessions(folder);
+            const session = current.ai.find((entry) => entry.id === sessionId);
+            const currentStoredChoice = config.agentProfiles.some(
+                (profile) => profile.id === session?.agentProfileId,
+            )
+                ? session?.agentProfileId
+                : '';
+            if (currentStoredChoice === agentProfileId) {
+                return {
+                    [HttpStatus.Ok]: {
+                        responseData: current,
+                    },
+                };
+            }
+            const sessions = await setFolderSessionAgentProfile({
+                folder,
+                sessionId,
+                agentProfileId,
+            });
+            const resolved = await resolveAgentCommandForSession({
+                folder,
+                sessionId,
+                fresh: false,
+                config,
+            });
+            await restartPane({
+                folder,
+                kind: PaneKind.Ai,
+                sessionId,
+                aiCmd: resolved?.command,
+            });
+            return {
+                [HttpStatus.Ok]: {
+                    responseData: sessions,
+                },
+            };
+        },
+    },
+);
 
 const killPanesImplementation = implementor.implementEndpoint(killPanesEndpoint, {
     async [HttpMethod.Post]({requestData}) {
@@ -535,14 +619,6 @@ const killPanesImplementation = implementor.implementEndpoint(killPanesEndpoint,
 
 const resetAiSessionImplementation = implementor.implementEndpoint(resetAiSessionEndpoint, {
     async [HttpMethod.Post]({requestData}) {
-        /**
-         * "Restart AI session" is the same daemon-side action as the regular "Restart AI" (kill the
-         * pty + spawn a fresh one in the same folder) — the only difference is the command we hand
-         * to the daemon: the resolved reset-AI-session string instead of the folder's normal
-         * `aiCmd`. Re-resolve from config on every call so a stale frontend that still has the menu
-         * rendered after the user cleared the setting just no-ops instead of running whatever it
-         * last saw.
-         */
         const folder = normalizePath(requestData.folder);
         const config = await loadConfig().catch(() => undefined);
         if (!config) {
@@ -554,15 +630,18 @@ const resetAiSessionImplementation = implementor.implementEndpoint(resetAiSessio
                 },
             };
         }
-        const cached = await getCachedFolders();
-        const cachedFolder = cached.find((entry) => entry.path === folder);
-        const fallbackFolders = cachedFolder?.parentRepoPath ? [cachedFolder.parentRepoPath] : [];
-        const cmd = getFolderResetAiSessionCmd({
-            config,
+        const sessionId = await resolveSessionId({
             folder,
-            fallbackFolders,
+            kind: PaneKind.Ai,
+            sessionId: requestData.sessionId ?? undefined,
         });
-        if (!cmd) {
+        const resolved = await resolveAgentCommandForSession({
+            folder,
+            sessionId,
+            fresh: true,
+            config,
+        });
+        if (!resolved?.profile.newSessionCommand) {
             return {
                 [HttpStatus.Ok]: {
                     responseData: {
@@ -574,12 +653,8 @@ const resetAiSessionImplementation = implementor.implementEndpoint(resetAiSessio
         await restartPane({
             folder,
             kind: PaneKind.Ai,
-            sessionId: await resolveSessionId({
-                folder,
-                kind: PaneKind.Ai,
-                sessionId: requestData.sessionId ?? undefined,
-            }),
-            aiCmd: cmd,
+            sessionId,
+            aiCmd: resolved.command,
         });
         return {
             [HttpStatus.Ok]: {
@@ -842,7 +917,7 @@ const reviewRequestedImplementation = implementor.implementEndpoint(reviewReques
 
 const ptyImplementation = implementor.implementWebSocket(ptyWebSocket, {
     async open({webSocket, searchParams}) {
-        const folder = searchParams.folder;
+        const folder = normalizePath(searchParams.folder);
         const kind = searchParams.kind;
         /**
          * Client-requested scrollback line cap (see `ptyWebSocket` search params). Empty or invalid
@@ -852,26 +927,34 @@ const ptyImplementation = implementor.implementWebSocket(ptyWebSocket, {
         const scrollbackLimit = Number.isFinite(parsedScrollbackLimit)
             ? parsedScrollbackLimit
             : undefined;
-        /**
-         * Look up the current AI command from agent-storm's config on every attach so the daemon's
-         * spawned PTY (when this is the first attach for the folder + kind pair) uses whatever the
-         * user has set. Failure is non-fatal — the daemon falls back to its built-in default
-         * (`claude`).
-         */
+        const sessionId = await resolveSessionId({
+            folder,
+            kind,
+            sessionId: searchParams.sessionId,
+        });
+        const liveAiSessionIds =
+            kind === PaneKind.Ai ? await getLivePaneSessionIds(folder, PaneKind.Ai) : [];
+        const fresh =
+            kind === PaneKind.Ai &&
+            !liveAiSessionIds.includes(sessionId) &&
+            (await takePendingNewSession({
+                folder,
+                sessionId,
+            }));
+        const resolved =
+            kind === PaneKind.Ai
+                ? await resolveAgentCommandForSession({
+                      folder,
+                      sessionId,
+                      fresh,
+                  })
+                : undefined;
         const attachment = await attachPane({
             folder,
             kind,
-            /**
-             * Resolve against the stored tab list so a hand-edited URL or a client whose session
-             * list hasn't loaded attaches to a real session rather than spawning a PTY under an id
-             * no tab points at.
-             */
-            sessionId: await resolveSessionId({
-                folder,
-                kind,
-                sessionId: searchParams.sessionId,
-            }),
-            aiCmd: await resolveAiCmdForFolder(folder),
+            sessionId,
+            /** Config-read failure is the only path that leaves the daemon's fallback in control. */
+            aiCmd: resolved?.command,
             scrollbackLimit,
             onData(data) {
                 webSocket.send(data);
@@ -949,6 +1032,7 @@ const implementation = implementApi<undefined>()(agentStormService, {
         sessionCreateImplementation,
         sessionRenameImplementation,
         sessionCloseImplementation,
+        sessionSetAgentProfileImplementation,
         resetAiSessionImplementation,
         restartDaemonImplementation,
         touchRepoImplementation,

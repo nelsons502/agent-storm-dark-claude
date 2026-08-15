@@ -12,6 +12,7 @@ import {normalizePath} from './paths.js';
  * sets for the same directory.
  */
 type SessionStore = Record<string, FolderSessions>;
+type StoredSessionMeta = Pick<SessionMeta, 'id'> & Partial<Omit<SessionMeta, 'id'>>;
 
 const storeState: {
     loaded: SessionStore | undefined;
@@ -21,7 +22,7 @@ const storeState: {
     pendingWrite: Promise.resolve(),
 };
 
-function isSessionMetaArray(value: unknown): value is SessionMeta[] {
+function isSessionMetaArray(value: unknown): value is StoredSessionMeta[] {
     return (
         Array.isArray(value) &&
         value.every(
@@ -34,10 +35,15 @@ function isSessionMetaArray(value: unknown): value is SessionMeta[] {
     );
 }
 
-function normalizeStoredSession(entry: Readonly<SessionMeta>): SessionMeta {
+function normalizeStoredSession(entry: Readonly<StoredSessionMeta>, kind: PaneKind): SessionMeta {
     return {
         id: entry.id,
         name: typeof entry.name === 'string' ? entry.name : '',
+        agentProfileId:
+            kind === PaneKind.Ai && typeof entry.agentProfileId === 'string'
+                ? entry.agentProfileId.trim()
+                : '',
+        newSessionPending: kind === PaneKind.Ai && (entry.newSessionPending ?? false),
     };
 }
 
@@ -64,8 +70,8 @@ export function parseSessionStore(contents: string): SessionStore {
         return {
             ...store,
             [normalizePath(folder)]: {
-                ai: ai.map((entry) => normalizeStoredSession(entry)),
-                shell: shell.map((entry) => normalizeStoredSession(entry)),
+                ai: ai.map((entry) => normalizeStoredSession(entry, PaneKind.Ai)),
+                shell: shell.map((entry) => normalizeStoredSession(entry, PaneKind.Shell)),
             },
         };
     }, {});
@@ -147,15 +153,19 @@ function initialSession(): SessionMeta {
     return {
         id: defaultSessionId,
         name: '',
+        agentProfileId: '',
+        newSessionPending: false,
     };
 }
 
 export async function createFolderSession({
     folder: folderPath,
     kind,
+    agentProfileId = '',
 }: Readonly<{
     folder: string;
     kind: PaneKind;
+    agentProfileId?: string | undefined;
 }>): Promise<FolderSessions> {
     const folder = normalizePath(folderPath);
     const current = await getFolderSessions(folder);
@@ -166,11 +176,68 @@ export async function createFolderSession({
             {
                 id: randomUUID(),
                 name: '',
+                agentProfileId: kind === PaneKind.Ai ? agentProfileId.trim() : '',
+                newSessionPending: kind === PaneKind.Ai,
             },
         ],
     };
     writeFolder(folder, updated);
     return updated;
+}
+
+export async function setFolderSessionAgentProfile({
+    folder: folderPath,
+    sessionId,
+    agentProfileId,
+}: Readonly<{
+    folder: string;
+    sessionId: string;
+    agentProfileId: string;
+}>): Promise<FolderSessions> {
+    const folder = normalizePath(folderPath);
+    const current = await getFolderSessions(folder);
+    const updated: FolderSessions = {
+        ...current,
+        ai: current.ai.map((session) =>
+            session.id === sessionId
+                ? {
+                      ...session,
+                      agentProfileId: agentProfileId.trim(),
+                  }
+                : session,
+        ),
+    };
+    writeFolder(folder, updated);
+    return updated;
+}
+
+export async function takePendingNewSession({
+    folder: folderPath,
+    sessionId,
+}: Readonly<{
+    folder: string;
+    sessionId: string;
+}>): Promise<boolean> {
+    const folder = normalizePath(folderPath);
+    const current = await getFolderSessions(folder);
+    const pendingSession = current.ai.some(
+        (session) => session.id === sessionId && session.newSessionPending,
+    );
+    if (!pendingSession) {
+        return false;
+    }
+    writeFolder(folder, {
+        ...current,
+        ai: current.ai.map((session) =>
+            session.id === sessionId
+                ? {
+                      ...session,
+                      newSessionPending: false,
+                  }
+                : session,
+        ),
+    });
+    return true;
 }
 
 export async function renameFolderSession({
@@ -332,6 +399,8 @@ export async function reconcileFolderSessions({
                     return {
                         id,
                         name: '',
+                        agentProfileId: '',
+                        newSessionPending: false,
                     };
                 });
             return orphans.length === 0

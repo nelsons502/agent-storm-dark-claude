@@ -28,6 +28,7 @@ import {
     sessionCreateEndpoint,
     sessionListEndpoint,
     sessionRenameEndpoint,
+    sessionSetAgentProfileEndpoint,
     touchRepoEndpoint,
     updateCheckEndpoint,
     uploadEndpoint,
@@ -125,8 +126,7 @@ export async function createWorktree(
     params: Readonly<{
         repoPath: string;
         name: string;
-        aiCmd?: string | undefined;
-        resetAiSessionCmd?: string | undefined;
+        agentProfileId?: string | undefined;
     }>,
 ): Promise<void> {
     await requestApi('POST /worktrees/create', () =>
@@ -209,10 +209,24 @@ export async function getFolderSessions(
 }
 
 export async function createSession(
-    params: Readonly<{folder: string; kind: PaneKind}>,
+    params: Readonly<{
+        folder: string;
+        kind: PaneKind;
+        agentProfileId?: string | undefined;
+    }>,
 ): Promise<FolderSessions> {
     return await requestApi('POST /sessions/create', () =>
         client.fetch(sessionCreateEndpoint).POST({
+            requestData: params,
+        }),
+    );
+}
+
+export async function setSessionAgentProfile(
+    params: Readonly<{folder: string; sessionId: string; agentProfileId: string}>,
+): Promise<FolderSessions> {
+    return await requestApi('POST /sessions/set-agent-profile', () =>
+        client.fetch(sessionSetAgentProfileEndpoint).POST({
             requestData: params,
         }),
     );

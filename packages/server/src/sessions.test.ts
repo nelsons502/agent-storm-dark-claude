@@ -13,6 +13,8 @@ import {
     removeFolderSession,
     renameFolderSession,
     resolveSessionId,
+    setFolderSessionAgentProfile,
+    takePendingNewSession,
 } from './sessions.js';
 
 /**
@@ -94,6 +96,132 @@ describe(createFolderSession.name, () => {
             assert.isLengthExactly(afterSecond.shell, 1);
             /** Ids must be unique or two tabs would drive the same PTY. */
             assert.strictEquals(new Set(afterSecond.ai.map((session) => session.id)).size, 3);
+        });
+    });
+
+    it('creates an AI session with its selected profile and pending fresh launch', async () => {
+        await withTempFolder(async (folder) => {
+            const ai = await createFolderSession({
+                folder,
+                kind: PaneKind.Ai,
+                agentProfileId: 'review-profile',
+            });
+            const shell = await createFolderSession({
+                folder,
+                kind: PaneKind.Shell,
+                agentProfileId: 'ignored-profile',
+            });
+
+            assert.deepEquals(
+                {
+                    ai: ai.ai[1],
+                    shell: shell.shell[1],
+                },
+                {
+                    ai: {
+                        id: ai.ai[1]?.id || '',
+                        name: '',
+                        agentProfileId: 'review-profile',
+                        newSessionPending: true,
+                    },
+                    shell: {
+                        id: shell.shell[1]?.id || '',
+                        name: '',
+                        agentProfileId: '',
+                        newSessionPending: false,
+                    },
+                },
+            );
+        });
+    });
+});
+
+describe(setFolderSessionAgentProfile.name, () => {
+    it('sets and clears one AI session profile without changing siblings', async () => {
+        await withTempFolder(async (folder) => {
+            const first = await createFolderSession({
+                folder,
+                kind: PaneKind.Ai,
+                agentProfileId: 'first-profile',
+            });
+            const second = await createFolderSession({
+                folder,
+                kind: PaneKind.Ai,
+                agentProfileId: 'sibling-profile',
+            });
+            const targetId = first.ai[1]?.id || '';
+            const siblingId = second.ai[2]?.id || '';
+
+            const set = await setFolderSessionAgentProfile({
+                folder,
+                sessionId: targetId,
+                agentProfileId: 'replacement-profile',
+            });
+            const cleared = await setFolderSessionAgentProfile({
+                folder,
+                sessionId: targetId,
+                agentProfileId: '',
+            });
+
+            assert.deepEquals(
+                {
+                    setTarget: set.ai.find((session) => session.id === targetId)?.agentProfileId,
+                    setSibling: set.ai.find((session) => session.id === siblingId)?.agentProfileId,
+                    clearedTarget: cleared.ai.find((session) => session.id === targetId)
+                        ?.agentProfileId,
+                    clearedSibling: cleared.ai.find((session) => session.id === siblingId)
+                        ?.agentProfileId,
+                },
+                {
+                    setTarget: 'replacement-profile',
+                    setSibling: 'sibling-profile',
+                    clearedTarget: '',
+                    clearedSibling: 'sibling-profile',
+                },
+            );
+        });
+    });
+});
+
+describe(takePendingNewSession.name, () => {
+    it('consumes pending fresh launch exactly once', async () => {
+        await withTempFolder(async (folder) => {
+            const created = await createFolderSession({
+                folder,
+                kind: PaneKind.Ai,
+                agentProfileId: 'fresh-profile',
+            });
+            const sessionId = created.ai[1]?.id || '';
+
+            const first = await takePendingNewSession({
+                folder,
+                sessionId,
+            });
+            const second = await takePendingNewSession({
+                folder,
+                sessionId,
+            });
+            const after = await getFolderSessions(folder);
+
+            assert.deepEquals(
+                {
+                    pendingOnCreation: created.ai[1]?.newSessionPending,
+                    first,
+                    second,
+                    stored: after.ai.find((session) => session.id === sessionId),
+                },
+                {
+                    pendingOnCreation: true,
+                    first: true,
+                    second: false,
+                    stored: {
+                        id: sessionId,
+                        name: '',
+                        agentProfileId: 'fresh-profile',
+                        newSessionPending: false,
+                    },
+                },
+            );
         });
     });
 });
@@ -292,6 +420,8 @@ describe(parseSessionStore.name, () => {
                 {
                     id: 'a',
                     name: 'named',
+                    agentProfileId: '',
+                    newSessionPending: false,
                 },
             ],
             shell: [],
@@ -314,5 +444,28 @@ describe(parseSessionStore.name, () => {
         );
 
         assert.strictEquals(parsed['/tmp/nameless']?.ai[0]?.name, '');
+    });
+
+    it('defaults legacy stored sessions to inherited profile and no pending fresh launch', () => {
+        const parsed = parseSessionStore(
+            JSON.stringify({
+                '/tmp/legacy': {
+                    ai: [
+                        {
+                            id: 'legacy-ai',
+                            name: 'Legacy',
+                        },
+                    ],
+                    shell: [],
+                },
+            }),
+        );
+
+        assert.deepEquals(parsed['/tmp/legacy']?.ai[0], {
+            id: 'legacy-ai',
+            name: 'Legacy',
+            agentProfileId: '',
+            newSessionPending: false,
+        });
     });
 });

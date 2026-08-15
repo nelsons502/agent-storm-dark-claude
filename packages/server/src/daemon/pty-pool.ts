@@ -14,7 +14,7 @@ const idleThresholdMs = 2000;
  * Fallback AI command when the backend doesn't supply one via the attach handshake. The
  * `AGENT_STORM_AI_CMD` env var is still honored as a last resort for direct daemon-protocol callers
  * that don't go through the backend (mostly debugging / tests). Production calls always carry the
- * current config's `aiCmd` and so override this.
+ * current session's resolved profile command and so override this.
  */
 const fallbackAiCommand = process.env.AGENT_STORM_AI_CMD || 'claude';
 
@@ -466,9 +466,9 @@ export function attachPane({
     /** Which session tab to attach to. Empty/omitted resolves to the folder+kind's default. */
     sessionId?: string | undefined;
     /**
-     * Current `aiCmd` from agent-storm config. Used only when spawning a fresh AI PTY here —
-     * existing live PTYs continue running whatever command they were launched with until the user
-     * explicitly restarts the pane. Falls back to {@link fallbackAiCommand} when omitted.
+     * Current resolved profile command. Used only when spawning a fresh AI PTY here — existing live
+     * PTYs continue running whatever command they were launched with until the user explicitly
+     * restarts the pane. Falls back to {@link fallbackAiCommand} when omitted.
      */
     aiCmd?: string | undefined;
     /**

@@ -1,8 +1,9 @@
 // cspell:words Hyperlegible, unpark, upserted
 
 import {
+    type AgentProfile,
+    defaultConfig,
     type FolderInfo,
-    PaneKind,
     PaneStatus,
     type RepoConfig,
     SidebarGrouping,
@@ -39,9 +40,11 @@ import {
     ViraMenuTrigger,
     ViraModal,
     ViraPopUpTrigger,
+    ViraSelect,
     ViraSize,
     viraThemeByKeys,
 } from 'vira';
+import {buildAgentProfilePickerOptions} from '../../util/agent-profiles.js';
 import {
     checkPath,
     createPath,
@@ -54,7 +57,6 @@ import {
     hideRepo,
     killFolderPanes,
     putConfig,
-    restartPane,
     setFolderParked,
     touchRepo,
 } from '../../util/api-client.js';
@@ -121,7 +123,7 @@ const menuIconSize = 16;
 const menuOpenPrIcon = createSizedIcon(lucideIcons.ExternalLink, menuIconSize);
 const menuShowAiIcon = createSizedIcon(lucideIcons.Eye, menuIconSize);
 const menuHideAiIcon = createSizedIcon(lucideIcons.EyeOff, menuIconSize);
-const menuEditCommandsIcon = createSizedIcon(lucideIcons.Terminal, menuIconSize);
+const menuEditProfileIcon = createSizedIcon(lucideIcons.Bot, menuIconSize);
 const menuKillPanesIcon = createSizedIcon(lucideIcons.PowerOff, menuIconSize);
 const menuHideRepoIcon = createSizedIcon(lucideIcons.Archive, menuIconSize);
 const menuDeleteWorktreeIcon = createSizedIcon(lucideIcons.Trash2, menuIconSize);
@@ -155,32 +157,21 @@ type SidebarState = {
     stopPoll: (() => void) | undefined;
     loadError: string | undefined;
     openMenuKey: string | undefined;
+    agentProfiles: ReadonlyArray<AgentProfile>;
+    defaultAgentProfileId: string;
     repoModalOpen: boolean;
     repoPath: string;
-    repoAiCmd: string;
-    repoGlobalAiCmd: string;
-    /** New input on the "Add repo" modal — leaves the global default in place when blank. */
-    repoResetAiSessionCmd: string;
-    repoGlobalResetAiSessionCmd: string;
+    repoAgentProfileId: string;
     repoSubmitting: boolean;
     worktreeModalRepoPath: string | undefined;
     worktreeName: string;
-    worktreeAiCmd: string;
-    worktreeGlobalAiCmd: string;
-    /** New input on the "Add worktree" modal — same semantics as the repo version. */
-    worktreeResetAiSessionCmd: string;
-    worktreeGlobalResetAiSessionCmd: string;
+    worktreeAgentProfileId: string;
+    worktreeInheritedProfileId: string;
     worktreeSubmitting: boolean;
-    /**
-     * Identity of the folder currently being edited in the "Edit folder commands" modal (the one
-     * that replaces the previous `window.prompt`-based AI-cmd flow). `undefined` when the modal is
-     * closed; the path lets us upsert the override into `folderAiCmds` on save.
-     */
     editFolderPath: string | undefined;
-    editFolderAiCmd: string;
-    editFolderResetAiSessionCmd: string;
-    editFolderGlobalAiCmd: string;
-    editFolderGlobalResetAiSessionCmd: string;
+    editFolderAgentProfileId: string;
+    editFolderInheritedProfileId: string;
+    editFolderInheritLabel: string;
     editFolderSubmitting: boolean;
     /**
      * Mirrors `config.sidebarGrouping`. Fetched lazily on first refresh tick so the filter menu can
@@ -238,11 +229,6 @@ type SidebarState = {
 
 type SidebarUpdate = (newState: Partial<SidebarState>) => void;
 
-type PaneRestartedEvent = {
-    folder: string;
-    kind: PaneKind;
-};
-
 export const VirSidebar = defineElement<{
     activeFolder: string | undefined;
     attentionFolders: ReadonlySet<string>;
@@ -266,10 +252,10 @@ export const VirSidebar = defineElement<{
          * right-hand pane unmounts immediately instead of waiting for the next folder-info poll.
          */
         foldersRemoved: defineElementEvent<ReadonlyArray<string>>(),
-        /** Emitted after a pane restart succeeds so the mounted terminal can reconnect. */
-        paneRestarted: defineElementEvent<PaneRestartedEvent>(),
         /** Emitted when the user clicks the gear button. Parent owns the modal open state. */
         openSettingsRequested: defineElementEvent<void>(),
+        /** Emitted from the More menu. The app owns the central profile manager modal. */
+        openAgentProfilesRequested: defineElementEvent<void>(),
     },
     state(): SidebarState {
         return {
@@ -277,25 +263,21 @@ export const VirSidebar = defineElement<{
             stopPoll: undefined,
             loadError: undefined,
             openMenuKey: undefined,
+            agentProfiles: defaultConfig.agentProfiles,
+            defaultAgentProfileId: defaultConfig.defaultAgentProfileId,
             repoModalOpen: false,
             repoPath: '',
-            repoAiCmd: '',
-            repoGlobalAiCmd: '',
-            repoResetAiSessionCmd: '',
-            repoGlobalResetAiSessionCmd: '',
+            repoAgentProfileId: '',
             repoSubmitting: false,
             worktreeModalRepoPath: undefined,
             worktreeName: '',
-            worktreeAiCmd: '',
-            worktreeGlobalAiCmd: '',
-            worktreeResetAiSessionCmd: '',
-            worktreeGlobalResetAiSessionCmd: '',
+            worktreeAgentProfileId: '',
+            worktreeInheritedProfileId: defaultConfig.defaultAgentProfileId,
             worktreeSubmitting: false,
             editFolderPath: undefined,
-            editFolderAiCmd: '',
-            editFolderResetAiSessionCmd: '',
-            editFolderGlobalAiCmd: '',
-            editFolderGlobalResetAiSessionCmd: '',
+            editFolderAgentProfileId: '',
+            editFolderInheritedProfileId: defaultConfig.defaultAgentProfileId,
+            editFolderInheritLabel: 'Inherit global default',
             editFolderSubmitting: false,
             sidebarGrouping: undefined,
             sidebarSorting: undefined,
@@ -864,17 +846,11 @@ export const VirSidebar = defineElement<{
         const onToggleParked = (folder: Readonly<FolderInfo>) => {
             void toggleFolderParked(folder, state, updateState);
         };
-        const emitPaneRestarted = (detail: PaneRestartedEvent) => {
-            dispatch(new events.paneRestarted(detail));
-        };
         const closeRepoModal = () => {
             updateState({
                 repoModalOpen: false,
                 repoPath: '',
-                repoAiCmd: '',
-                repoGlobalAiCmd: '',
-                repoResetAiSessionCmd: '',
-                repoGlobalResetAiSessionCmd: '',
+                repoAgentProfileId: '',
                 repoSubmitting: false,
             });
         };
@@ -889,10 +865,8 @@ export const VirSidebar = defineElement<{
             updateState({
                 worktreeModalRepoPath: undefined,
                 worktreeName: '',
-                worktreeAiCmd: '',
-                worktreeGlobalAiCmd: '',
-                worktreeResetAiSessionCmd: '',
-                worktreeGlobalResetAiSessionCmd: '',
+                worktreeAgentProfileId: '',
+                worktreeInheritedProfileId: state.defaultAgentProfileId,
                 worktreeSubmitting: false,
             });
         };
@@ -906,10 +880,9 @@ export const VirSidebar = defineElement<{
         const closeEditFolderModal = () => {
             updateState({
                 editFolderPath: undefined,
-                editFolderAiCmd: '',
-                editFolderResetAiSessionCmd: '',
-                editFolderGlobalAiCmd: '',
-                editFolderGlobalResetAiSessionCmd: '',
+                editFolderAgentProfileId: '',
+                editFolderInheritedProfileId: state.defaultAgentProfileId,
+                editFolderInheritLabel: 'Inherit global default',
                 editFolderSubmitting: false,
             });
         };
@@ -917,7 +890,6 @@ export const VirSidebar = defineElement<{
             void submitEditFolder({
                 state,
                 updateState,
-                emitPaneRestarted,
             });
         };
 
@@ -1114,6 +1086,13 @@ export const VirSidebar = defineElement<{
                         ></${ViraButton}>
                         ${renderMenuItemEntries([
                             {
+                                content: 'Agent profiles',
+                                iconOverride: lucideIcons.Bot,
+                                onClick: () => {
+                                    dispatch(new events.openAgentProfilesRequested());
+                                },
+                            },
+                            {
                                 content: 'Settings',
                                 onClick: () => {
                                     dispatch(new events.openSettingsRequested());
@@ -1249,6 +1228,13 @@ export const VirSidebar = defineElement<{
                                                 },
                                             },
                                             {
+                                                content: 'Edit default agent profile',
+                                                iconOverride: lucideIcons.Bot,
+                                                onClick: () => {
+                                                    void openEditFolderModal(root, updateState);
+                                                },
+                                            },
+                                            {
                                                 content: 'Remove repo',
                                                 iconOverride: lucideIcons.X,
                                                 onClick: () => {
@@ -1310,44 +1296,22 @@ export const VirSidebar = defineElement<{
                             }
                         })}
                     ></${ViraInput}>
-                    <${ViraInput.assign({
-                        label: 'AI command override',
-                        value: state.repoAiCmd,
-                        placeholder: state.repoGlobalAiCmd || 'claude',
-                        showClearButton: true,
-                        disableBrowserHelps: true,
+                    <${ViraSelect.assign({
+                        label: 'Default agent profile',
+                        options: buildAgentProfilePickerOptions({
+                            profiles: state.agentProfiles,
+                            inheritedProfileId: state.defaultAgentProfileId,
+                            inheritLabel: 'Inherit global default',
+                        }),
+                        value: state.repoAgentProfileId,
                         disabled: state.repoSubmitting,
                     })}
-                        ${listen(ViraInput.events.valueChange, (event) => {
+                        ${listen(ViraSelect.events.valueChange, (event) => {
                             updateState({
-                                repoAiCmd: event.detail,
+                                repoAgentProfileId: event.detail,
                             });
                         })}
-                        ${listen('keydown', (event) => {
-                            if (event instanceof KeyboardEvent && event.key === 'Enter') {
-                                submitRepo();
-                            }
-                        })}
-                    ></${ViraInput}>
-                    <${ViraInput.assign({
-                        label: 'Reset AI session command override',
-                        value: state.repoResetAiSessionCmd,
-                        placeholder: state.repoGlobalResetAiSessionCmd || '/clear',
-                        showClearButton: true,
-                        disableBrowserHelps: true,
-                        disabled: state.repoSubmitting,
-                    })}
-                        ${listen(ViraInput.events.valueChange, (event) => {
-                            updateState({
-                                repoResetAiSessionCmd: event.detail,
-                            });
-                        })}
-                        ${listen('keydown', (event) => {
-                            if (event instanceof KeyboardEvent && event.key === 'Enter') {
-                                submitRepo();
-                            }
-                        })}
-                    ></${ViraInput}>
+                    ></${ViraSelect}>
                     <div class="repo-modal-footer">
                         <${ViraButton.assign({
                             text: 'Cancel',
@@ -1393,44 +1357,22 @@ export const VirSidebar = defineElement<{
                             }
                         })}
                     ></${ViraInput}>
-                    <${ViraInput.assign({
-                        label: 'AI command override',
-                        value: state.worktreeAiCmd,
-                        placeholder: state.worktreeGlobalAiCmd || 'claude',
-                        showClearButton: true,
-                        disableBrowserHelps: true,
+                    <${ViraSelect.assign({
+                        label: 'Default agent profile',
+                        options: buildAgentProfilePickerOptions({
+                            profiles: state.agentProfiles,
+                            inheritedProfileId: state.worktreeInheritedProfileId,
+                            inheritLabel: 'Inherit repo default',
+                        }),
+                        value: state.worktreeAgentProfileId,
                         disabled: state.worktreeSubmitting,
                     })}
-                        ${listen(ViraInput.events.valueChange, (event) => {
+                        ${listen(ViraSelect.events.valueChange, (event) => {
                             updateState({
-                                worktreeAiCmd: event.detail,
+                                worktreeAgentProfileId: event.detail,
                             });
                         })}
-                        ${listen('keydown', (event) => {
-                            if (event instanceof KeyboardEvent && event.key === 'Enter') {
-                                submitWorktree();
-                            }
-                        })}
-                    ></${ViraInput}>
-                    <${ViraInput.assign({
-                        label: 'Reset AI session command override',
-                        value: state.worktreeResetAiSessionCmd,
-                        placeholder: state.worktreeGlobalResetAiSessionCmd || '/clear',
-                        showClearButton: true,
-                        disableBrowserHelps: true,
-                        disabled: state.worktreeSubmitting,
-                    })}
-                        ${listen(ViraInput.events.valueChange, (event) => {
-                            updateState({
-                                worktreeResetAiSessionCmd: event.detail,
-                            });
-                        })}
-                        ${listen('keydown', (event) => {
-                            if (event instanceof KeyboardEvent && event.key === 'Enter') {
-                                submitWorktree();
-                            }
-                        })}
-                    ></${ViraInput}>
+                    ></${ViraSelect}>
                     <div class="worktree-modal-footer">
                         <${ViraButton.assign({
                             text: 'Cancel',
@@ -1452,47 +1394,27 @@ export const VirSidebar = defineElement<{
             </${ViraModal}>
             <${ViraModal.assign({
                 open: !!state.editFolderPath,
-                modalTitle: 'Edit folder commands',
+                modalTitle: 'Edit default agent profile',
             })}
                 ${listen(ViraModal.events.modalClose, closeEditFolderModal)}
             >
                 <div class="repo-modal-body">
-                    <${ViraInput.assign({
-                        label: 'AI command override',
-                        value: state.editFolderAiCmd,
-                        placeholder: state.editFolderGlobalAiCmd || 'claude',
-                        showClearButton: true,
+                    <${ViraSelect.assign({
+                        label: 'Default agent profile',
+                        options: buildAgentProfilePickerOptions({
+                            profiles: state.agentProfiles,
+                            inheritedProfileId: state.editFolderInheritedProfileId,
+                            inheritLabel: state.editFolderInheritLabel,
+                        }),
+                        value: state.editFolderAgentProfileId,
                         disabled: state.editFolderSubmitting,
                     })}
-                        ${listen(ViraInput.events.valueChange, (event) => {
+                        ${listen(ViraSelect.events.valueChange, (event) => {
                             updateState({
-                                editFolderAiCmd: event.detail,
+                                editFolderAgentProfileId: event.detail,
                             });
                         })}
-                        ${listen('keydown', (event) => {
-                            if (event instanceof KeyboardEvent && event.key === 'Enter') {
-                                submitEditFolderModal();
-                            }
-                        })}
-                    ></${ViraInput}>
-                    <${ViraInput.assign({
-                        label: 'Reset AI session command override',
-                        value: state.editFolderResetAiSessionCmd,
-                        placeholder: state.editFolderGlobalResetAiSessionCmd || '/clear',
-                        showClearButton: true,
-                        disabled: state.editFolderSubmitting,
-                    })}
-                        ${listen(ViraInput.events.valueChange, (event) => {
-                            updateState({
-                                editFolderResetAiSessionCmd: event.detail,
-                            });
-                        })}
-                        ${listen('keydown', (event) => {
-                            if (event instanceof KeyboardEvent && event.key === 'Enter') {
-                                submitEditFolderModal();
-                            }
-                        })}
-                    ></${ViraInput}>
+                    ></${ViraSelect}>
                     <div class="repo-modal-footer">
                         <${ViraButton.assign({
                             text: 'Cancel',
@@ -1929,8 +1851,8 @@ function buildRowMenuEntries({
             },
         },
         {
-            content: 'Edit folder commands',
-            iconOverride: menuEditCommandsIcon,
+            content: 'Edit default agent profile',
+            iconOverride: menuEditProfileIcon,
             onClick: () => {
                 void openEditFolderModal(folder, updateState);
             },
@@ -2069,6 +1991,8 @@ async function refresh(
             sidebarSorting: config.sidebarSorting,
             onlyShowRecent: config.onlyShowRecent,
             repos: config.repos,
+            agentProfiles: config.agentProfiles,
+            defaultAgentProfileId: config.defaultAgentProfileId,
             updateStatus,
             reviewRequestedCount,
         } satisfies Partial<SidebarState>;
@@ -2254,21 +2178,23 @@ function filterBySearch(folders: ReadonlyArray<FolderInfo>, query: string): Fold
     });
 }
 
-/**
- * Open the "Edit folder commands" modal, seeded with this folder's current overrides (or the global
- * defaults if no override is set). Replaces the previous `window.prompt`-based flow so users can
- * edit the AI command and the reset-AI-session command in a single dialog.
- */
 async function openEditFolderModal(folder: FolderInfo, updateState: SidebarUpdate): Promise<void> {
     try {
         const config = await getConfig();
-        const override = config.folderAiCmds.find((entry) => entry.folder === folder.path);
+        const override = config.folderAgentProfileIds.find((entry) => entry.folder === folder.path);
+        const parentOverride = folder.parentRepoPath
+            ? config.folderAgentProfileIds.find((entry) => entry.folder === folder.parentRepoPath)
+            : undefined;
+        const inheritedProfileId = parentOverride?.agentProfileId || config.defaultAgentProfileId;
         updateState({
             editFolderPath: folder.path,
-            editFolderAiCmd: override?.aiCmd || '',
-            editFolderResetAiSessionCmd: override?.resetAiSessionCmd || '',
-            editFolderGlobalAiCmd: config.aiCmd,
-            editFolderGlobalResetAiSessionCmd: config.resetAiSessionCmd || '',
+            editFolderAgentProfileId: override?.agentProfileId || '',
+            editFolderInheritedProfileId: inheritedProfileId,
+            editFolderInheritLabel: folder.parentRepoPath
+                ? 'Inherit repo default'
+                : 'Inherit global default',
+            agentProfiles: config.agentProfiles,
+            defaultAgentProfileId: config.defaultAgentProfileId,
             editFolderSubmitting: false,
         });
     } catch (error: unknown) {
@@ -2276,70 +2202,43 @@ async function openEditFolderModal(folder: FolderInfo, updateState: SidebarUpdat
     }
 }
 
-/**
- * Persist the modal's two fields into `folderAiCmds`. If both inputs match the corresponding
- * globals, the override entry is dropped entirely; otherwise it's upserted with whichever of the
- * two values differ from the global. Restart the AI pane on save so the new `aiCmd` takes effect
- * (the reset-cmd doesn't need a restart — it's only invoked on demand).
- */
 async function submitEditFolder({
     state,
     updateState,
-    emitPaneRestarted,
 }: Readonly<{
     state: SidebarState;
     updateState: SidebarUpdate;
-    emitPaneRestarted: (detail: PaneRestartedEvent) => void;
 }>): Promise<void> {
     const folderPath = state.editFolderPath;
     if (!folderPath || state.editFolderSubmitting) {
         return;
     }
-    const aiCmd = state.editFolderAiCmd.trim();
-    const resetCmd = state.editFolderResetAiSessionCmd.trim();
+    const agentProfileId = state.editFolderAgentProfileId.trim();
     try {
         updateState({
             editFolderSubmitting: true,
         });
         const config = await getConfig();
-        const aiCmdIsOverride = !!aiCmd && aiCmd !== config.aiCmd;
-        const resetIsOverride = !!resetCmd && resetCmd !== (config.resetAiSessionCmd || '');
-        const otherEntries = config.folderAiCmds.filter((entry) => entry.folder !== folderPath);
-        const nextEntries =
-            aiCmdIsOverride || resetIsOverride
+        const otherEntries = config.folderAgentProfileIds.filter(
+            (entry) => entry.folder !== folderPath,
+        );
+        await putConfig({
+            ...config,
+            folderAgentProfileIds: agentProfileId
                 ? [
                       ...otherEntries,
                       {
                           folder: folderPath,
-                          aiCmd: aiCmdIsOverride ? aiCmd : '',
-                          ...(resetIsOverride
-                              ? {
-                                    resetAiSessionCmd: resetCmd,
-                                }
-                              : {}),
+                          agentProfileId,
                       },
                   ]
-                : otherEntries;
-        await putConfig({
-            ...config,
-            folderAiCmds: nextEntries,
+                : otherEntries,
         });
-        if (aiCmdIsOverride || aiCmd) {
-            await restartPane({
-                folder: folderPath,
-                kind: PaneKind.Ai,
-            });
-            emitPaneRestarted({
-                folder: folderPath,
-                kind: PaneKind.Ai,
-            });
-        }
         updateState({
             editFolderPath: undefined,
-            editFolderAiCmd: '',
-            editFolderResetAiSessionCmd: '',
-            editFolderGlobalAiCmd: '',
-            editFolderGlobalResetAiSessionCmd: '',
+            editFolderAgentProfileId: '',
+            editFolderInheritedProfileId: config.defaultAgentProfileId,
+            editFolderInheritLabel: 'Inherit global default',
             editFolderSubmitting: false,
         });
         await refresh(updateState);
@@ -2363,10 +2262,9 @@ async function openAddRepoModal(updateState: SidebarUpdate): Promise<void> {
         updateState({
             repoModalOpen: true,
             repoPath: '',
-            repoAiCmd: '',
-            repoGlobalAiCmd: config.aiCmd,
-            repoResetAiSessionCmd: '',
-            repoGlobalResetAiSessionCmd: config.resetAiSessionCmd || '',
+            repoAgentProfileId: '',
+            agentProfiles: config.agentProfiles,
+            defaultAgentProfileId: config.defaultAgentProfileId,
             repoSubmitting: false,
         });
     } catch (error: unknown) {
@@ -2429,35 +2327,14 @@ async function submitAddRepo({
                 repos: refreshedConfig.repos,
                 repoModalOpen: false,
                 repoPath: '',
-                repoAiCmd: '',
-                repoGlobalAiCmd: '',
-                repoResetAiSessionCmd: '',
-                repoGlobalResetAiSessionCmd: '',
+                repoAgentProfileId: '',
                 repoSubmitting: false,
             });
             notifyActivated(path);
             return;
         }
-        const aiCmd = state.repoAiCmd.trim();
-        const resetCmd = state.repoResetAiSessionCmd.trim();
-        const aiCmdIsOverride = !!aiCmd && aiCmd !== config.aiCmd;
-        const resetIsOverride = !!resetCmd && resetCmd !== (config.resetAiSessionCmd || '');
-        const otherEntries = config.folderAiCmds.filter((entry) => entry.folder !== path);
-        const folderAiCmds =
-            aiCmdIsOverride || resetIsOverride
-                ? [
-                      ...otherEntries,
-                      {
-                          folder: path,
-                          aiCmd: aiCmdIsOverride ? aiCmd : '',
-                          ...(resetIsOverride
-                              ? {
-                                    resetAiSessionCmd: resetCmd,
-                                }
-                              : {}),
-                      },
-                  ]
-                : otherEntries;
+        const agentProfileId = state.repoAgentProfileId.trim();
+        const otherEntries = config.folderAgentProfileIds.filter((entry) => entry.folder !== path);
         await putConfig({
             ...config,
             repos: [
@@ -2467,7 +2344,15 @@ async function submitAddRepo({
                     postWorktreeCmd: null,
                 },
             ],
-            folderAiCmds,
+            folderAgentProfileIds: agentProfileId
+                ? [
+                      ...otherEntries,
+                      {
+                          folder: path,
+                          agentProfileId,
+                      },
+                  ]
+                : otherEntries,
         });
         /**
          * Fetch the new folder list directly so we can find the repo's resolved path (may include a
@@ -2483,10 +2368,7 @@ async function submitAddRepo({
             loadError: undefined,
             repoModalOpen: false,
             repoPath: '',
-            repoAiCmd: '',
-            repoGlobalAiCmd: '',
-            repoResetAiSessionCmd: '',
-            repoGlobalResetAiSessionCmd: '',
+            repoAgentProfileId: '',
             repoSubmitting: false,
         });
         const newFolder = folders.find((folder) => folder.path === path);
@@ -2553,13 +2435,16 @@ async function confirmRemoveRepo(
 async function openAddWorktreeModal(repoPath: string, updateState: SidebarUpdate): Promise<void> {
     try {
         const config = await getConfig();
+        const repoProfileId =
+            config.folderAgentProfileIds.find((entry) => entry.folder === repoPath)
+                ?.agentProfileId || config.defaultAgentProfileId;
         updateState({
             worktreeModalRepoPath: repoPath,
             worktreeName: '',
-            worktreeAiCmd: '',
-            worktreeGlobalAiCmd: config.aiCmd,
-            worktreeResetAiSessionCmd: '',
-            worktreeGlobalResetAiSessionCmd: config.resetAiSessionCmd || '',
+            worktreeAgentProfileId: '',
+            worktreeInheritedProfileId: repoProfileId,
+            agentProfiles: config.agentProfiles,
+            defaultAgentProfileId: config.defaultAgentProfileId,
             worktreeSubmitting: false,
         });
     } catch (error: unknown) {
@@ -2581,8 +2466,6 @@ async function submitAddWorktree({
     if (!repoPath || !trimmedName || state.worktreeSubmitting) {
         return;
     }
-    const aiCmd = state.worktreeAiCmd.trim();
-    const resetCmd = state.worktreeResetAiSessionCmd.trim();
     try {
         updateState({
             worktreeSubmitting: true,
@@ -2590,11 +2473,7 @@ async function submitAddWorktree({
         await createWorktree({
             repoPath,
             name: trimmedName,
-            aiCmd: aiCmd && aiCmd !== state.worktreeGlobalAiCmd ? aiCmd : undefined,
-            resetAiSessionCmd:
-                resetCmd && resetCmd !== state.worktreeGlobalResetAiSessionCmd
-                    ? resetCmd
-                    : undefined,
+            agentProfileId: state.worktreeAgentProfileId || undefined,
         });
         const folders = await getFolders();
         updateState({
@@ -2602,10 +2481,8 @@ async function submitAddWorktree({
             loadError: undefined,
             worktreeModalRepoPath: undefined,
             worktreeName: '',
-            worktreeAiCmd: '',
-            worktreeGlobalAiCmd: '',
-            worktreeResetAiSessionCmd: '',
-            worktreeGlobalResetAiSessionCmd: '',
+            worktreeAgentProfileId: '',
+            worktreeInheritedProfileId: state.defaultAgentProfileId,
             worktreeSubmitting: false,
         });
         const newWorktree = folders.find(

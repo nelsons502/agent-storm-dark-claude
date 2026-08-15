@@ -27,7 +27,6 @@ describe('config theme', () => {
     it('keeps light for a legacy config missing the theme field', () => {
         // A config object as written before `theme` existed — no `theme` key at all.
         const legacy: Partial<Config> = {
-            aiCmd: 'claude',
             repos: [],
         };
 

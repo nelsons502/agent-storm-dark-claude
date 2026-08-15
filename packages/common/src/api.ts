@@ -61,24 +61,76 @@ export const configJsonSchema = {
     additionalProperties: false,
     title: 'agent-storm config',
     properties: {
-        aiCmd: {
-            type: 'string',
-            default: 'claude',
-            title: 'AI command',
-            description: 'Command launched in the AI pane (e.g. `claude`).',
+        agentProfiles: {
+            type: 'array',
+            default: [
+                {
+                    id: 'claude-default',
+                    name: 'Claude Code',
+                    launchCommand: 'claude',
+                    newSessionCommand: '',
+                },
+            ],
+            title: 'Agent profiles',
+            description: 'Reusable named command pairs for AI sessions.',
+            items: {
+                type: 'object',
+                additionalProperties: false,
+                title: 'Agent profile',
+                properties: {
+                    id: {
+                        type: 'string',
+                        title: 'ID',
+                    },
+                    name: {
+                        type: 'string',
+                        title: 'Name',
+                    },
+                    launchCommand: {
+                        type: 'string',
+                        title: 'Launch command',
+                    },
+                    newSessionCommand: {
+                        type: 'string',
+                        title: 'New-session command',
+                    },
+                },
+                required: [
+                    'id',
+                    'name',
+                    'launchCommand',
+                    'newSessionCommand',
+                ],
+            },
         },
-        /**
-         * Optional global default for the "Restart AI session" menu item. When non-empty (or when a
-         * per-folder override is set in `folderAiCmds`), the sidebar row menu shows the item and
-         * clicking it writes this string + newline into the folder's AI pane. Intentionally absent
-         * from `required` so older configs without it still load — missing → "" → no menu item.
-         */
-        resetAiSessionCmd: {
+        defaultAgentProfileId: {
             type: 'string',
-            default: '',
-            title: 'Reset AI session command',
-            description:
-                'Optional. Command (e.g. `/clear`) sent into the AI pane when the user picks "Restart AI session" from a folder\'s row menu. Per-folder overrides live alongside the AI command override.',
+            default: 'claude-default',
+            title: 'Default agent profile',
+        },
+        folderAgentProfileIds: {
+            type: 'array',
+            default: [],
+            title: 'Folder agent profile overrides',
+            items: {
+                type: 'object',
+                additionalProperties: false,
+                title: 'Folder agent profile override',
+                properties: {
+                    folder: {
+                        type: 'string',
+                        title: 'Folder',
+                    },
+                    agentProfileId: {
+                        type: 'string',
+                        title: 'Agent profile ID',
+                    },
+                },
+                required: [
+                    'folder',
+                    'agentProfileId',
+                ],
+            },
         },
         postWorktreeCmd: {
             type: [
@@ -127,41 +179,6 @@ export const configJsonSchema = {
                 required: [
                     'path',
                     'postWorktreeCmd',
-                ],
-            },
-        },
-        folderAiCmds: {
-            type: 'array',
-            default: [],
-            title: 'Folder AI command overrides',
-            items: {
-                type: 'object',
-                additionalProperties: false,
-                title: 'Folder AI command override',
-                properties: {
-                    folder: {
-                        type: 'string',
-                        title: 'Folder',
-                    },
-                    aiCmd: {
-                        type: 'string',
-                        title: 'AI command',
-                    },
-                    /**
-                     * Optional per-folder override of the global `resetAiSessionCmd`. When the user
-                     * picks "Restart AI session" from a row menu, this wins over the global default
-                     * (and we fall back through worktree-root → global the same way `aiCmd`
-                     * resolution does). Absent from `required` so an entry can exist for the
-                     * `aiCmd` override alone, the reset-cmd override alone, or both.
-                     */
-                    resetAiSessionCmd: {
-                        type: 'string',
-                        title: 'Reset AI session command override',
-                    },
-                },
-                required: [
-                    'folder',
-                    'aiCmd',
                 ],
             },
         },
@@ -347,10 +364,11 @@ export const configJsonSchema = {
         },
     },
     required: [
-        'aiCmd',
+        'agentProfiles',
+        'defaultAgentProfileId',
+        'folderAgentProfileIds',
         'postWorktreeCmd',
         'repos',
-        'folderAiCmds',
         'mergeSteps',
         'hiddenAiPane',
         'disabledGitHubPolling',
@@ -380,14 +398,8 @@ export const folderInfoShape = defineShape({
      */
     isParked: false,
     aiHidden: false,
-    aiCmd: '',
-    /**
-     * Resolved reset-AI-session command for this folder — backend already walked the per-folder
-     * override → global default lookup. Empty string when no command is configured; the sidebar
-     * uses that as the "don't render the menu item" signal so the frontend never has to recreate
-     * the resolution logic.
-     */
-    resetAiSessionCmd: '',
+    /** Resolved configured profile after folder, repo-root, global, and recovery fallback. */
+    agentProfileId: '',
     branch: nullableShape(''),
     git: {
         dirty: false,
@@ -450,6 +462,10 @@ const folderActionRequestShape = defineShape({
 export const sessionMetaShape = defineShape({
     id: '',
     name: '',
+    /** Empty means the AI tab inherits its folder profile. Always empty for shell tabs. */
+    agentProfileId: '',
+    /** Consumed when a newly-created AI tab first attaches to its PTY. */
+    newSessionPending: false,
 });
 
 /**
@@ -469,6 +485,8 @@ const sessionListRequestShape = defineShape({
 const sessionCreateRequestShape = defineShape({
     folder: '',
     kind: enumShape(PaneKind),
+    /** Empty or null inherits the folder default. Ignored for shell sessions. */
+    agentProfileId: nullableShape(''),
 });
 
 const sessionRenameRequestShape = defineShape({
@@ -483,6 +501,13 @@ const sessionCloseRequestShape = defineShape({
     folder: '',
     kind: enumShape(PaneKind),
     sessionId: '',
+});
+
+const sessionSetAgentProfileRequestShape = defineShape({
+    folder: '',
+    sessionId: '',
+    /** Empty restores folder inheritance. */
+    agentProfileId: '',
 });
 
 /**
@@ -505,13 +530,8 @@ const paneSessionFolderRequestShape = defineShape({
 const createWorktreeRequestShape = defineShape({
     repoPath: '',
     name: '',
-    aiCmd: nullableShape(''),
-    /**
-     * Optional per-worktree override of the global reset-AI-session command, collected by the "Add
-     * worktree" modal alongside `aiCmd`. Null/undefined → don't write an override entry; the
-     * worktree inherits the global / repo-level default.
-     */
-    resetAiSessionCmd: nullableShape(''),
+    /** Null or empty inherits the parent repo's configured profile. */
+    agentProfileId: nullableShape(''),
 });
 
 const deleteWorktreeRequestShape = defineShape({
@@ -1072,12 +1092,7 @@ export const killPanesEndpoint = defineEndpoint({
     },
 });
 
-/**
- * Sends the configured "reset AI session" string into a folder's AI pane (per-folder override →
- * global default). Triggered by the row-menu "Restart AI session" item, which only appears when the
- * resolved command is non-empty. Returns a no-op 200 when no command is configured so a stale
- * frontend doesn't surface errors after the user clears the setting.
- */
+/** Returns every normalized AI and shell tab for one folder. */
 export const sessionListEndpoint = defineEndpoint({
     path: '/sessions/list',
     requests: {
@@ -1139,6 +1154,22 @@ export const sessionCloseEndpoint = defineEndpoint({
     },
 });
 
+/** Changes one AI tab's configured profile and restarts only that tab. */
+export const sessionSetAgentProfileEndpoint = defineEndpoint({
+    path: '/sessions/set-agent-profile',
+    requests: {
+        [HttpMethod.Post]: {
+            requestData: sessionSetAgentProfileRequestShape,
+            responses: {
+                [HttpStatus.Ok]: {
+                    responseData: sessionsResponseShape,
+                },
+            },
+        },
+    },
+});
+
+/** Restarts one AI tab with its profile's fresh-session command, or no-ops if none is configured. */
 export const resetAiSessionEndpoint = defineEndpoint({
     path: '/panes/reset-ai-session',
     requests: {
@@ -1282,6 +1313,7 @@ export const agentStormService = defineApi({
         sessionCreateEndpoint,
         sessionRenameEndpoint,
         sessionCloseEndpoint,
+        sessionSetAgentProfileEndpoint,
         resetAiSessionEndpoint,
         restartDaemonEndpoint,
         touchRepoEndpoint,
@@ -1300,13 +1332,26 @@ export const agentStormService = defineApi({
     webSockets: [ptyWebSocket],
 });
 
-export const defaultConfig = configShape.default;
+export const defaultConfig: typeof configShape.runtimeType = {
+    ...configShape.default,
+    agentProfiles: [
+        {
+            id: 'claude-default',
+            name: 'Claude Code',
+            launchCommand: 'claude',
+            newSessionCommand: '',
+        },
+    ],
+    defaultAgentProfileId: 'claude-default',
+    folderAgentProfileIds: [],
+};
 
 /**
  * Derived directly from {@link configJsonSchema} via `json-schema-to-ts` so the runtime shape, the
  * settings modal's form schema, and this TypeScript type are all driven from the same definition.
  */
 export type Config = SchemaShapeToType<typeof configJsonSchema, NonNullable<unknown>>;
+export type AgentProfile = Config['agentProfiles'][number];
 export type RepoConfig = Config['repos'][number];
 export type FolderInfo = typeof folderInfoShape.runtimeType;
 export type UpdateStatus = typeof updateStatusResponseShape.runtimeType;

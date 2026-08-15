@@ -19,15 +19,16 @@ import {localStorageClient, scrollbackLimit} from '../../util/local-storage-clie
  * Config properties that round-trip through `/config` (so the backend can persist them across
  * restarts) but are hidden from the settings form. Reasons vary: `githubPollingAutoDisable` is
  * entirely backend-managed (the user has no business editing it here), while `repos`,
- * `folderAiCmds`, and `hiddenAiPane` are per-folder data managed through the sidebar rather than
- * this JSON form (and too large / noisy to belong here). Stripped from both the schema we hand to
- * `ViraJsonForm` and from the form's input/output, then preserved on save so hiding them never
- * blows away their runtime state.
+ * `agentProfiles`, profile references, and `hiddenAiPane` have dedicated controls elsewhere.
+ * Stripped from both the schema we hand to `ViraJsonForm` and from the form's input/output, then
+ * preserved on save so hiding them never blows away their runtime state.
  */
 const hiddenConfigKeys = [
     'githubPollingAutoDisable',
     'repos',
-    'folderAiCmds',
+    'agentProfiles',
+    'defaultAgentProfileId',
+    'folderAgentProfileIds',
     'hiddenAiPane',
 ] as const satisfies ReadonlyArray<keyof Config>;
 

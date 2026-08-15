@@ -2,6 +2,7 @@
 
 import {
     PaneKind,
+    type AgentProfile,
     type FolderInfo,
     type FolderSessions,
     type SessionMeta,
@@ -19,12 +20,17 @@ import {
     type ViraMenuItemEntry,
 } from 'vira';
 import {
+    getSessionAgentProfilePresentation,
+    resolveAgentProfileForPresentation,
+} from '../../util/agent-profiles.js';
+import {
     closeSession,
     createSession,
     getFolderSessions,
     renameSession,
     resetAiSession,
     restartPane,
+    setSessionAgentProfile,
 } from '../../util/api-client.js';
 import {moveTabGroup, type PaneAttentionRequest} from '../../util/interaction-state.js';
 import {localStorageClient, paneSplit} from '../../util/local-storage-client.js';
@@ -35,6 +41,7 @@ import {ScreenSize} from '../../util/screen-size.js';
  * on every app boot even for users who never open a Diff tab. Splitting it out defers ~90KB
  * minified. The class is loaded on demand when the Diff tab is first opened, in `render` below.
  */
+import {VirAgentProfilePickerModal} from './vir-agent-profile-picker-modal.element.js';
 import type {VirDiffPane} from './vir-diff-pane.element.js';
 import {VirGithubPane} from './vir-github-pane.element.js';
 import {VirProgressTracker, type MergeStepActionDetail} from './vir-progress-tracker.element.js';
@@ -97,7 +104,6 @@ export const VirPaneGroup = defineElement<{
      * tab or one each, and the pane-visibility rules. Updates as the user resizes the window.
      */
     screenSize: ScreenSize;
-    aiRestartKey: number;
     /**
      * 1-based index of the active session tab for each pane, straight from the URL. Two values
      * because desktop shows both panes at once, so each has its own independent selection. An index
@@ -105,12 +111,9 @@ export const VirPaneGroup = defineElement<{
      */
     aiSessionIndex: number;
     shellSessionIndex: number;
-    /**
-     * Backend-resolved "reset AI session" command for this folder (per-folder override → global
-     * default). Empty means not configured, which hides the corresponding session-menu item — same
-     * signal the sidebar row menu used.
-     */
-    resetAiSessionCmd: string;
+    agentProfiles: ReadonlyArray<AgentProfile>;
+    /** Resolved folder/repo/global profile used by tabs whose stored profile id is empty or stale. */
+    folderAgentProfileId: string;
     /**
      * This folder's info, for the merge-step tracker in the tab bar. Undefined while the first
      * folder-info poll is still in flight, which renders no tracker rather than an empty one.
@@ -177,6 +180,10 @@ export const VirPaneGroup = defineElement<{
             diffPaneLoading: false,
             /** Same lazy-mount-then-keep pattern as `diffPane` above, for the GitHub pane. */
             githubMounted: false,
+            profilePickerOpen: false,
+            profilePickerMode: 'new' as 'new' | 'switch',
+            profilePickerSessionId: undefined as string | undefined,
+            profilePickerSelection: '',
         };
     },
     styles: css`
@@ -447,6 +454,30 @@ export const VirPaneGroup = defineElement<{
             text-overflow: ellipsis;
         }
 
+        .profile-badge {
+            appearance: none;
+            min-width: 0;
+            max-width: 120px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            padding: 1px 6px;
+            border: 1px solid var(--app-border);
+            border-radius: 999px;
+            color: var(--app-muted);
+            background: var(--app-surface-raised);
+            font: inherit;
+            font-size: 10px;
+            line-height: 1.4;
+            cursor: pointer;
+        }
+
+        .profile-badge:hover,
+        .profile-badge:focus-visible {
+            color: var(--app-text);
+            border-color: var(--app-border-strong);
+        }
+
         .pane-body {
             /* Fill whatever the session strip leaves behind. */
             flex-grow: 1;
@@ -461,17 +492,23 @@ export const VirPaneGroup = defineElement<{
          * positioning (rather than collapsing the strip's height) avoids re-triggering an xterm refit
          * on every hover.
          */
-        .session-add-floating {
+        .session-floating-controls {
             position: absolute;
             top: 2px;
             right: 2px;
             z-index: 2;
+            display: flex;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .session-add-floating {
             opacity: 0;
             transition: opacity 120ms ease;
         }
 
         .pane:hover .session-add-floating,
-        .session-add-floating:focus-within {
+        .session-add-floating:focus-visible {
             opacity: 1;
         }
 
@@ -610,10 +647,11 @@ export const VirPaneGroup = defineElement<{
         const sessionIndexFor = (kind: PaneKind): number =>
             kind === PaneKind.Ai ? inputs.aiSessionIndex : inputs.shellSessionIndex;
 
-        const onAddSession = (kind: PaneKind) => {
+        const createSessionWithProfile = (kind: PaneKind, agentProfileId = '') => {
             void createSession({
                 folder: inputs.folder,
                 kind,
+                agentProfileId: kind === PaneKind.Ai ? agentProfileId || undefined : undefined,
             })
                 .then((sessions) => {
                     applySessions(sessions);
@@ -626,6 +664,33 @@ export const VirPaneGroup = defineElement<{
                     );
                 })
                 .catch(reportSessionError);
+        };
+
+        const onAddSession = (kind: PaneKind) => {
+            if (kind === PaneKind.Ai) {
+                updateState({
+                    profilePickerOpen: true,
+                    profilePickerMode: 'new',
+                    profilePickerSessionId: undefined,
+                    profilePickerSelection: '',
+                });
+            } else {
+                createSessionWithProfile(kind);
+            }
+        };
+
+        const openProfileSwitch = (session: Readonly<SessionMeta>) => {
+            const storedChoice = inputs.agentProfiles.some(
+                (profile) => profile.id === session.agentProfileId,
+            )
+                ? session.agentProfileId
+                : '';
+            updateState({
+                profilePickerOpen: true,
+                profilePickerMode: 'switch',
+                profilePickerSessionId: session.id,
+                profilePickerSelection: storedChoice,
+            });
         };
 
         const onRenameSession = (kind: PaneKind, session: Readonly<SessionMeta>, index: number) => {
@@ -668,6 +733,14 @@ export const VirPaneGroup = defineElement<{
             })
                 .then(() => bumpRestartKey(PaneKind.Ai, session.id))
                 .catch(reportSessionError);
+        };
+
+        const profileForSession = (session: Readonly<SessionMeta>): AgentProfile => {
+            return resolveAgentProfileForPresentation({
+                profiles: inputs.agentProfiles,
+                inheritedProfileId: inputs.folderAgentProfileId,
+                explicitProfileId: session.agentProfileId,
+            });
         };
 
         const onCloseSession = (kind: PaneKind, session: Readonly<SessionMeta>, index: number) => {
@@ -731,7 +804,13 @@ export const VirPaneGroup = defineElement<{
                     content: 'Restart',
                     onClick: () => onRestartSession(kind, session),
                 },
-                kind === PaneKind.Ai && inputs.resetAiSessionCmd
+                kind === PaneKind.Ai
+                    ? {
+                          content: 'Change agent profile',
+                          onClick: () => openProfileSwitch(session),
+                      }
+                    : undefined,
+                kind === PaneKind.Ai && profileForSession(session).newSessionCommand
                     ? {
                           content: 'New AI session',
                           onClick: () => onResetAiSession(session),
@@ -752,19 +831,42 @@ export const VirPaneGroup = defineElement<{
             return entries.filter((entry): entry is ViraMenuItemEntry => !!entry);
         };
 
-        /**
-         * Sole "new session" affordance for a pane showing one session, where the tab strip (and so
-         * its `+`) is hidden.
-         */
+        const renderProfileBadge = (session: Readonly<SessionMeta>) => {
+            const presentation = getSessionAgentProfilePresentation({
+                session,
+                index: 0,
+                profiles: inputs.agentProfiles,
+                inheritedProfileId: inputs.folderAgentProfileId,
+            });
+            return html`
+                <button
+                    type="button"
+                    class="profile-badge"
+                    title=${`Configured profile: ${presentation.profileName}. Running command changes on restart.`}
+                    ${listen('click', (event) => {
+                        event.stopPropagation();
+                        openProfileSwitch(session);
+                    })}
+                >
+                    ${presentation.profileName}
+                </button>
+            `;
+        };
+
+        /** Sole new-tab affordance when the multi-session strip is hidden. */
         const renderFloatingAddSession = (kind: PaneKind) => html`
-            <span class="session-add-floating">
+            <span class="session-floating-controls">
+                ${kind === PaneKind.Ai && state.sessions?.ai[0]
+                    ? renderProfileBadge(state.sessions.ai[0])
+                    : ''}
                 <${ViraButton.assign({
                     buttonSize: ViraSize.Small,
                     buttonEmphasis: ViraEmphasis.Subtle,
                     color: ViraColorVariant.Neutral,
                     text: '+',
                 })}
-                    title="New session"
+                    class="session-add-floating"
+                    title=${kind === PaneKind.Ai ? 'New AI tab' : 'New shell tab'}
                     ${listen('click', () => onAddSession(kind))}
                 ></${ViraButton}>
             </span>
@@ -799,6 +901,7 @@ export const VirPaneGroup = defineElement<{
                                 <span class="session-tab-label">
                                     ${sessionLabel(session, index)}
                                 </span>
+                                ${kind === PaneKind.Ai ? renderProfileBadge(session) : ''}
                                 <span ${listen('click', (event) => event.stopPropagation())}>
                                     <${ViraMenuTrigger.assign({
                                         horizontalAnchor: HorizontalAnchor.Right,
@@ -834,7 +937,7 @@ export const VirPaneGroup = defineElement<{
                         text: '+',
                     })}
                         class="session-add"
-                        title="New session"
+                        title=${kind === PaneKind.Ai ? 'New AI tab' : 'New shell tab'}
                         ${listen('click', () => onAddSession(kind))}
                     ></${ViraButton}>
                 </div>
@@ -857,9 +960,8 @@ export const VirPaneGroup = defineElement<{
             if (!session) {
                 return '';
             }
-            const folderRestartKey = kind === PaneKind.Ai ? inputs.aiRestartKey : 0;
             const sessionRestartKey = state.restartKeys[`${kind}:${session.id}`] || 0;
-            const mountKey = `${session.id}:${sessionRestartKey + folderRestartKey}`;
+            const mountKey = `${session.id}:${sessionRestartKey}`;
             return repeat(
                 [mountKey],
                 (key) => key,
@@ -1106,6 +1208,49 @@ export const VirPaneGroup = defineElement<{
                   ]
                 : [tab];
 
+        const closeProfilePicker = () => {
+            updateState({
+                profilePickerOpen: false,
+                profilePickerSessionId: undefined,
+                profilePickerSelection: '',
+            });
+        };
+
+        const confirmProfilePicker = (agentProfileId: string) => {
+            if (state.profilePickerMode === 'new') {
+                closeProfilePicker();
+                createSessionWithProfile(PaneKind.Ai, agentProfileId);
+                return;
+            }
+            const session = state.sessions?.ai.find(
+                (entry) => entry.id === state.profilePickerSessionId,
+            );
+            if (!session) {
+                closeProfilePicker();
+                return;
+            }
+            const currentStoredChoice = inputs.agentProfiles.some(
+                (profile) => profile.id === session.agentProfileId,
+            )
+                ? session.agentProfileId
+                : '';
+            if (agentProfileId === currentStoredChoice) {
+                closeProfilePicker();
+                return;
+            }
+            void setSessionAgentProfile({
+                folder: inputs.folder,
+                sessionId: session.id,
+                agentProfileId,
+            })
+                .then((sessions) => {
+                    applySessions(sessions);
+                    bumpRestartKey(PaneKind.Ai, session.id);
+                    closeProfilePicker();
+                })
+                .catch(reportSessionError);
+        };
+
         return html`
             ${isMobile
                 ? html`
@@ -1292,6 +1437,27 @@ export const VirPaneGroup = defineElement<{
                     </div>
                 </div>
             </div>
+            <${VirAgentProfilePickerModal.assign({
+                open: state.profilePickerOpen,
+                profiles: inputs.agentProfiles,
+                inheritedProfileId: inputs.folderAgentProfileId,
+                selectedProfileId: state.profilePickerSelection,
+                inheritLabel: 'Inherit folder default',
+                modalTitle:
+                    state.profilePickerMode === 'new'
+                        ? 'Choose agent profile for new tab'
+                        : 'Change agent profile',
+                saveLabel: state.profilePickerMode === 'new' ? 'Create tab' : 'Switch and restart',
+                message:
+                    state.profilePickerMode === 'new'
+                        ? 'The tab is created with this profile before its terminal starts.'
+                        : 'Only this tab restarts. The badge shows the profile configured for its next launch.',
+            })}
+                ${listen(VirAgentProfilePickerModal.events.closeRequested, closeProfilePicker)}
+                ${listen(VirAgentProfilePickerModal.events.selectionConfirmed, (event) =>
+                    confirmProfilePicker(event.detail),
+                )}
+            ></${VirAgentProfilePickerModal}>
         `;
     },
 });

@@ -11,14 +11,8 @@ import {awaitedForEach, log, wait} from '@augment-vir/common';
 import {mkdir, readFile, stat, writeFile} from 'node:fs/promises';
 import {basename} from 'node:path';
 import {checkValidShape} from 'object-shape-tester';
-import {
-    getFolderAiCmd,
-    getFolderMergeSteps,
-    getFolderResetAiSessionCmd,
-    isFolderParked,
-    loadConfig,
-    saveConfig,
-} from './config.js';
+import {resolveAgentProfile} from './agent-profile.js';
+import {getFolderMergeSteps, isFolderParked, loadConfig, saveConfig} from './config.js';
 import {folderInfoCachePath, githubCachePath, notCommittedDir} from './file-paths.js';
 import {
     fetchRepoPrs,
@@ -341,8 +335,7 @@ type RefreshTarget = {
     isWorktreeRoot: boolean;
     isParked: boolean;
     aiHidden: boolean;
-    aiCmd: string;
-    resetAiSessionCmd: string;
+    agentProfileId: string;
     mergeSteps: ReturnType<typeof getFolderMergeSteps>;
 };
 
@@ -378,14 +371,10 @@ async function enumerateTargets(config: Readonly<Config>): Promise<RefreshTarget
                             folder: repo.path,
                         }),
                         aiHidden: config.hiddenAiPane.includes(repo.path),
-                        aiCmd: getFolderAiCmd({
+                        agentProfileId: resolveAgentProfile({
                             config,
                             folder: repo.path,
-                        }),
-                        resetAiSessionCmd: getFolderResetAiSessionCmd({
-                            config,
-                            folder: repo.path,
-                        }),
+                        }).id,
                         mergeSteps: getFolderMergeSteps({
                             config,
                             folder: repo.path,
@@ -403,14 +392,10 @@ async function enumerateTargets(config: Readonly<Config>): Promise<RefreshTarget
                     /** A repo root has no PR lifecycle, so parking it would mean nothing. */
                     isParked: false,
                     aiHidden: false,
-                    aiCmd: getFolderAiCmd({
+                    agentProfileId: resolveAgentProfile({
                         config,
                         folder: repo.path,
-                    }),
-                    resetAiSessionCmd: getFolderResetAiSessionCmd({
-                        config,
-                        folder: repo.path,
-                    }),
+                    }).id,
                     mergeSteps: getFolderMergeSteps({
                         config,
                         folder: repo.path,
@@ -428,16 +413,11 @@ async function enumerateTargets(config: Readonly<Config>): Promise<RefreshTarget
                                 folder: child,
                             }),
                             aiHidden: config.hiddenAiPane.includes(child),
-                            aiCmd: getFolderAiCmd({
+                            agentProfileId: resolveAgentProfile({
                                 config,
                                 folder: child,
-                                fallbackFolders: [repo.path],
-                            }),
-                            resetAiSessionCmd: getFolderResetAiSessionCmd({
-                                config,
-                                folder: child,
-                                fallbackFolders: [repo.path],
-                            }),
+                                parentRepoPath: repo.path,
+                            }).id,
                             /** Attestations are per-worktree; they never inherit from the root. */
                             mergeSteps: getFolderMergeSteps({
                                 config,
@@ -479,8 +459,7 @@ async function buildFolderInfo({
         isWorktreeRoot: target.isWorktreeRoot,
         isParked: target.isParked,
         aiHidden: target.aiHidden,
-        aiCmd: target.aiCmd,
-        resetAiSessionCmd: target.resetAiSessionCmd,
+        agentProfileId: target.agentProfileId,
         branch: git.branch,
         git: {
             dirty: git.dirty,
@@ -557,8 +536,7 @@ function placeholderFolderInfo(target: RefreshTarget): FolderInfo {
         isWorktreeRoot: target.isWorktreeRoot,
         isParked: target.isParked,
         aiHidden: target.aiHidden,
-        aiCmd: target.aiCmd,
-        resetAiSessionCmd: target.resetAiSessionCmd,
+        agentProfileId: target.agentProfileId,
         branch: null,
         git: {
             dirty: false,
@@ -669,7 +647,9 @@ async function loadPersistedCache(): Promise<void> {
             refreshState.targets = parsed.targets.map((target) => {
                 return {
                     ...target,
-                    aiCmd: check.isString(target.aiCmd) ? target.aiCmd : '',
+                    agentProfileId: check.isString(target.agentProfileId)
+                        ? target.agentProfileId
+                        : '',
                 };
             });
             /**
