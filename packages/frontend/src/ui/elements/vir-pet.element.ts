@@ -288,7 +288,7 @@ export const VirPet = defineElement<{
     styles: css`
         :host {
             position: fixed;
-            right: 18px;
+            left: 18px;
             bottom: 18px;
             z-index: 40;
             font-family: var(--app-font-sans, ui-sans-serif, system-ui, sans-serif);
