@@ -152,6 +152,46 @@ async function isBareGitRepo(folder: string): Promise<boolean> {
     return !!headStat?.isFile() && !!refsStat?.isDirectory() && !!objectsStat?.isDirectory();
 }
 
+/**
+ * Preferred default-branch names, in priority order, used to pick which existing worktree a new
+ * worktree branches off of. Falls back to the first worktree found only when none of these are
+ * checked out anywhere, so new worktrees don't silently fork off of whatever branch happens to be
+ * first in directory-listing order (e.g. a feature branch that alphabetically sorts early).
+ */
+const preferredBaseBranches = [
+    'dev',
+    'main',
+    'master',
+];
+
+async function findBaseWorktree(children: readonly string[]): Promise<string> {
+    const anyChild = children[0];
+    if (!anyChild) {
+        throw new Error('No existing worktree found to base a new worktree on.');
+    }
+
+    const branchesByChild = new Map(
+        await Promise.all(
+            children.map(
+                async (child) =>
+                    [
+                        child,
+                        await getCurrentBranch(child),
+                    ] as const,
+            ),
+        ),
+    );
+
+    for (const preferredBranch of preferredBaseBranches) {
+        const match = children.find((child) => branchesByChild.get(child) === preferredBranch);
+        if (match) {
+            return match;
+        }
+    }
+
+    return anyChild;
+}
+
 export async function addWorktree({
     repoPath,
     name,
@@ -160,23 +200,29 @@ export async function addWorktree({
     name: string;
 }>): Promise<{worktreePath: string}> {
     const children = await listWorktreeChildren(repoPath);
-    const anyChild = children[0];
-    if (!anyChild) {
-        throw new Error(`No existing worktree found in ${repoPath} to base a new worktree on.`);
+    const baseChild = await findBaseWorktree(children);
+    const baseBranch = await getCurrentBranch(baseChild);
+    if (!baseBranch) {
+        throw new Error(
+            `Could not determine a branch to base the new worktree on in ${baseChild}.`,
+        );
     }
     await exec(
         'git',
         [
             'worktree',
             'add',
+            '-b',
+            name,
             `../${name}`,
+            baseBranch,
         ],
         {
-            cwd: anyChild,
+            cwd: baseChild,
         },
     );
     return {
-        worktreePath: join(dirname(anyChild), name),
+        worktreePath: join(dirname(baseChild), name),
     };
 }
 

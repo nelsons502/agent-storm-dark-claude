@@ -10,7 +10,13 @@ import {mkdir, mkdtemp, rm, stat, writeFile} from 'node:fs/promises';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {promisify} from 'node:util';
-import {buildPrsByBranch, listWorktreeChildren, normalizePrInfo, removeWorktree} from './git.js';
+import {
+    addWorktree,
+    buildPrsByBranch,
+    listWorktreeChildren,
+    normalizePrInfo,
+    removeWorktree,
+} from './git.js';
 
 const exec = promisify(execFile);
 
@@ -275,55 +281,176 @@ async function git({
     });
 }
 
-describe(removeWorktree.name, () => {
-    async function initRepo({
-        parent,
-        mainPath,
-    }: Readonly<{
-        parent: string;
-        mainPath: string;
-    }>): Promise<void> {
-        await git({
-            cwd: parent,
-            args: [
-                'init',
-                'main',
+async function initRepo({
+    parent,
+    mainPath,
+}: Readonly<{
+    parent: string;
+    mainPath: string;
+}>): Promise<void> {
+    await git({
+        cwd: parent,
+        args: [
+            'init',
+            'main',
+        ],
+    });
+    await git({
+        cwd: mainPath,
+        args: [
+            'config',
+            'user.email',
+            'test@example.com',
+        ],
+    });
+    await git({
+        cwd: mainPath,
+        args: [
+            'config',
+            'user.name',
+            'Test User',
+        ],
+    });
+    await writeFile(join(mainPath, 'tracked.txt'), 'base\n');
+    await git({
+        cwd: mainPath,
+        args: [
+            'add',
+            'tracked.txt',
+        ],
+    });
+    await git({
+        cwd: mainPath,
+        args: [
+            'commit',
+            '-m',
+            'Initial commit',
+        ],
+    });
+}
+
+describe(addWorktree.name, () => {
+    async function currentBranch(cwd: string): Promise<string> {
+        const {stdout} = await exec(
+            'git',
+            [
+                'rev-parse',
+                '--abbrev-ref',
+                'HEAD',
             ],
-        });
-        await git({
-            cwd: mainPath,
-            args: [
-                'config',
-                'user.email',
-                'test@example.com',
-            ],
-        });
-        await git({
-            cwd: mainPath,
-            args: [
-                'config',
-                'user.name',
-                'Test User',
-            ],
-        });
-        await writeFile(join(mainPath, 'tracked.txt'), 'base\n');
-        await git({
-            cwd: mainPath,
-            args: [
-                'add',
-                'tracked.txt',
-            ],
-        });
-        await git({
-            cwd: mainPath,
-            args: [
-                'commit',
-                '-m',
-                'Initial commit',
-            ],
-        });
+            {
+                cwd,
+            },
+        );
+        return stdout.trim();
     }
 
+    it('bases a new worktree on `dev` even when an unrelated worktree sorts first', async () => {
+        /**
+         * The failure this guards: `readdir` can return `feature-branch` before `main`, and a naive
+         * "just use the first worktree found" pick would fork the new worktree off of whatever
+         * branch that first entry happens to have checked out.
+         */
+        const parent = await mkdtemp(join(tmpdir(), 'agent-storm-git-'));
+        const mainPath = join(parent, 'main');
+        const devPath = join(parent, 'dev');
+        const featurePath = join(parent, 'a-feature-branch');
+        try {
+            await initRepo({
+                parent,
+                mainPath,
+            });
+            await git({
+                cwd: mainPath,
+                args: [
+                    'worktree',
+                    'add',
+                    '../dev',
+                    '-b',
+                    'dev',
+                ],
+            });
+            await writeFile(join(devPath, 'dev-only.txt'), 'dev\n');
+            await git({
+                cwd: devPath,
+                args: [
+                    'add',
+                    'dev-only.txt',
+                ],
+            });
+            await git({
+                cwd: devPath,
+                args: [
+                    'commit',
+                    '-m',
+                    'Dev-only commit',
+                ],
+            });
+            await git({
+                cwd: mainPath,
+                args: [
+                    'worktree',
+                    'add',
+                    '../a-feature-branch',
+                    '-b',
+                    'feature-branch',
+                ],
+            });
+            await writeFile(join(featurePath, 'feature-only.txt'), 'feature\n');
+            await git({
+                cwd: featurePath,
+                args: [
+                    'add',
+                    'feature-only.txt',
+                ],
+            });
+            await git({
+                cwd: featurePath,
+                args: [
+                    'commit',
+                    '-m',
+                    'Feature-only commit',
+                ],
+            });
+
+            const {worktreePath} = await addWorktree({
+                repoPath: parent,
+                name: 'new-work',
+            });
+
+            assert.strictEquals(await currentBranch(worktreePath), 'new-work');
+            const mergeBase = await exec(
+                'git',
+                [
+                    'merge-base',
+                    'new-work',
+                    'dev',
+                ],
+                {
+                    cwd: worktreePath,
+                },
+            ).then(({stdout}) => stdout.trim());
+            const devHead = await exec(
+                'git',
+                [
+                    'rev-parse',
+                    'dev',
+                ],
+                {
+                    cwd: worktreePath,
+                },
+            ).then(({stdout}) => stdout.trim());
+            assert.strictEquals(mergeBase, devHead);
+        } finally {
+            await rm(parent, {
+                recursive: true,
+                force: true,
+            });
+        }
+    });
+});
+
+describe(removeWorktree.name, () => {
     it('removes dirty locked worktrees', async () => {
         const parent = await mkdtemp(join(tmpdir(), 'agent-storm-git-'));
         const mainPath = join(parent, 'main');
